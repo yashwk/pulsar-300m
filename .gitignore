@@ -1,0 +1,38 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# --- Virtualenv / compiled extension / build output ---
+.venv/
+venv/
+build/
+dist/
+*.so
+*.o
+
+# --- Datasets & checkpoints (large, machine-specific) ---
+data/
+checkpoints/
+*.bin
+*.pt
+*.pth
+*.safetensors
+*.jsonl
+live_status.json
+metrics.csv
+canary_history.json
+
+# --- Run artifacts ---
+*.log
+runs/
+wandb/
+outputs/
+tmp/
+
+# --- Tooling / OS ---
+.playwright-mcp/
+.DS_Store

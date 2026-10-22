@@ -1,0 +1,3380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PULSAR Telemetry & Training Monitor</title>
+  
+  <script>
+    (function() {
+      const theme = localStorage.getItem('pulsar_theme') || 'light';
+      document.documentElement.setAttribute('data-theme', theme);
+    })();
+  </script>
+
+  <!-- Inter & JetBrains Mono Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  
+  <!-- Chart.js, Hammer.js, and Chart.js Zoom Plugin -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/hammer.js/2.0.8/hammer.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
+
+  <style>
+    :root, [data-theme="light"] {
+      color-scheme: light;
+      --bg-base: #f8fafc;
+      --bg-surface: #ffffff;
+      --bg-card: #ffffff;
+      --bg-card-subtle: #f1f5f9;
+      --bg-card-hover: #e2e8f0;
+      --border: #cbd5e1;
+      --border-subtle: #e2e8f0;
+      --border-focus: #94a3b8;
+      
+      --code-bg: #f8fafc;
+      --card-shadow: 0 1px 3px rgba(0, 0, 0, 0.05), 0 1px 2px rgba(0, 0, 0, 0.03);
+
+      --white: #0f172a;
+      --silver: #334155;
+      --emerald: #059669;
+      --amber: #d97706;
+      --rose: #dc2626;
+      --purple: #7c3aed;
+      --cyan: #0284c7;
+
+      --text-main: #0f172a;
+      --text-secondary: #334155;
+      --text-muted: #64748b;
+      --text-dim: #94a3b8;
+
+      --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      --font-mono: 'JetBrains Mono', ui-monospace, Menlo, Monaco, monospace;
+    }
+
+    [data-theme="dark"] {
+      color-scheme: dark;
+      --bg-base: #0f172a;
+      --bg-surface: #1e293b;
+      --bg-card: #1e293b;
+      --bg-card-subtle: #131c2e;
+      --bg-card-hover: #29384f;
+      --border: #334155;
+      --border-subtle: #243044;
+      --border-focus: #64748b;
+
+      --code-bg: #090e17;
+      --card-shadow: 0 2px 6px rgba(0, 0, 0, 0.25);
+
+      --white: #ffffff;
+      --silver: #cbd5e1;
+      --emerald: #10b981;
+      --amber: #f59e0b;
+      --rose: #ef4444;
+      --purple: #a855f7;
+      --cyan: #38bdf8;
+
+      --text-main: #f8fafc;
+      --text-secondary: #cbd5e1;
+      --text-muted: #94a3b8;
+      --text-dim: #64748b;
+    }
+
+    [data-theme="oled"] {
+      color-scheme: dark;
+      --bg-base: #000000;
+      --bg-surface: #0c0c0e;
+      --bg-card: #141417;
+      --bg-card-subtle: #08080a;
+      --bg-card-hover: #1c1c21;
+      --border: #27272a;
+      --border-subtle: #18181b;
+      --border-focus: #3f3f46;
+
+      --code-bg: #040405;
+      --card-shadow: none;
+
+      --white: #ffffff;
+      --silver: #cbd5e1;
+      --emerald: #10b981;
+      --amber: #f59e0b;
+      --rose: #ef4444;
+      --purple: #a855f7;
+      --cyan: #38bdf8;
+
+      --text-main: #ffffff;
+      --text-secondary: #e4e4e7;
+      --text-muted: #a1a1aa;
+      --text-dim: #71717a;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background-color: var(--bg-base);
+      color: var(--text-main);
+      font-family: var(--font-sans);
+      min-height: 100vh;
+      padding: 0.85rem 1.15rem;
+      line-height: 1.45;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .app-container {
+      max-width: 1640px;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+
+    /* Minimalist Header */
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 0.7rem 1rem;
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+    }
+
+    .brand-section {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      flex-wrap: wrap;
+    }
+
+    .brand-logo {
+      display: flex;
+      align-items: center;
+      gap: 0.55rem;
+    }
+
+    .status-dot-indicator {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--emerald);
+      flex-shrink: 0;
+      transition: background-color 0.2s;
+    }
+
+    .status-dot-indicator.offline { background: var(--rose); }
+    .status-dot-indicator.cooling { background: var(--amber); }
+
+    .brand-title {
+      font-size: 0.98rem;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      color: var(--white);
+      font-family: var(--font-mono);
+    }
+
+    .badges-group {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      flex-wrap: wrap;
+    }
+
+    .spec-badge {
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      font-weight: 500;
+      padding: 0.22rem 0.55rem;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      background: var(--bg-card-subtle);
+      color: var(--text-secondary);
+      white-space: nowrap;
+    }
+
+    .spec-badge-accent {
+      border-color: var(--border-focus);
+      background: var(--bg-card);
+      color: var(--text-main);
+      font-weight: 600;
+    }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 0.55rem;
+    }
+
+    .theme-switch-group {
+      display: flex;
+      align-items: center;
+      background: var(--bg-card-subtle);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      padding: 2px;
+      gap: 2px;
+    }
+
+    .theme-btn {
+      background: transparent;
+      border: 1px solid transparent;
+      color: var(--text-muted);
+      padding: 0.22rem 0.55rem;
+      border-radius: 4px;
+      font-size: 0.72rem;
+      font-family: var(--font-mono);
+      font-weight: 500;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 0.3rem;
+      transition: all 0.15s ease;
+    }
+
+    .theme-btn:hover {
+      color: var(--text-main);
+      background: var(--bg-card-hover);
+    }
+
+    .theme-btn.active {
+      background: var(--bg-surface);
+      color: var(--text-main);
+      font-weight: 700;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+      border: 1px solid var(--border);
+    }
+
+    .server-status-pill {
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      color: var(--text-muted);
+      background: var(--bg-card-subtle);
+      padding: 0.25rem 0.65rem;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 0.45rem;
+    }
+
+    .btn-action {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+      padding: 0.28rem 0.75rem;
+      border-radius: 4px;
+      font-size: 0.72rem;
+      font-family: var(--font-mono);
+      cursor: pointer;
+      font-weight: 500;
+      transition: all 0.15s;
+    }
+
+    .btn-action:hover {
+      background: var(--bg-card-hover);
+      color: var(--text-main);
+      border-color: var(--border-focus);
+    }
+
+    /* Alert Banners */
+    .alert-banner {
+      border-radius: 5px;
+      padding: 0.65rem 0.95rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
+      font-size: 0.8rem;
+      border: 1px solid;
+    }
+
+    .alert-banner-amber {
+      background: #121008;
+      border-color: #38290e;
+      color: #fef3c7;
+    }
+
+    .alert-banner-purple {
+      background: #120d18;
+      border-color: #311c42;
+      color: #ede9fe;
+    }
+
+    .alert-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-family: var(--font-mono);
+      font-weight: 600;
+      font-size: 0.76rem;
+    }
+
+    .alert-desc {
+      font-size: 0.74rem;
+      color: var(--text-muted);
+    }
+
+    .cooling-meter-wrapper {
+      height: 4px;
+      background: rgba(255, 255, 255, 0.06);
+      border-radius: 2px;
+      overflow: hidden;
+      margin-top: 0.15rem;
+    }
+
+    .cooling-meter-fill {
+      height: 100%;
+      background: var(--amber);
+      border-radius: 2px;
+      transition: width 0.4s ease;
+      width: 100%;
+    }
+
+    /* Dual Horizon Progress Grid */
+    .progress-banner-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.75rem;
+    }
+
+    @media (max-width: 900px) {
+      .progress-banner-grid { grid-template-columns: 1fr; }
+    }
+
+    .progress-box {
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.75rem 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
+      box-shadow: var(--card-shadow);
+    }
+
+    .progress-top-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .progress-title-sub {
+      font-size: 0.74rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--text-secondary);
+      font-family: var(--font-mono);
+      font-weight: 600;
+    }
+
+    .progress-val-badge {
+      font-family: var(--font-mono);
+      font-size: 0.84rem;
+      font-weight: 700;
+      color: var(--text-main);
+    }
+
+    .progress-track {
+      height: 6px;
+      background: var(--bg-card-subtle);
+      border: 1px solid var(--border-subtle);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+
+    .progress-fill-neutral {
+      height: 100%;
+      background: var(--text-main);
+      border-radius: 2px;
+      transition: width 0.3s ease;
+    }
+
+    .progress-fill-purple {
+      height: 100%;
+      background: var(--purple);
+      border-radius: 2px;
+      transition: width 0.3s ease;
+    }
+
+    .progress-meta-row {
+      display: flex;
+      justify-content: space-between;
+      font-family: var(--font-mono);
+      font-size: 0.74rem;
+      color: var(--text-secondary);
+    }
+
+    /* 6 Top KPI Cards Grid (Training Dynamics Focused) */
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(6, 1fr);
+      gap: 0.75rem;
+    }
+
+    @media (max-width: 1350px) {
+      .kpi-grid { grid-template-columns: repeat(3, 1fr); }
+    }
+    @media (max-width: 768px) {
+      .kpi-grid { grid-template-columns: repeat(2, 1fr); }
+    }
+    @media (max-width: 500px) {
+      .kpi-grid { grid-template-columns: 1fr; }
+    }
+
+    .kpi-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.75rem 0.95rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
+      box-shadow: var(--card-shadow);
+      transition: border-color 0.15s, transform 0.15s;
+    }
+
+    .kpi-card:hover {
+      border-color: var(--border-focus);
+    }
+
+    .kpi-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .kpi-label {
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-secondary);
+      font-family: var(--font-mono);
+      font-weight: 600;
+    }
+
+    .kpi-metric-tag {
+      font-size: 0.65rem;
+      font-family: var(--font-mono);
+      color: var(--text-secondary);
+      border: 1px solid var(--border);
+      padding: 0.05rem 0.3rem;
+      border-radius: 3px;
+      font-weight: 500;
+    }
+
+    .kpi-main-val {
+      font-size: 1.5rem;
+      font-weight: 700;
+      font-family: var(--font-mono);
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--text-main);
+    }
+
+    .kpi-sub-row {
+      font-size: 0.74rem;
+      color: var(--text-secondary);
+      font-family: var(--font-mono);
+      display: flex;
+      align-items: center;
+      gap: 0.35rem;
+      flex-wrap: wrap;
+    }
+
+    .kpi-pill {
+      display: inline-block;
+      padding: 0.08rem 0.35rem;
+      border-radius: 3px;
+      font-size: 0.66rem;
+      font-family: var(--font-mono);
+      font-weight: 600;
+    }
+
+    .kpi-pill-emerald { background: rgba(16, 185, 129, 0.12); color: var(--emerald); border: 1px solid rgba(16, 185, 129, 0.25); }
+    .kpi-pill-rose { background: rgba(239, 68, 68, 0.12); color: var(--rose); border: 1px solid rgba(239, 68, 68, 0.25); }
+    .kpi-pill-amber { background: rgba(245, 158, 11, 0.12); color: var(--amber); border: 1px solid rgba(245, 158, 11, 0.25); }
+
+    /* Interactive Chart Toolbar */
+    .chart-toolbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.5rem 0.95rem;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      box-shadow: var(--card-shadow);
+    }
+
+    .toolbar-group {
+      display: flex;
+      align-items: center;
+      gap: 0.3rem;
+    }
+
+    .toolbar-label {
+      font-size: 0.72rem;
+      font-family: var(--font-mono);
+      text-transform: uppercase;
+      color: var(--text-secondary);
+      font-weight: 600;
+      margin-right: 0.15rem;
+    }
+
+    .range-btn, .tool-btn {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+      padding: 0.22rem 0.55rem;
+      border-radius: 4px;
+      font-size: 0.72rem;
+      font-family: var(--font-mono);
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+
+    .range-btn:hover, .tool-btn:hover {
+      background: var(--bg-card-hover);
+      color: var(--text-main);
+      border-color: var(--border-focus);
+    }
+
+    .range-btn.active {
+      background: var(--text-main);
+      color: var(--bg-base);
+      border-color: var(--text-main);
+      font-weight: 700;
+    }
+
+    .tool-btn.active {
+      background: rgba(16, 185, 129, 0.15);
+      color: var(--emerald);
+      border-color: var(--emerald);
+      font-weight: 600;
+    }
+
+    /* 2x2 Interactive Charts Grid */
+    .charts-grid-2x2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.75rem;
+    }
+
+    @media (max-width: 1100px) {
+      .charts-grid-2x2 { grid-template-columns: 1fr; }
+    }
+
+    .chart-box {
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.85rem 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.55rem;
+      box-shadow: var(--card-shadow);
+    }
+
+    .chart-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .chart-title-wrap {
+      display: flex;
+      align-items: center;
+      gap: 0.45rem;
+    }
+
+    .chart-heading {
+      font-size: 0.82rem;
+      font-weight: 600;
+      color: var(--text-main);
+      font-family: var(--font-mono);
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+
+    .chart-status-pill {
+      font-size: 0.68rem;
+      font-family: var(--font-mono);
+      padding: 0.08rem 0.45rem;
+      border-radius: 3px;
+      border: 1px solid var(--border);
+      background: var(--bg-card-subtle);
+      color: var(--text-secondary);
+    }
+
+    .chart-actions {
+      display: flex;
+      align-items: center;
+      gap: 0.3rem;
+    }
+
+    .chart-mini-btn {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+      padding: 0.16rem 0.45rem;
+      border-radius: 3px;
+      font-size: 0.68rem;
+      font-family: var(--font-mono);
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+
+    .chart-mini-btn:hover {
+      background: var(--bg-card-hover);
+      color: var(--text-main);
+      border-color: var(--border-focus);
+    }
+
+    .chart-canvas-wrapper {
+      position: relative;
+      height: 275px;
+      width: 100%;
+    }
+
+    /* Diagnostics Subsystem Cards */
+    .subsystem-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.75rem;
+    }
+
+    @media (max-width: 950px) {
+      .subsystem-grid { grid-template-columns: 1fr; }
+    }
+
+    .subsystem-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.85rem 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.65rem;
+      box-shadow: var(--card-shadow);
+    }
+
+    .subsystem-title {
+      font-size: 0.82rem;
+      font-weight: 600;
+      color: var(--text-main);
+      display: flex;
+      align-items: center;
+      gap: 0.45rem;
+      font-family: var(--font-mono);
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+
+    .subsystem-title-purple {
+      color: var(--purple);
+    }
+
+    .pulse-breakdown-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-family: var(--font-mono);
+      font-size: 0.74rem;
+    }
+
+    .pulse-breakdown-table th {
+      text-align: left;
+      padding: 0.42rem 0.55rem;
+      color: var(--text-secondary);
+      border-bottom: 1px solid var(--border);
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      font-weight: 600;
+    }
+
+    .pulse-breakdown-table td {
+      padding: 0.45rem 0.55rem;
+      border-bottom: 1px solid var(--border-subtle);
+      color: var(--text-secondary);
+    }
+
+    .cramming-stats-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.55rem;
+    }
+
+    .cramming-stat-box {
+      background: var(--bg-card-subtle);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 0.6rem 0.75rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.15rem;
+    }
+
+    .cramming-stat-label {
+      font-size: 0.68rem;
+      color: var(--text-secondary);
+      font-family: var(--font-mono);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      font-weight: 600;
+    }
+
+    .cramming-stat-val {
+      font-size: 1.05rem;
+      font-weight: 700;
+      font-family: var(--font-mono);
+      color: var(--text-main);
+    }
+
+    /* Enhanced Canary Inspection Bay */
+    .canary-section {
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.95rem 1.1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+      box-shadow: var(--card-shadow);
+    }
+
+    .canary-header-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 0.6rem;
+    }
+
+    .canary-title {
+      font-size: 0.84rem;
+      font-weight: 700;
+      color: var(--purple);
+      display: flex;
+      align-items: center;
+      gap: 0.45rem;
+      font-family: var(--font-mono);
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+
+    .canary-header-right {
+      display: flex;
+      align-items: center;
+      gap: 0.45rem;
+      flex-wrap: wrap;
+    }
+
+    .milestone-scrubber {
+      display: flex;
+      align-items: center;
+      gap: 0.3rem;
+      flex-wrap: wrap;
+    }
+
+    .scrub-btn {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+      padding: 0.22rem 0.55rem;
+      border-radius: 4px;
+      font-size: 0.7rem;
+      font-family: var(--font-mono);
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+
+    .scrub-btn:hover {
+      background: var(--bg-card-hover);
+      color: var(--text-main);
+      border-color: var(--border-focus);
+    }
+
+    .scrub-btn.active {
+      background: var(--text-main);
+      border-color: var(--text-main);
+      color: var(--bg-base);
+      font-weight: 700;
+    }
+
+    .canary-sub-toolbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 0.45rem 0.75rem;
+      background: var(--bg-card-subtle);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+    }
+
+    .canary-filters-group {
+      display: flex;
+      align-items: center;
+      gap: 0.25rem;
+      flex-wrap: wrap;
+    }
+
+    .filter-btn {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+      padding: 0.2rem 0.5rem;
+      border-radius: 3px;
+      font-size: 0.7rem;
+      font-family: var(--font-mono);
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+
+    .filter-btn:hover {
+      background: var(--bg-card-hover);
+      color: var(--text-main);
+    }
+
+    .filter-btn.active {
+      background: var(--text-main);
+      border-color: var(--text-main);
+      color: var(--bg-base);
+      font-weight: 700;
+    }
+
+    .canary-meta-status {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-size: 0.72rem;
+      font-family: var(--font-mono);
+      color: var(--text-secondary);
+    }
+
+    .canary-meta-pill {
+      background: var(--bg-card-subtle);
+      border: 1px solid var(--border);
+      padding: 0.12rem 0.45rem;
+      border-radius: 3px;
+      color: var(--text-secondary);
+    }
+
+    .canary-cards-grid {
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+
+    .canary-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.8rem 0.95rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.55rem;
+      transition: border-color 0.15s;
+    }
+
+    .canary-card:hover {
+      border-color: var(--border-focus);
+    }
+
+    .canary-card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 0.4rem;
+    }
+
+    .canary-header-left {
+      display: flex;
+      align-items: center;
+      gap: 0.45rem;
+    }
+
+    .canary-tag {
+      font-size: 0.65rem;
+      font-family: var(--font-mono);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      padding: 0.14rem 0.42rem;
+      border-radius: 3px;
+    }
+
+    .tag-sql { background: rgba(59, 130, 246, 0.12); color: #2563eb; border: 1px solid rgba(59, 130, 246, 0.3); }
+    [data-theme="dark"] .tag-sql, [data-theme="oled"] .tag-sql { background: rgba(59, 130, 246, 0.15); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.35); }
+    .tag-tool { background: rgba(236, 72, 153, 0.12); color: #db2777; border: 1px solid rgba(236, 72, 153, 0.3); }
+    [data-theme="dark"] .tag-tool, [data-theme="oled"] .tag-tool { background: rgba(236, 72, 153, 0.15); color: #f472b6; border: 1px solid rgba(236, 72, 153, 0.35); }
+    .tag-python { background: rgba(16, 185, 129, 0.12); color: #059669; border: 1px solid rgba(16, 185, 129, 0.3); }
+    [data-theme="dark"] .tag-python, [data-theme="oled"] .tag-python { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.35); }
+    .tag-math { background: rgba(168, 85, 247, 0.12); color: #7c3aed; border: 1px solid rgba(168, 85, 247, 0.3); }
+    [data-theme="dark"] .tag-math, [data-theme="oled"] .tag-math { background: rgba(168, 85, 247, 0.15); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.35); }
+    .tag-general { background: rgba(245, 158, 11, 0.12); color: #d97706; border: 1px solid rgba(245, 158, 11, 0.3); }
+    [data-theme="dark"] .tag-general, [data-theme="oled"] .tag-general { background: rgba(245, 158, 11, 0.15); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.35); }
+
+    .canary-title-text {
+      font-size: 0.82rem;
+      font-weight: 700;
+      color: var(--text-main);
+      font-family: var(--font-mono);
+    }
+
+    .canary-header-right-tools {
+      display: flex;
+      align-items: center;
+      gap: 0.35rem;
+    }
+
+    .canary-eval-badge {
+      font-size: 0.68rem;
+      font-family: var(--font-mono);
+      padding: 0.08rem 0.45rem;
+      border-radius: 3px;
+      font-weight: 600;
+    }
+
+    .eval-badge-emerald {
+      background: rgba(16, 185, 129, 0.12);
+      color: var(--emerald);
+      border: 1px solid rgba(16, 185, 129, 0.25);
+    }
+
+    .eval-badge-amber {
+      background: rgba(245, 158, 11, 0.12);
+      color: var(--amber);
+      border: 1px solid rgba(245, 158, 11, 0.25);
+    }
+
+    .eval-badge-purple {
+      background: rgba(168, 85, 247, 0.12);
+      color: var(--purple);
+      border: 1px solid rgba(168, 85, 247, 0.25);
+    }
+
+    .copy-btn {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+      padding: 0.18rem 0.5rem;
+      border-radius: 3px;
+      font-size: 0.68rem;
+      font-family: var(--font-mono);
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+
+    .copy-btn:hover {
+      background: var(--bg-card-hover);
+      color: var(--text-main);
+    }
+
+    .canary-prompt-banner {
+      font-size: 0.74rem;
+      color: var(--text-secondary);
+      font-family: var(--font-mono);
+      background: var(--bg-card-subtle);
+      padding: 0.45rem 0.75rem;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--purple);
+      display: flex;
+      align-items: baseline;
+      gap: 0.5rem;
+    }
+
+    .canary-prompt-label {
+      font-size: 0.68rem;
+      text-transform: uppercase;
+      font-weight: 700;
+      color: var(--purple);
+      letter-spacing: 0.04em;
+      flex-shrink: 0;
+    }
+
+    .code-editor-box {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 0.55rem 0;
+      font-family: var(--font-mono);
+      font-size: 0.78rem;
+      line-height: 1.5;
+      overflow-x: auto;
+      max-height: 240px;
+      overflow-y: auto;
+    }
+
+    .code-line {
+      display: flex;
+      padding: 0 0.75rem;
+    }
+
+    .code-line:hover {
+      background: rgba(0, 0, 0, 0.04);
+    }
+    [data-theme="dark"] .code-line:hover, [data-theme="oled"] .code-line:hover {
+      background: rgba(255, 255, 255, 0.04);
+    }
+
+    .line-num {
+      width: 28px;
+      color: var(--text-dim);
+      user-select: none;
+      text-align: right;
+      padding-right: 12px;
+      flex-shrink: 0;
+    }
+
+    .line-text {
+      color: var(--text-main);
+      white-space: pre-wrap;
+      word-break: break-word;
+      flex-grow: 1;
+    }
+
+    /* Syntax Highlighting */
+    .tok-kw { color: var(--text-main); font-weight: 700; }
+    .tok-fn { color: var(--emerald); }
+    .tok-string { color: var(--amber); }
+    .tok-comment { color: var(--text-muted); font-style: italic; }
+    .tok-num { color: var(--silver); }
+    .tok-key { color: var(--text-main); font-weight: 600; }
+    .tok-bool { color: var(--emerald); }
+    .token-eot {
+      display: inline-block;
+      background: var(--bg-card-subtle);
+      color: var(--text-secondary);
+      font-size: 0.65rem;
+      font-weight: 600;
+      padding: 0.08rem 0.4rem;
+      border-radius: 3px;
+      border: 1px solid var(--border);
+      margin: 0 0.2rem;
+      vertical-align: middle;
+    }
+
+    .canary-explanation-block {
+      background: var(--bg-card-subtle);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 0.5rem 0.75rem;
+      font-size: 0.74rem;
+      font-family: var(--font-mono);
+      color: var(--text-secondary);
+      line-height: 1.5;
+    }
+
+    .canary-explanation-header {
+      font-size: 0.66rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--text-muted);
+      font-weight: 600;
+      margin-bottom: 0.25rem;
+    }
+
+    .json-tool-card {
+      background: var(--bg-card-subtle);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 0.5rem 0.75rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.3rem;
+      font-family: var(--font-mono);
+      font-size: 0.74rem;
+    }
+
+    .json-tool-header {
+      display: flex;
+      justify-content: space-between;
+      color: var(--emerald);
+      font-weight: 600;
+      font-size: 0.76rem;
+    }
+
+    .json-param-row {
+      display: flex;
+      gap: 0.5rem;
+      color: var(--text-secondary);
+    }
+
+    .json-param-key {
+      color: var(--text-muted);
+      width: 60px;
+      font-weight: 500;
+    }
+
+    .prose-reading-box {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 0.75rem 0.95rem;
+      font-family: var(--font-sans);
+      font-size: 0.84rem;
+      line-height: 1.6;
+      color: var(--text-main);
+      max-height: 240px;
+      overflow-y: auto;
+    }
+
+    .math-step-card {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 0.6rem 0.85rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
+      font-family: var(--font-mono);
+      font-size: 0.78rem;
+    }
+
+    /* Comparison Layout */
+    .canary-split-comparison {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.65rem;
+    }
+
+    @media (max-width: 900px) {
+      .canary-split-comparison { grid-template-columns: 1fr; }
+    }
+
+    .compare-pane {
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
+    }
+
+    .compare-pane-title {
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      font-family: var(--font-mono);
+      font-weight: 600;
+      color: var(--text-secondary);
+      display: flex;
+      justify-content: space-between;
+    }
+
+    /* Minimalist Footer */
+    footer {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 0.65rem 0.55rem;
+      font-size: 0.72rem;
+      color: var(--text-secondary);
+      font-family: var(--font-mono);
+      border-top: 1px solid var(--border);
+    }
+
+    /* =========================================================================
+       Complete Mobile & Tablet Responsive Engine (<= 768px & <= 480px)
+       ========================================================================= */
+    @media (max-width: 768px) {
+      body {
+        padding: 0.5rem 0.55rem;
+      }
+
+      .app-container {
+        gap: 0.55rem;
+      }
+
+      header {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 0.6rem;
+        padding: 0.6rem 0.75rem;
+      }
+
+      .brand-section {
+        justify-content: space-between;
+        width: 100%;
+        gap: 0.5rem;
+      }
+
+      .badges-group {
+        width: 100%;
+        gap: 0.3rem;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        padding-bottom: 2px;
+        flex-wrap: wrap;
+      }
+
+      .spec-badge {
+        font-size: 0.67rem;
+        padding: 0.18rem 0.45rem;
+      }
+
+      .header-actions {
+        width: 100%;
+        justify-content: space-between;
+        flex-wrap: wrap;
+        gap: 0.4rem;
+      }
+
+      .theme-switch-group {
+        flex: 1;
+        justify-content: center;
+      }
+
+      .theme-btn {
+        flex: 1;
+        justify-content: center;
+        padding: 0.2rem 0.4rem;
+        font-size: 0.68rem;
+      }
+
+      .server-status-pill {
+        font-size: 0.68rem;
+        padding: 0.2rem 0.5rem;
+      }
+
+      .btn-action {
+        font-size: 0.68rem;
+        padding: 0.25rem 0.55rem;
+      }
+
+      .alert-header {
+        flex-wrap: wrap;
+        gap: 0.35rem;
+      }
+
+      .progress-banner-grid {
+        grid-template-columns: 1fr;
+        gap: 0.5rem;
+      }
+
+      .progress-box {
+        padding: 0.6rem 0.75rem;
+      }
+
+      .progress-meta-row {
+        flex-wrap: wrap;
+        gap: 0.3rem;
+        font-size: 0.70rem;
+      }
+
+      .progress-meta-row span {
+        word-break: break-word;
+      }
+
+      .kpi-grid {
+        grid-template-columns: repeat(2, 1fr) !important;
+        gap: 0.45rem;
+      }
+
+      .kpi-card {
+        padding: 0.55rem 0.65rem;
+      }
+
+      .kpi-title {
+        font-size: 0.65rem;
+      }
+
+      .kpi-val {
+        font-size: 1.15rem;
+      }
+
+      .kpi-sub {
+        font-size: 0.65rem;
+      }
+
+      .charts-grid-2x2 {
+        grid-template-columns: 1fr;
+        gap: 0.55rem;
+      }
+
+      .chart-box {
+        padding: 0.6rem 0.75rem;
+      }
+
+      .chart-header {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 0.35rem;
+      }
+
+      .chart-controls {
+        width: 100%;
+        justify-content: flex-end;
+        flex-wrap: wrap;
+        gap: 0.25rem;
+      }
+
+      .chart-wrapper {
+        height: 220px !important;
+      }
+
+      .subsystem-grid {
+        grid-template-columns: 1fr;
+        gap: 0.55rem;
+      }
+
+      .subsystem-card {
+        padding: 0.6rem 0.75rem;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+      }
+
+      .pulse-breakdown-table {
+        min-width: 480px;
+        font-size: 0.70rem;
+      }
+
+      .pulse-breakdown-table th,
+      .pulse-breakdown-table td {
+        padding: 0.35rem 0.45rem;
+      }
+
+      .cramming-stats-grid {
+        grid-template-columns: 1fr;
+        gap: 0.45rem;
+      }
+
+      .canary-section {
+        padding: 0.6rem 0.75rem;
+      }
+
+      .canary-header {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 0.5rem;
+      }
+
+      .canary-sub-toolbar {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 0.5rem;
+      }
+
+      .canary-filters-group {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        flex-wrap: nowrap;
+        padding-bottom: 2px;
+      }
+
+      .scrubber-pills {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        flex-wrap: nowrap;
+        padding-bottom: 2px;
+      }
+
+      .filter-btn, .scrub-btn {
+        flex-shrink: 0;
+        min-height: 28px;
+        padding: 0.25rem 0.6rem;
+      }
+
+      .canary-card-header {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 0.4rem;
+      }
+
+      .canary-header-left {
+        flex-wrap: wrap;
+        gap: 0.35rem;
+      }
+
+      .canary-header-right-tools {
+        width: 100%;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+
+      .canary-code-box,
+      .prose-reading-box {
+        font-size: 0.76rem;
+        padding: 0.55rem 0.7rem;
+        max-height: 200px;
+      }
+
+      .copy-btn {
+        padding: 0.3rem 0.6rem;
+        font-size: 0.72rem;
+        min-height: 32px;
+      }
+
+      footer {
+        flex-direction: column;
+        gap: 0.4rem;
+        text-align: center;
+        padding: 0.6rem 0.5rem;
+        font-size: 0.68rem;
+      }
+    }
+
+    @media (max-width: 480px) {
+      body {
+        padding: 0.35rem 0.4rem;
+      }
+
+      .kpi-grid {
+        grid-template-columns: repeat(2, 1fr) !important;
+        gap: 0.35rem;
+      }
+
+      .kpi-card {
+        padding: 0.45rem 0.5rem;
+      }
+
+      .kpi-val {
+        font-size: 1.05rem;
+      }
+
+      .chart-wrapper {
+        height: 190px !important;
+      }
+
+      .spec-badge {
+        font-size: 0.63rem;
+        padding: 0.15rem 0.35rem;
+      }
+
+      .progress-box-title {
+        font-size: 0.72rem;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app-container">
+
+    <!-- Header Bar -->
+    <header>
+      <div class="brand-section">
+        <div class="brand-logo">
+          <div id="statusDot" class="status-dot-indicator"></div>
+          <div class="brand-title">PULSAR</div>
+        </div>
+        <div class="badges-group" id="headerBadgesGroup">
+          <span class="spec-badge spec-badge-accent" id="hdrBadgeCore">Core: 8L → 24L (3 Pulses)</span>
+          <span class="spec-badge" id="hdrBadgeMoE">MoE: 1 Shared + 8 Routed (Top-2)</span>
+          <span class="spec-badge" id="hdrBadgeAttn">32k Hybrid Attention</span>
+          <span class="spec-badge" id="hdrBadgeParams">298.5M Total (147.5M Active)</span>
+          <span class="spec-badge" id="hdrBadgeDevice">NVIDIA GeForce RTX 4060</span>
+        </div>
+      </div>
+      <div class="header-actions">
+        <div class="theme-switch-group">
+          <button id="themeBtnLight" class="theme-btn" onclick="setTheme('light')" title="Bright Daylight Mode">☀️ Light</button>
+          <button id="themeBtnDark" class="theme-btn" onclick="setTheme('dark')" title="High-Contrast Slate Dark">🌙 Dark</button>
+          <button id="themeBtnOLED" class="theme-btn" onclick="setTheme('oled')" title="Midnight OLED">🖤 Midnight</button>
+        </div>
+        <div class="server-status-pill">
+          <span id="liveStatusText">Streaming Telemetry</span>
+          <span id="pingBadge" style="color: var(--emerald);">1.5s</span>
+        </div>
+        <button class="btn-action" onclick="fetchHistory(true)">Refresh</button>
+      </div>
+    </header>
+
+    <!-- Thermal Cooldown Banner -->
+    <div id="coolingBanner" class="alert-banner alert-banner-amber" style="display: none;">
+      <div class="alert-header">
+        <span>THERMAL COOLDOWN ACTIVE (<span id="coolingCountdown">120s</span> REMAINING)</span>
+        <span>GPU Protection Active</span>
+      </div>
+      <div class="alert-desc">
+        VRAM caches flushed to reduce die and junction temperatures. Training pipeline will resume automatically at countdown expiry.
+      </div>
+      <div class="cooling-meter-wrapper">
+        <div id="coolingMeterFill" class="cooling-meter-fill"></div>
+      </div>
+    </div>
+
+    <!-- Run Completion / Milestone Status Banner -->
+    <div id="runStatusBanner" class="alert-banner alert-banner-purple" style="display: none;">
+      <div class="alert-header">
+        <span id="runStatusTitle">TRAINING RUN COMPLETED</span>
+        <span id="runStatusBadge">100% Target Reached</span>
+      </div>
+      <div id="runStatusDesc" class="alert-desc">
+        All training steps completed. Final checkpoint saved to checkpoints/latest.pt and checkpoints/best.pt.
+      </div>
+    </div>
+
+    <!-- Dual Horizon Progress Grid -->
+    <div class="progress-banner-grid">
+      <!-- 1. Current Run Target -->
+      <div class="progress-box">
+        <div class="progress-top-row">
+          <span class="progress-title-sub">Current Run Target</span>
+          <span class="progress-val-badge" id="valStepPct">0.0%</span>
+        </div>
+        <div class="progress-track">
+          <div id="stepProgressBar" class="progress-fill-neutral" style="width: 0%;"></div>
+        </div>
+        <div class="progress-meta-row">
+          <div><strong id="valStepText" style="color: var(--white);">Step -- / --</strong></div>
+          <div>Phase: <span id="valPhase" style="color: var(--text-secondary);">Stable Phase</span></div>
+          <div>ETA: <span id="valETA" style="color: var(--amber);">--:--</span> (<span id="valElapsed">--</span> elapsed)</div>
+        </div>
+      </div>
+
+      <!-- 2. Dynamic Dataset Horizon -->
+      <div class="progress-box">
+        <div class="progress-top-row">
+          <span class="progress-title-sub" id="datasetHorizonTitle">Dataset Horizon (2 Shards Zero-Copy)</span>
+          <span class="progress-val-badge" id="valDatasetPct" style="color: var(--purple);">0.0%</span>
+        </div>
+        <div class="progress-track">
+          <div id="datasetProgressBar" class="progress-fill-purple" style="width: 0%;"></div>
+        </div>
+        <div class="progress-meta-row">
+          <div><strong id="valTokensText" style="color: var(--white);">0.0M / 950.4M Tokens</strong></div>
+          <div>Active: <span id="valShardsText" style="color: var(--emerald);">Shard 1/2</span></div>
+          <div>Batch: <span id="valBatchText" style="color: var(--text-secondary);">131,072 tok/step</span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 6 High-Signal KPI Cards -->
+    <div class="kpi-grid">
+      <!-- 1. Output Validation Loss -->
+      <div class="kpi-card">
+        <div class="kpi-top">
+          <span class="kpi-label" id="kpiValTitle">Val Loss (Pulse 3)</span>
+          <span class="kpi-metric-tag" id="kpiValBadge" style="color: var(--emerald);">24L</span>
+        </div>
+        <div class="kpi-main-val" id="kpiValL3" style="color: var(--emerald);">--</div>
+        <div class="kpi-sub-row">
+          <span>PPL: <strong id="kpiValPPL3" style="color: var(--white);">--</strong></span>
+          <span style="color: var(--text-dim);">•</span>
+          <span>Best: <span id="kpiBestVal" style="color: var(--text-secondary);">--</span></span>
+        </div>
+      </div>
+
+      <!-- 2. Training Loss & Convergence -->
+      <div class="kpi-card">
+        <div class="kpi-top">
+          <span class="kpi-label">Training Loss</span>
+          <span id="kpiLossDeltaPill" class="kpi-pill kpi-pill-emerald">Δ: --</span>
+        </div>
+        <div class="kpi-main-val" id="kpiTrainLoss" style="color: var(--white);">--</div>
+        <div class="kpi-sub-row">
+          <span>PPL: <strong id="kpiTrainPPL" style="color: var(--text-secondary);">--</strong></span>
+          <span style="color: var(--text-dim);">•</span>
+          <span>EMA: <strong id="kpiTrainEMA" style="color: var(--silver);">--</strong></span>
+        </div>
+      </div>
+
+      <!-- 3. Recurrent Pulse Gain / Reasoning Refinement -->
+      <div class="kpi-card">
+        <div class="kpi-top">
+          <span class="kpi-label" id="kpiRecurrentTitle">Recurrent Refinement</span>
+          <span class="kpi-metric-tag" id="kpiRecurrentBadge" style="color: var(--purple);">Pulse 1 → 3</span>
+        </div>
+        <div class="kpi-main-val" id="kpiRecurrentGain" style="color: var(--purple);">-- Loss</div>
+        <div class="kpi-sub-row">
+          <span>Gain: <strong id="kpiRecurrentPPLGain" style="color: var(--emerald);">+--% PPL</strong></span>
+          <span style="color: var(--text-dim);">•</span>
+          <span id="kpiPulseStepDeltas" style="color: var(--text-secondary); font-size: 0.68rem;">P1: -- → P3: --</span>
+        </div>
+      </div>
+
+      <!-- 4. Gradient Norm & Optimizer Clip (#1) -->
+      <div class="kpi-card">
+        <div class="kpi-top">
+          <span class="kpi-label">Total Grad Norm</span>
+          <span id="kpiGradBadge" class="kpi-pill kpi-pill-emerald">Norm &lt; 1.0</span>
+        </div>
+        <div class="kpi-main-val" id="kpiGradTotal" style="color: var(--white);">--</div>
+        <div class="kpi-sub-row">
+          <span id="kpiSubGrads" style="font-size: 0.68rem; color: var(--text-secondary);">M: -- | A: --</span>
+          <span style="color: var(--text-dim);">•</span>
+          <span id="kpiGradRatio" style="font-size: 0.68rem; color: var(--text-dim);">M/A: --×</span>
+        </div>
+      </div>
+
+      <!-- 5. Throughput & Compute Efficiency (#2) -->
+      <div class="kpi-card">
+        <div class="kpi-top">
+          <span class="kpi-label">Throughput & Compute</span>
+          <span id="kpiMfuBadge" class="kpi-metric-tag" style="color: var(--emerald);">--% MFU</span>
+        </div>
+        <div class="kpi-main-val" id="kpiTokPerSec" style="color: var(--emerald);">-- tok/s</div>
+        <div class="kpi-sub-row">
+          <span id="kpiStepTime">--s/step</span>
+          <span style="color: var(--text-dim);">•</span>
+          <span id="kpiVramHeadroom">-- GB / 8.0 GB</span>
+        </div>
+      </div>
+
+      <!-- 6. MoE Routing Uniformity & Balance -->
+      <div class="kpi-card">
+        <div class="kpi-top">
+          <span class="kpi-label">MoE Routing Health</span>
+          <span id="kpiMoeUniformBadge" class="kpi-metric-tag" style="color: var(--purple);">Top-2 (7E)</span>
+        </div>
+        <div class="kpi-main-val" id="kpiMoeUniformity" style="color: var(--purple);">--% Uniform</div>
+        <div class="kpi-sub-row">
+          <span id="kpiMoeSpreadSub" style="color: var(--text-secondary);">Spread: --%</span>
+          <span style="color: var(--text-dim);">•</span>
+          <span id="kpiMoEBiasSub" style="color: var(--text-dim);">Bias: --</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Interactive Charts Toolbar -->
+    <div class="chart-toolbar">
+      <div class="toolbar-group">
+        <span class="toolbar-label">Steps:</span>
+        <button class="range-btn" onclick="setChartRange(50, this)">50</button>
+        <button class="range-btn" onclick="setChartRange(100, this)">100</button>
+        <button class="range-btn active" onclick="setChartRange(250, this)">250</button>
+        <button class="range-btn" onclick="setChartRange(500, this)">500</button>
+        <button class="range-btn" onclick="setChartRange(1000, this)">1000</button>
+        <button class="range-btn" onclick="setChartRange(0, this)">All (Step 1 → Now)</button>
+      </div>
+
+      <div class="toolbar-group">
+        <span class="toolbar-label">Controls:</span>
+        <button class="tool-btn" onclick="resetAllZoom()">Reset Zoom</button>
+        <button id="btnToggleSmoothing" class="tool-btn active" onclick="toggleSmoothing()" title="Toggle the EMA overlay on the training loss chart">Loss EMA</button>
+      </div>
+
+      <div class="toolbar-group">
+        <span class="spec-badge" id="pointCountBadge">Loading...</span>
+      </div>
+    </div>
+
+    <!-- 2x2 Interactive Charts Grid -->
+    <div class="charts-grid-2x2">
+      <!-- Chart 1: Loss & Multi-Pulse Convergence -->
+      <div class="chart-box">
+        <div class="chart-header">
+          <div class="chart-title-wrap">
+            <span class="chart-heading">Loss & Multi-Pulse Convergence</span>
+            <span class="chart-status-pill" id="badgeChart1Refine">Refinement Active</span>
+          </div>
+          <div class="chart-actions">
+            <button class="chart-mini-btn" onclick="resetSingleZoom(chart1)">Reset Zoom</button>
+          </div>
+        </div>
+        <div class="chart-canvas-wrapper">
+          <canvas id="chart1Canvas"></canvas>
+        </div>
+      </div>
+
+      <!-- Chart 2: Gradient Norms & Optimizer Stability (#1) -->
+      <div class="chart-box">
+        <div class="chart-header">
+          <div class="chart-title-wrap">
+            <span class="chart-heading">Gradient Norms & Optimizer Health (#1)</span>
+            <span class="chart-status-pill" id="badgeGradStatus">Clip Limit: 1.0</span>
+            <span class="chart-status-pill" id="badgeLRSchedule">Muon: 0.020 | Adam: 6.0e-04</span>
+          </div>
+          <div class="chart-actions">
+            <button class="chart-mini-btn" onclick="resetSingleZoom(chart2)">Reset Zoom</button>
+          </div>
+        </div>
+        <div class="chart-canvas-wrapper">
+          <canvas id="chart2Canvas"></canvas>
+        </div>
+      </div>
+
+      <!-- Chart 3: Recurrent Pulse Intelligence Gain (#4) -->
+      <div class="chart-box">
+        <div class="chart-header">
+          <div class="chart-title-wrap">
+            <span class="chart-heading">Recurrent Pulse Intelligence Gain (#4)</span>
+            <span class="chart-status-pill" id="badgePPLGain">+0.78 PPL Saved</span>
+          </div>
+          <div class="chart-actions">
+            <button class="chart-mini-btn" onclick="resetSingleZoom(chart3)">Reset Zoom</button>
+          </div>
+        </div>
+        <div class="chart-canvas-wrapper">
+          <canvas id="chart3Canvas"></canvas>
+        </div>
+      </div>
+
+      <!-- Chart 4: Sparse MoE Expert Routing & Load Distribution -->
+      <div class="chart-box">
+        <div class="chart-header">
+          <div class="chart-title-wrap">
+            <span class="chart-heading">Sparse MoE Expert Routing & Load Distribution</span>
+            <span class="chart-status-pill" id="badgeMoEBalance">Uniform Baseline: 12.5%</span>
+          </div>
+          <div class="chart-actions">
+            <button class="chart-mini-btn" onclick="resetSingleZoom(chart4)">Reset Zoom</button>
+          </div>
+        </div>
+        <div class="chart-canvas-wrapper">
+          <canvas id="chart4Canvas"></canvas>
+        </div>
+      </div>
+
+      <!-- Chart 5: Recurrent State Velocity & Contraction Dynamics -->
+      <div class="chart-box">
+        <div class="chart-header">
+          <div class="chart-title-wrap">
+            <span class="chart-heading">Recurrent State Velocity & Contraction (Δh)</span>
+            <span class="chart-status-pill" id="badgeContraction">Contraction Active</span>
+          </div>
+          <div class="chart-actions">
+            <button class="chart-mini-btn" onclick="resetSingleZoom(chart5)">Reset Zoom</button>
+          </div>
+        </div>
+        <div class="chart-canvas-wrapper">
+          <canvas id="chart5Canvas"></canvas>
+        </div>
+      </div>
+
+      <!-- Chart 6: Hardware Saturation & Training Stability -->
+      <div class="chart-box">
+        <div class="chart-header">
+          <div class="chart-title-wrap">
+            <span class="chart-heading">Hardware Saturation & Performance Health</span>
+            <span class="chart-status-pill" id="badgeHardwarePerf">11.5k tok/s • 37% MFU</span>
+          </div>
+          <div class="chart-actions">
+            <button class="chart-mini-btn" onclick="resetSingleZoom(chart6)">Reset Zoom</button>
+          </div>
+        </div>
+        <div class="chart-canvas-wrapper">
+          <canvas id="chart6Canvas"></canvas>
+        </div>
+      </div>
+    </div>
+
+    <!-- Architecture & Information Theory Diagnostic Cards -->
+    <div class="subsystem-grid">
+      <!-- Card 1: Pulsar Recurrent Core Engine -->
+      <div class="subsystem-card">
+        <div class="subsystem-title" id="diagCoreTitle">
+          Pulsar Recurrent Core (8 Layers Looped 3× = 24 Effective Layers)
+        </div>
+        <table class="pulse-breakdown-table">
+          <thead>
+            <tr>
+              <th>Recurrent Pass</th>
+              <th>Effective Depth</th>
+              <th>Val Loss</th>
+              <th>Val PPL</th>
+              <th>Refinement Gain</th>
+            </tr>
+          </thead>
+          <tbody id="recurrentCoreTblBody">
+            <tr>
+              <td><strong style="color: var(--amber);">Pulse 1</strong></td>
+              <td>8 Layers (Fast Draft)</td>
+              <td id="tblL1">--</td>
+              <td id="tblPPL1">--</td>
+              <td style="color: var(--text-dim);">Baseline Draft</td>
+            </tr>
+            <tr>
+              <td><strong style="color: var(--silver);">Pulse 2</strong></td>
+              <td>16 Layers (Refine)</td>
+              <td id="tblL2">--</td>
+              <td id="tblPPL2">--</td>
+              <td id="tblGain12" style="color: var(--silver);">--</td>
+            </tr>
+            <tr>
+              <td><strong style="color: var(--emerald);">Pulse 3</strong></td>
+              <td>24 Layers (Deep Output)</td>
+              <td id="tblL3">--</td>
+              <td id="tblPPL3">--</td>
+              <td id="tblGain23" style="color: var(--emerald);">--</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="cramming-stats-grid" style="margin-top: 0.15rem;">
+          <div class="cramming-stat-box">
+            <span class="cramming-stat-label" id="diagTotalGainLabel">Total 3× Latent Gain (L1 → L3)</span>
+            <span class="cramming-stat-val" id="diagTotalGain" style="color: var(--emerald);">--</span>
+          </div>
+          <div class="cramming-stat-box">
+            <span class="cramming-stat-label">Prompt Anchor Ratio (λ)</span>
+            <span class="cramming-stat-val" id="diagMixLambda" style="color: var(--silver);">20.0% / 80.0%</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Card 2: Sparse MoE Routing & Specialization Engine -->
+      <div class="subsystem-card">
+        <div class="subsystem-title subsystem-title-purple" id="diagMoETitle">
+          Sparse MoE Routing & Expert Specialization (1 Shared + 8 Routed, Top-2)
+        </div>
+        <table class="pulse-breakdown-table">
+          <thead>
+            <tr>
+              <th>MoE Metric</th>
+              <th>Configuration</th>
+              <th>Live Status</th>
+              <th>Information Health</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong style="color: var(--purple);">Routing Geometry</strong></td>
+              <td id="diagMoEGeom">1 Shared + 8 Routed (Top-2)</td>
+              <td id="diagMoEDist" style="color: var(--white); font-size: 0.7rem;">[--]</td>
+              <td style="color: var(--emerald);">Balanced Uniformity</td>
+            </tr>
+            <tr>
+              <td><strong style="color: var(--cyan);">Compute Budget</strong></td>
+              <td id="diagActiveCompute">147.5M Active / 298.5M Total</td>
+              <td id="diagActiveParamsDetail" style="color: var(--silver);">97.1M non-embed</td>
+              <td style="color: var(--cyan);">49.4% Sparsity Ratio</td>
+            </tr>
+            <tr>
+              <td><strong style="color: var(--amber);">FFN Dimension</strong></td>
+              <td id="diagMoEActiveFFN">d_expert = 1024 | 3072 Active Width</td>
+              <td id="diagRouterConf" style="color: var(--amber);">--</td>
+              <td id="diagMoEEntropy" style="color: var(--text-secondary);">Max Bias: 0.151</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="cramming-stats-grid" style="margin-top: 0.15rem;">
+          <div class="cramming-stat-box">
+            <span class="cramming-stat-label">MoE Uniformity (Shannon H)</span>
+            <span class="cramming-stat-val" id="diagMoEUniformityVal" style="color: var(--purple);">99.4%</span>
+          </div>
+          <div class="cramming-stat-box">
+            <span class="cramming-stat-label">Auxiliary Router Loss</span>
+            <span class="cramming-stat-val" id="diagMoEAuxLoss" style="color: var(--emerald);">0.000 (Aux-Free)</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Enhanced Canary Inspection Bay with Customized Parsers & Comparison -->
+    <div class="canary-section">
+      <div class="canary-header-bar">
+        <div class="canary-title">
+          Model Capability Evolution & Canary Probing
+        </div>
+        <div class="canary-header-right">
+          <div class="milestone-scrubber" id="scrubberContainer">
+            <!-- Rendered dynamically -->
+          </div>
+          <button id="btnToggleCompare" class="tool-btn" onclick="toggleCompareMode()">Compare with Baseline</button>
+        </div>
+      </div>
+
+      <div class="canary-sub-toolbar">
+        <div class="canary-filters-group">
+          <span class="toolbar-label">Domain:</span>
+          <button class="filter-btn active" onclick="setCanaryFilter('ALL', this)">All (5)</button>
+          <button class="filter-btn" onclick="setCanaryFilter('SQL', this)">SQL</button>
+          <button class="filter-btn" onclick="setCanaryFilter('Python', this)">Python</button>
+          <button class="filter-btn" onclick="setCanaryFilter('Tool Calling / JSON', this)">JSON Tool</button>
+          <button class="filter-btn" onclick="setCanaryFilter('Math / Reasoning', this)">Math</button>
+          <button class="filter-btn" onclick="setCanaryFilter('General Knowledge', this)">Knowledge</button>
+        </div>
+        <div class="canary-meta-status">
+          <span>Active Milestone: <strong id="viewingMilestoneLabel" style="color: var(--white);">Latest Live</strong></span>
+          <span class="canary-meta-pill">Argmax Greedy • RepPen: 1.15</span>
+        </div>
+      </div>
+
+      <div class="canary-cards-grid" id="canaryGrid">
+        <!-- Rendered dynamically with specialized parsing per canary type -->
+      </div>
+    </div>
+
+    <!-- Minimalist Footer -->
+    <footer>
+      <div>Pulsar Telemetry • 146.8M Active / 298.55M Total (8L → 24L Recurrent MoE) • 32k Hybrid Attention • Port 7860</div>
+      <div>RTX 4060 Laptop (8GB) • PyTorch Fused CUDA • Muon + AdamW</div>
+    </footer>
+
+  </div>
+
+  <script>
+    // Register Chart.js Zoom Plugin
+    if (window.ChartZoom) {
+      Chart.register(window.ChartZoom);
+    }
+
+    Chart.defaults.color = '#475569';
+    Chart.defaults.font.family = "'JetBrains Mono', ui-monospace, Menlo, Monaco, monospace";
+    Chart.defaults.font.size = 11;
+    Chart.defaults.plugins.legend.labels.boxWidth = 10;
+    Chart.defaults.plugins.legend.labels.usePointStyle = true;
+
+    // Subtle Crosshair Guide Plugin
+    const crosshairPlugin = {
+      id: 'crosshair',
+      afterDraw: (chart) => {
+        if (chart.tooltip?._active?.length) {
+          const activePoint = chart.tooltip._active[0];
+          const ctx = chart.ctx;
+          const x = activePoint.element.x;
+          const topY = chart.scales.y ? chart.scales.y.top : chart.chartArea.top;
+          const bottomY = chart.scales.y ? chart.scales.y.bottom : chart.chartArea.bottom;
+
+          ctx.save();
+          ctx.beginPath();
+          ctx.moveTo(x, topY);
+          ctx.lineTo(x, bottomY);
+          ctx.lineWidth = 1;
+          ctx.setLineDash([2, 2]);
+          ctx.strokeStyle = document.documentElement.getAttribute('data-theme') === 'light' ? 'rgba(0, 0, 0, 0.25)' : 'rgba(255, 255, 255, 0.25)';
+          ctx.stroke();
+          ctx.restore();
+        }
+      }
+    };
+    Chart.register(crosshairPlugin);
+
+    const baseChartOptions = {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      layout: {
+        padding: { left: 4, right: 12, top: 6, bottom: 4 }
+      },
+      interaction: {
+        mode: 'index',
+        intersect: false
+      },
+      plugins: {
+        legend: {
+          position: 'top',
+          align: 'end',
+          labels: { boxWidth: 10, padding: 8, color: '#334155' }
+        },
+        tooltip: {
+          backgroundColor: '#0f172a',
+          titleColor: '#ffffff',
+          bodyColor: '#f8fafc',
+          borderColor: '#cbd5e1',
+          borderWidth: 1,
+          padding: 8,
+          boxPadding: 4,
+          usePointStyle: true,
+          titleFont: { family: "'JetBrains Mono'", size: 11, weight: 'bold' },
+          bodyFont: { family: "'JetBrains Mono'", size: 10 }
+        },
+        zoom: {
+          pan: { enabled: true, mode: 'x', modifierKey: null },
+          zoom: {
+            wheel: { enabled: true },
+            drag: { enabled: true, backgroundColor: 'rgba(59, 130, 246, 0.12)', borderColor: 'rgba(59, 130, 246, 0.35)', borderWidth: 1 },
+            mode: 'x'
+          }
+        }
+      },
+      scales: {
+        x: {
+          grid: { color: 'rgba(0, 0, 0, 0.08)' },
+          ticks: {
+            color: '#475569',
+            maxTicksLimit: 10,
+            autoSkip: true,
+            maxRotation: 0
+          }
+        },
+        y: {
+          grid: { color: 'rgba(0, 0, 0, 0.08)' },
+          ticks: { color: '#475569' }
+        }
+      }
+    };
+
+    // 1. Chart 1: Loss & Multi-Pulse Convergence
+    const chart1 = new Chart(document.getElementById('chart1Canvas'), {
+      type: 'line',
+      data: {
+        labels: [],
+        datasets: [
+          { label: 'Train Loss (Raw)', borderColor: 'rgba(142, 142, 147, 0.22)', borderWidth: 1, data: [], pointRadius: 0 },
+          { label: 'Train EMA (0.85)', borderColor: '#ffffff', borderWidth: 1.8, data: [], pointRadius: 0 },
+          { label: 'Val Pulse 1 [8L]', borderColor: '#f59e0b', borderWidth: 1.5, borderDash: [3, 3], data: [], pointRadius: 2, pointHoverRadius: 4, spanGaps: true },
+          { label: 'Val Pulse 2 [16L]', borderColor: '#cbd5e1', borderWidth: 1.5, borderDash: [2, 2], data: [], pointRadius: 2, pointHoverRadius: 4, spanGaps: true },
+          { label: 'Val Pulse 3 [24L]', borderColor: '#10b981', borderWidth: 2.2, data: [], pointRadius: 2.5, pointHoverRadius: 5, spanGaps: true }
+        ]
+      },
+      options: {
+        ...baseChartOptions,
+        scales: {
+          ...baseChartOptions.scales,
+          y: { ...baseChartOptions.scales.y, title: { display: true, text: 'Loss (Cross-Entropy Nats)' } }
+        }
+      }
+    });
+
+    // 2. Chart 2: Gradient Norms & Optimizer Health (#1)
+    const chart2 = new Chart(document.getElementById('chart2Canvas'), {
+      type: 'line',
+      data: {
+        labels: [],
+        datasets: [
+          { label: 'Total Grad Norm', borderColor: '#ffffff', borderWidth: 1.8, data: [], pointRadius: 0 },
+          { label: 'Muon Norm', borderColor: '#10b981', borderWidth: 1.4, data: [], pointRadius: 0 },
+          { label: 'Adam Norm', borderColor: '#cbd5e1', borderWidth: 1.4, data: [], pointRadius: 0 },
+          { label: 'Clip Limit (1.0)', borderColor: '#ef4444', borderWidth: 1, borderDash: [4, 4], data: [], pointRadius: 0 }
+        ]
+      },
+      options: {
+        ...baseChartOptions,
+        scales: {
+          ...baseChartOptions.scales,
+          y: {
+            ...baseChartOptions.scales.y,
+            title: { display: true, text: 'L2 Gradient Norm' },
+            min: 0,
+            suggestedMax: 2.0
+          }
+        }
+      }
+    });
+
+    // 3. Chart 3: Recurrent Pulse Intelligence Gain (#4)
+    const chart3 = new Chart(document.getElementById('chart3Canvas'), {
+      type: 'line',
+      data: {
+        labels: [],
+        datasets: [
+          { label: 'Pulse 1→2 Gain (ΔLoss)', borderColor: '#cbd5e1', borderWidth: 1.4, borderDash: [2, 2], data: [], pointRadius: 2, spanGaps: true, yAxisID: 'y' },
+          { label: 'Pulse 2→3 Gain (ΔLoss)', borderColor: '#10b981', borderWidth: 1.4, borderDash: [2, 2], data: [], pointRadius: 2, spanGaps: true, yAxisID: 'y' },
+          { label: 'Total 3× Recurrent Gain (ΔLoss)', borderColor: '#a855f7', borderWidth: 2.2, data: [], pointRadius: 2.5, spanGaps: true, yAxisID: 'y' },
+          { label: 'Relative PPL Saved (%)', borderColor: '#f59e0b', backgroundColor: 'rgba(245, 158, 11, 0.08)', fill: true, borderWidth: 1.5, data: [], pointRadius: 2, spanGaps: true, yAxisID: 'y1' }
+        ]
+      },
+      options: {
+        ...baseChartOptions,
+        scales: {
+          ...baseChartOptions.scales,
+          y: {
+            ...baseChartOptions.scales.y,
+            position: 'left',
+            title: { display: true, text: 'Loss Reduction (Nats)' },
+            suggestedMin: 0
+          },
+          y1: {
+            position: 'right',
+            grid: { drawOnChartArea: false },
+            title: { display: true, text: 'Relative PPL Saved (%)' },
+            ticks: { callback: v => v + '%' },
+            suggestedMin: 0,
+            suggestedMax: 30
+          }
+        }
+      }
+    });
+
+    // 4. Chart 4: Sparse MoE Expert Routing & Load Distribution
+    const EXPERT_COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ec4899', '#8b5cf6', '#06b6d4', '#f97316', '#f43f5e'];
+    // Rebuild chart 4's datasets when the model's routed-expert count differs from the
+    // 8-expert default (the trainer reports the real count in model_config).
+    function ensureExpertDatasets(n) {
+      const count = (Number.isFinite(n) && n > 0) ? Math.floor(n) : 8;
+      const ds = chart4.data.datasets;
+      const idealLabel = `Ideal (${(100 / count).toFixed(1)}%)`;
+      if (ds.length === count + 2) {
+        ds[count].label = idealLabel;
+        return;
+      }
+      const rebuilt = [];
+      for (let e = 0; e < count; e++) {
+        rebuilt.push({
+          label: `Expert ${e}`,
+          borderColor: EXPERT_COLORS[e % EXPERT_COLORS.length],
+          borderWidth: 1.5,
+          data: [],
+          pointRadius: 0,
+          yAxisID: 'y'
+        });
+      }
+      rebuilt.push({ label: idealLabel, borderColor: '#64748b', borderWidth: 1.4, borderDash: [4, 4], data: [], pointRadius: 0, yAxisID: 'y' });
+      rebuilt.push({ label: 'Router Bias |b_i|', borderColor: '#94a3b8', borderWidth: 1.2, borderDash: [2, 2], data: [], pointRadius: 0, yAxisID: 'y1' });
+      chart4.data.datasets = rebuilt;
+    }
+
+    const chart4 = new Chart(document.getElementById('chart4Canvas'), {
+      type: 'line',
+      data: {
+        labels: [],
+        datasets: [
+          { label: 'Expert 0', borderColor: '#3b82f6', borderWidth: 1.5, data: [], pointRadius: 0, yAxisID: 'y' },
+          { label: 'Expert 1', borderColor: '#10b981', borderWidth: 1.5, data: [], pointRadius: 0, yAxisID: 'y' },
+          { label: 'Expert 2', borderColor: '#f59e0b', borderWidth: 1.5, data: [], pointRadius: 0, yAxisID: 'y' },
+          { label: 'Expert 3', borderColor: '#ec4899', borderWidth: 1.5, data: [], pointRadius: 0, yAxisID: 'y' },
+          { label: 'Expert 4', borderColor: '#8b5cf6', borderWidth: 1.5, data: [], pointRadius: 0, yAxisID: 'y' },
+          { label: 'Expert 5', borderColor: '#06b6d4', borderWidth: 1.5, data: [], pointRadius: 0, yAxisID: 'y' },
+          { label: 'Expert 6', borderColor: '#f97316', borderWidth: 1.5, data: [], pointRadius: 0, yAxisID: 'y' },
+          { label: 'Expert 7', borderColor: '#f43f5e', borderWidth: 1.5, data: [], pointRadius: 0, yAxisID: 'y' },
+          { label: 'Ideal (12.5%)', borderColor: '#64748b', borderWidth: 1.4, borderDash: [4, 4], data: [], pointRadius: 0, yAxisID: 'y' },
+          { label: 'Router Bias |b_i|', borderColor: '#94a3b8', borderWidth: 1.2, borderDash: [2, 2], data: [], pointRadius: 0, yAxisID: 'y1' }
+        ]
+      },
+      options: {
+        ...baseChartOptions,
+        scales: {
+          ...baseChartOptions.scales,
+          y: {
+            ...baseChartOptions.scales.y,
+            position: 'left',
+            title: { display: true, text: 'Expert Routing Share (%)' },
+            min: 0,
+            suggestedMax: 25,
+            ticks: { callback: v => v + '%' }
+          },
+          y1: {
+            position: 'right',
+            grid: { drawOnChartArea: false },
+            title: { display: true, text: 'Max Router Bias |b_i|' },
+            suggestedMin: 0
+          }
+        }
+      }
+    });
+
+    // 5. Chart 5: Recurrent State Velocity & Contraction Dynamics
+    const chart5 = new Chart(document.getElementById('chart5Canvas'), {
+      type: 'line',
+      data: {
+        labels: [],
+        datasets: [
+          { label: 'Pulse 1 Velocity (Δh₁)', borderColor: '#f59e0b', borderWidth: 1.5, data: [], pointRadius: 0, yAxisID: 'y' },
+          { label: 'Pulse 2 Velocity (Δh₂)', borderColor: '#cbd5e1', borderWidth: 1.5, data: [], pointRadius: 0, yAxisID: 'y' },
+          { label: 'Pulse 3 Velocity (Δh₃)', borderColor: '#10b981', borderWidth: 2.0, data: [], pointRadius: 0, yAxisID: 'y' },
+          { label: 'Final State Displacement', borderColor: '#a855f7', borderWidth: 2.2, data: [], pointRadius: 0, yAxisID: 'y' },
+          { label: 'Anchor Mix (λ %)', borderColor: '#06b6d4', borderWidth: 1.4, borderDash: [3, 3], data: [], pointRadius: 0, yAxisID: 'y1' }
+        ]
+      },
+      options: {
+        ...baseChartOptions,
+        scales: {
+          ...baseChartOptions.scales,
+          y: {
+            ...baseChartOptions.scales.y,
+            position: 'left',
+            title: { display: true, text: 'Displacement Norm ||Δh||' },
+            min: 0
+          },
+          y1: {
+            position: 'right',
+            grid: { drawOnChartArea: false },
+            title: { display: true, text: 'Anchor Mix λ (%)' },
+            min: 0,
+            max: 50,
+            ticks: { callback: v => v + '%' }
+          }
+        }
+      }
+    });
+
+    // 6. Chart 6: Hardware Saturation & Training Stability
+    const chart6 = new Chart(document.getElementById('chart6Canvas'), {
+      type: 'line',
+      data: {
+        labels: [],
+        datasets: [
+          { label: 'Throughput (tok/s)', borderColor: '#10b981', borderWidth: 2, data: [], pointRadius: 0, yAxisID: 'y' },
+          { label: 'Compute (TFLOPs)', borderColor: '#38bdf8', borderWidth: 1.6, data: [], pointRadius: 0, yAxisID: 'y1' },
+          { label: 'Peak VRAM (GB)', borderColor: '#f43f5e', borderWidth: 1.4, borderDash: [2, 2], data: [], pointRadius: 0, yAxisID: 'y2' }
+        ]
+      },
+      options: {
+        ...baseChartOptions,
+        scales: {
+          ...baseChartOptions.scales,
+          y: {
+            ...baseChartOptions.scales.y,
+            position: 'left',
+            title: { display: true, text: 'Throughput (tok/s)' },
+            suggestedMin: 8000,
+            suggestedMax: 13000
+          },
+          y1: {
+            position: 'right',
+            grid: { drawOnChartArea: false },
+            title: { display: true, text: 'Sustained TFLOPs' },
+            suggestedMin: 15,
+            suggestedMax: 30
+          },
+          y2: {
+            position: 'right',
+            display: false,
+            min: 0,
+            max: 8.5
+          }
+        }
+      }
+    });
+
+    function updateChartsTheme(theme) {
+      const isLight = (theme === 'light');
+      const gridColor = isLight ? 'rgba(0, 0, 0, 0.08)' : 'rgba(255, 255, 255, 0.09)';
+      const tickColor = isLight ? '#475569' : '#94a3b8';
+      const labelColor = isLight ? '#1e293b' : '#cbd5e1';
+      const tooltipBg = isLight ? '#0f172a' : '#1e293b';
+      const tooltipBorder = isLight ? '#cbd5e1' : '#475569';
+
+      [chart1, chart2, chart3, chart4, chart5, chart6].forEach(chart => {
+        if (!chart) return;
+        if (chart.options?.scales) {
+          Object.keys(chart.options.scales).forEach(scaleKey => {
+            const scale = chart.options.scales[scaleKey];
+            if (scale.grid && scale.grid.display !== false) scale.grid.color = gridColor;
+            if (scale.ticks) scale.ticks.color = tickColor;
+            if (scale.title) scale.title.color = labelColor;
+          });
+        }
+        if (chart.options?.plugins?.legend?.labels) {
+          chart.options.plugins.legend.labels.color = labelColor;
+        }
+        if (chart.options?.plugins?.tooltip) {
+          chart.options.plugins.tooltip.backgroundColor = tooltipBg;
+          chart.options.plugins.tooltip.borderColor = tooltipBorder;
+        }
+      });
+
+      // Dataset styling tweaks
+      if (chart1?.data?.datasets) {
+        chart1.data.datasets[0].borderColor = isLight ? 'rgba(100, 116, 139, 0.45)' : 'rgba(148, 163, 184, 0.4)';
+        chart1.data.datasets[1].borderColor = isLight ? '#0f172a' : '#ffffff';
+        chart1.data.datasets[3].borderColor = isLight ? '#475569' : '#cbd5e1';
+      }
+      if (chart2?.data?.datasets) {
+        chart2.data.datasets[0].borderColor = isLight ? '#0f172a' : '#ffffff';
+        chart2.data.datasets[2].borderColor = isLight ? '#0284c7' : '#cbd5e1';
+      }
+      if (chart3?.data?.datasets) {
+        chart3.data.datasets[0].borderColor = isLight ? '#475569' : '#cbd5e1';
+      }
+
+      chart1?.update('none');
+      chart2?.update('none');
+      chart3?.update('none');
+      chart4?.update('none');
+      chart5?.update('none');
+      chart6?.update('none');
+    }
+
+    function setTheme(theme) {
+      document.documentElement.setAttribute('data-theme', theme);
+      try {
+        localStorage.setItem('pulsar_theme', theme);
+      } catch (e) {}
+
+      document.querySelectorAll('.theme-btn').forEach(btn => btn.classList.remove('active'));
+      if (theme === 'light') {
+        document.getElementById('themeBtnLight')?.classList.add('active');
+      } else if (theme === 'oled') {
+        document.getElementById('themeBtnOLED')?.classList.add('active');
+      } else {
+        document.getElementById('themeBtnDark')?.classList.add('active');
+      }
+
+      updateChartsTheme(theme);
+    }
+
+    let rawHistory = [];
+    let lastModelConfig = null;
+    let currentRangeLimit = 250;
+    let isSmoothingOn = true;
+    let milestoneCanaries = [];
+    let selectedMilestoneIdx = -1; // -1 = Latest Live
+    let canaryCategoryFilter = 'ALL';
+    let isCompareMode = false;
+
+    // Initialize Theme immediately
+    const initialTheme = localStorage.getItem('pulsar_theme') || 'light';
+    setTheme(initialTheme);
+
+    function computeEMA(series, alpha = 0.85) {
+      if (!series || series.length === 0) return [];
+      const res = [];
+      let ema = null;
+      for (const val of series) {
+        if (val === null || val === undefined || isNaN(val)) {
+          res.push(null);
+          continue;
+        }
+        ema = (ema === null) ? val : (alpha * ema + (1 - alpha) * val);
+        res.push(Number(ema.toFixed(4)));
+      }
+      return res;
+    }
+
+    function setChartRange(limit, btn) {
+      if (btn && btn.parentElement) {
+        btn.parentElement.querySelectorAll('.range-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+      }
+      currentRangeLimit = limit;
+      fetchHistory();
+    }
+
+    function resetSingleZoom(chart) {
+      if (chart && chart.resetZoom) chart.resetZoom();
+    }
+
+    function resetAllZoom() {
+      [chart1, chart2, chart3, chart4, chart5, chart6].forEach(c => {
+        if (c && c.resetZoom) c.resetZoom();
+      });
+    }
+
+    function toggleSmoothing() {
+      isSmoothingOn = !isSmoothingOn;
+      const btn = document.getElementById('btnToggleSmoothing');
+      if (btn) btn.classList.toggle('active', isSmoothingOn);
+      chart1.data.datasets[1].hidden = !isSmoothingOn;
+      chart1.update('none');
+    }
+
+    function setCanaryFilter(filter, btn) {
+      canaryCategoryFilter = filter;
+      if (btn && btn.parentElement) {
+        btn.parentElement.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+      }
+      renderSelectedCanaries();
+    }
+
+    function toggleCompareMode() {
+      isCompareMode = !isCompareMode;
+      const btn = document.getElementById('btnToggleCompare');
+      if (btn) {
+        btn.classList.toggle('active', isCompareMode);
+        btn.innerText = isCompareMode ? 'Exit Comparison' : 'Compare with Baseline';
+      }
+      renderSelectedCanaries();
+    }
+
+    function copyCanaryText(btn, text) {
+      if (!navigator.clipboard) return;
+      navigator.clipboard.writeText(text).then(() => {
+        const orig = btn.innerText;
+        btn.innerText = 'Copied!';
+        setTimeout(() => { btn.innerText = orig; }, 1200);
+      });
+    }
+
+    function escapeHtml(text) {
+      if (!text) return '';
+      return text
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+    }
+
+    /* Specialized Syntax Highlighters & Parsers per Canary */
+    function renderCodeLines(rawCode, highlighterFn) {
+      const highlighted = highlighterFn ? highlighterFn(rawCode) : escapeHtml(rawCode);
+      const lines = highlighted.split('\n');
+      return lines.map((line, idx) => `
+        <div class="code-line">
+          <span class="line-num">${idx + 1}</span>
+          <span class="line-text">${line || '&nbsp;'}</span>
+        </div>
+      `).join('');
+    }
+
+    function highlightSQL(code) {
+      let h = escapeHtml(code);
+      return h.replace(/(--[^\n]*)|('(?:''|[^'\\]|\\.)*')|\b(SELECT|FROM|WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT|OFFSET|JOIN|LEFT|RIGHT|INNER|OUTER|ON|AND|OR|NOT|IN|BETWEEN|LIKE|IS|NULL|AS|ASC|DESC|CASE|WHEN|THEN|ELSE|END|DATEADD|GETDATE|COUNT|SUM|AVG|MIN|MAX|ROUND|COALESCE)\b|\b(\d+)\b/gi, (match, comment, str, kw, num) => {
+        if (comment) return `<span class="tok-comment">${comment}</span>`;
+        if (str) return `<span class="tok-string">${str}</span>`;
+        if (kw) return `<span class="tok-kw">${kw}</span>`;
+        if (num) return `<span class="tok-num">${num}</span>`;
+        return match;
+      });
+    }
+
+    function highlightPython(code) {
+      let h = escapeHtml(code);
+      h = h.replace(/&lt;\|endoftext\|&gt;|<\|endoftext\|>/g, '<span class="token-eot">[EOT]</span>');
+      return h.replace(/(#[^\n]*)|("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|\b(def|return|if|else|elif|for|while|in|import|from|class|pass|break|continue|None|True|False)\b|\b(print|range|len|fibonacci|fibonacci_sequence)\b|\b(\d+)\b/g, (match, comment, str, kw, fn, num) => {
+        if (comment) return `<span class="tok-comment">${comment}</span>`;
+        if (str) return `<span class="tok-string">${str}</span>`;
+        if (kw) return `<span class="tok-kw">${kw}</span>`;
+        if (fn) return `<span class="tok-fn">${fn}</span>`;
+        if (num) return `<span class="tok-num">${num}</span>`;
+        return match;
+      });
+    }
+
+    function highlightJSON(code) {
+      let h = escapeHtml(code);
+      h = h.replace(/&lt;\|endoftext\|&gt;|<\|endoftext\|>/g, '<span class="token-eot">[EOT]</span>');
+      h = h.replace(/("(\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*")/g, function(match) {
+        if (/:$/.test(match) || /"\s*:/.test(match)) {
+          return '<span class="tok-key">' + match + '</span>';
+        }
+        return '<span class="tok-string">' + match + '</span>';
+      });
+      h = h.replace(/<span class="tok-string">(&quot;.*?&quot;)<\/span>\s*:/g, '<span class="tok-key">$1</span>:');
+      h = h.replace(/\b(true|false|null)\b/gi, '<span class="tok-bool">$1</span>');
+      h = h.replace(/\b(\d+)\b/g, '<span class="tok-num">$1</span>');
+      return h;
+    }
+
+    function inferCanaryTag(canary, promptText) {
+      if (canary && canary.tag) return canary.tag;
+      if (canary && canary.category) return canary.category;
+      const p = (promptText || (canary ? canary.prompt : '') || '').toLowerCase();
+      if (p.includes('select') || p.includes('orders') || p.includes('from')) return 'SQL';
+      if (p.includes('def ') || p.includes('quicksort') || p.includes('fibonacci')) return 'Python';
+      if (p.includes('tool_call') || p.includes('query_database') || p.includes('{')) return 'Tool Calling / JSON';
+      if (p.includes('question:') || p.includes('train travels') || p.includes('speed')) return 'Math / Reasoning';
+      if (p.includes('france') || p.includes('capital')) return 'General Knowledge';
+      if (p.includes('recurrent') || p.includes('neural network')) return 'Deep Learning / ML';
+      if (p.includes('nature') || p.includes('law')) return 'Physics / Science';
+      return 'General Knowledge';
+    }
+
+    /* Specialized Canary Renderers */
+    function renderCanaryContent(canary, promptText, completionText) {
+      const tag = inferCanaryTag(canary, promptText);
+
+      // 1. SQL Canary
+      if (tag === 'SQL') {
+        const fullSql = (completionText.startsWith(promptText)) ? completionText : (promptText + completionText);
+        let queryPart = fullSql;
+        let commentaryPart = "";
+        
+        const semiIdx = fullSql.indexOf(';');
+        if (semiIdx !== -1 && semiIdx < fullSql.length - 1) {
+          queryPart = fullSql.slice(0, semiIdx + 1).trim();
+          commentaryPart = fullSql.slice(semiIdx + 1).trim();
+        }
+
+        const isGoodSql = /\b(GROUP\s+BY|DATEADD|WHERE)\b/i.test(queryPart);
+        const evalBadge = isGoodSql 
+          ? `<span class="canary-eval-badge eval-badge-emerald">Syntax: Plausible Analytical SQL</span>`
+          : `<span class="canary-eval-badge eval-badge-amber">Partial Query Stream</span>`;
+
+        return `
+          <div class="canary-card-header">
+            <div class="canary-header-left">
+              <span class="canary-tag tag-sql">SQL</span>
+              <span class="canary-title-text">SQL Query Synthesis</span>
+              <span class="canary-meta-pill">Schema: orders(customer_name, total_spent)</span>
+            </div>
+            <div class="canary-header-right-tools">
+              ${evalBadge}
+              <button class="copy-btn" onclick="copyCanaryText(this, \`${escapeHtml(fullSql).replace(/`/g, '\\`')}\`)">Copy</button>
+            </div>
+          </div>
+          <div class="canary-prompt-banner">
+            <span class="canary-prompt-label">Prompt:</span>
+            <span>${escapeHtml(promptText)}</span>
+          </div>
+          <div class="code-editor-box">
+            ${renderCodeLines(queryPart, highlightSQL)}
+          </div>
+          ${commentaryPart ? `
+            <div class="canary-explanation-block">
+              <div class="canary-explanation-header">Query Commentary / Reasoning Trace:</div>
+              <div>${escapeHtml(commentaryPart)}</div>
+            </div>
+          ` : ''}
+        `;
+      }
+
+      // 2. Python Canary
+      if (tag === 'Python') {
+        const fullPy = (completionText.startsWith(promptText)) ? completionText : (promptText + completionText);
+        const hasRecursiveCall = /\bfibonacci(_sequence)?\s*\(/i.test(completionText);
+        const hasEot = completionText.includes('<|endoftext|>');
+        
+        const evalBadge = hasRecursiveCall
+          ? `<span class="canary-eval-badge eval-badge-emerald">Logic: Recursive Case Defined</span>`
+          : `<span class="canary-eval-badge eval-badge-amber">Incomplete Logic</span>`;
+
+        return `
+          <div class="canary-card-header">
+            <div class="canary-header-left">
+              <span class="canary-tag tag-python">Python</span>
+              <span class="canary-title-text">Python Algorithm Synthesis</span>
+              <span class="canary-meta-pill">Task: Fibonacci Generator</span>
+            </div>
+            <div class="canary-header-right-tools">
+              ${evalBadge}
+              ${hasEot ? '<span class="canary-eval-badge eval-badge-purple">EOS Clean Stop</span>' : ''}
+              <button class="copy-btn" onclick="copyCanaryText(this, \`${escapeHtml(fullPy).replace(/`/g, '\\`')}\`)">Copy</button>
+            </div>
+          </div>
+          <div class="canary-prompt-banner">
+            <span class="canary-prompt-label">Prompt:</span>
+            <span>${escapeHtml(promptText.replace(/\n/g, ' '))}</span>
+          </div>
+          <div class="code-editor-box">
+            ${renderCodeLines(fullPy, highlightPython)}
+          </div>
+        `;
+      }
+
+      // 3. Tool Calling / JSON Canary
+      if (tag === 'Tool Calling / JSON') {
+        const combined = (completionText.startsWith(promptText)) ? completionText : (promptText + completionText);
+        
+        // Extract JSON block
+        let jsonStr = combined;
+        let commentary = "";
+        let parsed = null;
+
+        let braceCount = 0;
+        let inString = false;
+        let escape = false;
+        let start = combined.indexOf("{");
+        let end = -1;
+
+        if (start !== -1) {
+          for (let i = start; i < combined.length; i++) {
+            const ch = combined[i];
+            if (escape) { escape = false; continue; }
+            if (ch === "\\") { escape = true; continue; }
+            if (ch === '"') { inString = !inString; continue; }
+            if (!inString) {
+              if (ch === "{") braceCount++;
+              else if (ch === "}") {
+                braceCount--;
+                if (braceCount === 0) { end = i; break; }
+              }
+            }
+          }
+        }
+
+        if (end !== -1) {
+          jsonStr = combined.slice(start, end + 1);
+          commentary = combined.slice(end + 1).trim();
+          try {
+            parsed = JSON.parse(jsonStr);
+          } catch(e) {}
+        }
+
+        const isValidJSON = parsed !== null;
+        const evalBadge = isValidJSON
+          ? `<span class="canary-eval-badge eval-badge-emerald">Schema: Valid Tool Call Object</span>`
+          : `<span class="canary-eval-badge eval-badge-amber">Stream: Incomplete JSON Token</span>`;
+
+        return `
+          <div class="canary-card-header">
+            <div class="canary-header-left">
+              <span class="canary-tag tag-tool">JSON</span>
+              <span class="canary-title-text">Tool Calling & JSON Function Calling</span>
+              <span class="canary-meta-pill">API: query_database</span>
+            </div>
+            <div class="canary-header-right-tools">
+              ${evalBadge}
+              <button class="copy-btn" onclick="copyCanaryText(this, \`${escapeHtml(combined).replace(/`/g, '\\`')}\`)">Copy</button>
+            </div>
+          </div>
+          <div class="canary-prompt-banner">
+            <span class="canary-prompt-label">Prompt:</span>
+            <span>${escapeHtml(promptText)}</span>
+          </div>
+          ${isValidJSON && parsed.tool_call ? `
+            <div class="json-tool-card">
+              <div class="json-tool-header">
+                <span>Action: ${escapeHtml(parsed.tool_call.name || 'unknown')}</span>
+                <span style="color: var(--text-dim); font-size: 0.65rem;">Parsed Arguments</span>
+              </div>
+              ${Object.entries(parsed.tool_call.arguments || {}).map(([k, v]) => `
+                <div class="json-param-row">
+                  <span class="json-param-key">${escapeHtml(k)}:</span>
+                  <span>"${escapeHtml(String(v))}"</span>
+                </div>
+              `).join('')}
+            </div>
+          ` : ''}
+          <div class="code-editor-box">
+            ${renderCodeLines(jsonStr, highlightJSON)}
+          </div>
+          ${commentary ? `
+            <div class="canary-explanation-block">
+              <div class="canary-explanation-header">Agent Post-Execution Commentary:</div>
+              <div>${escapeHtml(commentary)}</div>
+            </div>
+          ` : ''}
+        `;
+      }
+
+      // 4. Math / Reasoning Canary
+      if (tag === 'Math / Reasoning') {
+        const fullMath = (completionText.startsWith(promptText)) ? completionText : (promptText + completionText);
+        let reasoningBody = completionText;
+        if (reasoningBody.startsWith(promptText)) {
+          reasoningBody = reasoningBody.slice(promptText.length).trim();
+        }
+
+        const hasTarget60 = /\b60\b/.test(reasoningBody);
+        const evalBadge = hasTarget60
+          ? `<span class="canary-eval-badge eval-badge-emerald">Target Match: 60 km/h</span>`
+          : `<span class="canary-eval-badge eval-badge-amber">Target Deviation (Expected: 60 km/h)</span>`;
+
+        let highlightedReasoning = escapeHtml(reasoningBody);
+        highlightedReasoning = highlightedReasoning.replace(/\b(Question:|Answer:|Solution:)/g, '<strong style="color: var(--white);">$1</strong>');
+        highlightedReasoning = highlightedReasoning.replace(/\b(\d+)\s*(km\/h|km|hours?)\b/gi, '<span style="color: var(--amber); font-weight: 600;">$1 $2</span>');
+
+        return `
+          <div class="canary-card-header">
+            <div class="canary-header-left">
+              <span class="canary-tag tag-math">Math</span>
+              <span class="canary-title-text">Quantitative Problem Solving</span>
+              <span class="canary-meta-pill">Target: 60 km/h (120 km ÷ 2 h)</span>
+            </div>
+            <div class="canary-header-right-tools">
+              ${evalBadge}
+              <button class="copy-btn" onclick="copyCanaryText(this, \`${escapeHtml(fullMath).replace(/`/g, '\\`')}\`)">Copy</button>
+            </div>
+          </div>
+          <div class="canary-prompt-banner">
+            <span class="canary-prompt-label">Prompt:</span>
+            <span>${escapeHtml(promptText.replace(/\n/g, ' '))}</span>
+          </div>
+          <div class="math-step-card">
+            <div>${highlightedReasoning || '<em style="color: var(--text-dim)">Generating reasoning steps...</em>'}</div>
+          </div>
+        `;
+      }
+
+      // 5. General Knowledge Canary
+      if (tag === 'General Knowledge') {
+        const fullGen = (completionText.startsWith(promptText)) ? completionText : (promptText + completionText);
+        let proseBody = completionText;
+        if (proseBody.startsWith(promptText)) {
+          proseBody = proseBody.slice(promptText.length).trim();
+        }
+
+        let highlightedProse = escapeHtml(proseBody);
+        highlightedProse = highlightedProse.replace(/\b(glucose|ATP|mitochondria|homeostasis|cellular respiration|cells|energy)\b/gi, '<strong style="color: var(--emerald);">$1</strong>');
+
+        return `
+          <div class="canary-card-header">
+            <div class="canary-header-left">
+              <span class="canary-tag tag-general">Knowledge</span>
+              <span class="canary-title-text">Scientific & Domain Factual Recall</span>
+              <span class="canary-meta-pill">Cellular Biology & Biochemistry</span>
+            </div>
+            <div class="canary-header-right-tools">
+              <span class="canary-eval-badge eval-badge-emerald">Syntactic Fluency: High</span>
+              <button class="copy-btn" onclick="copyCanaryText(this, \`${escapeHtml(fullGen).replace(/`/g, '\\`')}\`)">Copy</button>
+            </div>
+          </div>
+          <div class="canary-prompt-banner">
+            <span class="canary-prompt-label">Prompt:</span>
+            <span>${escapeHtml(promptText)}...</span>
+          </div>
+          <div class="prose-reading-box">
+            ${highlightedProse || '<em style="color: var(--text-dim)">Generating factual text...</em>'}
+          </div>
+        `;
+      }
+
+      // Fallback
+      const tagClass = tag.toLowerCase().includes('sql') ? 'sql' :
+                       tag.toLowerCase().includes('python') ? 'python' :
+                       tag.toLowerCase().includes('tool') ? 'tool' :
+                       tag.toLowerCase().includes('math') ? 'math' : 'general';
+      const catName = canary.category || (tag.toLowerCase().includes('sql') ? 'SQL' :
+                                          tag.toLowerCase().includes('python') ? 'Python' :
+                                          tag.toLowerCase().includes('tool') ? 'JSON Tool' :
+                                          tag.toLowerCase().includes('math') ? 'Math' : 'Knowledge');
+      return `
+        <div class="canary-card-header">
+          <div class="canary-header-left">
+            <span class="canary-tag tag-${tagClass}">${escapeHtml(tag)}</span>
+            <span class="canary-title-text">${escapeHtml(canary.title || (tag + ' Synthesis'))}</span>
+            <span class="canary-meta-pill">Category: ${escapeHtml(catName)}</span>
+          </div>
+          <div class="canary-header-right-tools">
+            <span class="canary-eval-badge eval-badge-emerald">${escapeHtml(catName)} Probing</span>
+            <button class="copy-btn" onclick="copyCanaryText(this, \`${escapeHtml(completionText).replace(/`/g, '\\`')}\`)">Copy</button>
+          </div>
+        </div>
+        <div class="canary-prompt-banner">
+          <span class="canary-prompt-label">Prompt:</span>
+          <span>${escapeHtml(promptText)}</span>
+        </div>
+        <div class="code-editor-box">
+          <div class="code-line"><span class="line-text">${escapeHtml(completionText)}</span></div>
+        </div>
+      `;
+    }
+
+    function applyChartData() {
+      if (!rawHistory || rawHistory.length === 0) return;
+
+      const slice = rawHistory;
+      const steps = slice.map(r => Number(r.step).toLocaleString());
+
+      // 1. Chart 1: Loss & Multi-Pulse Convergence
+      chart1.data.labels = steps;
+      chart1.data.datasets[0].data = slice.map(r => r.train_loss);
+      chart1.data.datasets[1].data = computeEMA(slice.map(r => r.train_loss), 0.85);
+      chart1.data.datasets[2].data = slice.map(r => (r.val_loss !== null && r.val_loss !== undefined) ? (r.val_pulse_losses?.[0] ?? null) : null);
+      chart1.data.datasets[3].data = slice.map(r => (r.val_loss !== null && r.val_loss !== undefined) ? (r.val_pulse_losses?.[1] ?? null) : null);
+      chart1.data.datasets[4].data = slice.map(r => (r.val_loss !== null && r.val_loss !== undefined) ? (r.val_pulse_losses?.[2] ?? r.val_loss ?? null) : null);
+      chart1.update('none');
+
+      // 2. Chart 2: Gradient Norms & Optimizer Health (#1)
+      chart2.data.labels = steps;
+      chart2.data.datasets[0].data = slice.map(r => r.grad_norm_total ?? r.grad_total ?? null);
+      chart2.data.datasets[1].data = slice.map(r => r.grad_norm_muon ?? r.grad_muon ?? null);
+      chart2.data.datasets[2].data = slice.map(r => r.grad_norm_adam ?? r.grad_adam ?? null);
+      chart2.data.datasets[3].data = slice.map(() => 1.0);
+      chart2.update('none');
+
+      // 3. Chart 3: Recurrent Pulse Intelligence Gain (#4)
+      chart3.data.labels = steps;
+      chart3.data.datasets[0].data = slice.map(r => {
+        const p = r.pulse_losses;
+        return (p && p.length >= 2) ? Number((p[0] - p[1]).toFixed(4)) : null;
+      });
+      chart3.data.datasets[1].data = slice.map(r => {
+        const p = r.pulse_losses;
+        return (p && p.length >= 3) ? Number((p[1] - p[2]).toFixed(4)) : null;
+      });
+      chart3.data.datasets[2].data = slice.map(r => {
+        const p = r.pulse_losses;
+        return (p && p.length >= 3) ? Number((p[0] - p[2]).toFixed(4)) : null;
+      });
+      chart3.data.datasets[3].data = slice.map(r => {
+        const p = r.pulse_losses;
+        if (!p || p.length < 3) return null;
+        const ppl1 = Math.exp(Math.min(p[0], 15));
+        const ppl3 = Math.exp(Math.min(p[2], 15));
+        if (ppl1 <= 0) return 0;
+        const relGainPct = ((ppl1 - ppl3) / ppl1) * 100;
+        return Number(relGainPct.toFixed(1));
+      });
+      chart3.update('none');
+
+      // 4. Chart 4: Sparse MoE Expert Routing & Load Distribution
+      chart4.data.labels = steps;
+      const lastRow = slice[slice.length - 1];
+      const nExp = (lastRow && lastRow.expert_pcts && lastRow.expert_pcts.length)
+        || (lastModelConfig && lastModelConfig.n_routed_experts) || 8;
+      ensureExpertDatasets(nExp);
+      for (let e = 0; e < nExp; e++) {
+        chart4.data.datasets[e].data = slice.map(r => r.expert_pcts?.[e] ?? (r[`e${e}`] ?? null));
+      }
+      chart4.data.datasets[nExp].data = slice.map(() => Number((100 / nExp).toFixed(1)));
+      chart4.data.datasets[nExp + 1].data = slice.map(r => r.router_max_bias ?? r.max_bias ?? null);
+      chart4.update('none');
+
+      const latestR = slice[slice.length - 1];
+      if (latestR && latestR.expert_pcts && latestR.expert_pcts.length > 0) {
+        const ep = latestR.expert_pcts;
+        const minE = Math.min(...ep).toFixed(1);
+        const maxE = Math.max(...ep).toFixed(1);
+        const bEl = document.getElementById('badgeMoEBalance');
+        if (bEl) bEl.innerText = `Spread: ${minE}%–${maxE}% | Bias: ${(latestR.router_max_bias ?? 0).toFixed(3)}`;
+      }
+
+      // 5. Chart 5: Recurrent State Velocity & Contraction Dynamics
+      chart5.data.labels = steps;
+      chart5.data.datasets[0].data = slice.map(r => r.pulse_deltas?.[0] ?? (r.delta_h1 ?? null));
+      chart5.data.datasets[1].data = slice.map(r => r.pulse_deltas?.[1] ?? (r.delta_h2 ?? null));
+      chart5.data.datasets[2].data = slice.map(r => r.pulse_deltas?.[2] ?? (r.delta_h3 ?? null));
+      chart5.data.datasets[3].data = slice.map(r => r.pulse_final_delta ?? (r.pulse_deltas?.[2] ?? null));
+      chart5.data.datasets[4].data = slice.map(r => (r.mix_lambda ?? null) !== null ? Number((r.mix_lambda * 100).toFixed(1)) : null);
+      chart5.update('none');
+
+      if (latestR && latestR.pulse_deltas && latestR.pulse_deltas.length >= 3) {
+        const pd = latestR.pulse_deltas;
+        const bCont = document.getElementById('badgeContraction');
+        if (bCont) bCont.innerText = `Contraction: ${(pd[0] / Math.max(1e-3, pd[2])).toFixed(1)}× (${pd[0].toFixed(0)} → ${pd[2].toFixed(0)})`;
+      }
+
+      // 6. Chart 6: Hardware Saturation & Training Stability
+      chart6.data.labels = steps;
+      chart6.data.datasets[0].data = slice.map(r => r.tok_per_sec ?? null);
+      const flopScale = (lastModelConfig && lastModelConfig.active_params)
+        ? 6.0 * lastModelConfig.active_params * (lastModelConfig.num_pulses || 3) / 1e12
+        : null;
+      chart6.data.datasets[1].data = slice.map(r => {
+        if (r.tflops !== null && r.tflops !== undefined) return r.tflops;
+        return (r.tok_per_sec && flopScale) ? Number((r.tok_per_sec * flopScale).toFixed(2)) : null;
+      });
+      chart6.data.datasets[2].data = slice.map(r => r.vram_peak ?? null);
+      chart6.update('none');
+
+      if (latestR && latestR.tok_per_sec) {
+        const bHw = document.getElementById('badgeHardwarePerf');
+        if (bHw) bHw.innerText = `${(latestR.tok_per_sec / 1e3).toFixed(1)}k tok/s • ${latestR.mfu_pct !== null && latestR.mfu_pct !== undefined ? latestR.mfu_pct.toFixed(1) + '% MFU' : '-- MFU'} • ${latestR.vram_peak !== null && latestR.vram_peak !== undefined ? latestR.vram_peak + 'GB' : '-- GB'}`;
+      }
+
+      const countBadge = document.getElementById('pointCountBadge');
+      if (countBadge) {
+        countBadge.innerText = `${slice.length.toLocaleString()} Steps Visualized`;
+      }
+    }
+
+    async function fetchHistory() {
+      try {
+        const url = `/api/history?last_n=${currentRangeLimit}&max_points=1500`;
+        const res = await fetch(url);
+        if (!res.ok) return;
+        const data = await res.json();
+        rawHistory = data.history || [];
+        applyChartData();
+      } catch (err) {
+        console.warn('History fetch error', err);
+      }
+    }
+
+    async function fetchCanaryMilestones() {
+      try {
+        const res = await fetch('/api/canaries');
+        if (!res.ok) return;
+        const data = await res.json();
+        milestoneCanaries = data.milestones || [];
+        renderScrubber();
+        renderSelectedCanaries();
+      } catch (err) {
+        console.warn('Canaries fetch error', err);
+      }
+    }
+
+    function renderScrubber() {
+      const container = document.getElementById('scrubberContainer');
+      if (!container || milestoneCanaries.length === 0) return;
+
+      container.innerHTML = '';
+      milestoneCanaries.forEach((m, idx) => {
+        const btn = document.createElement('button');
+        const isSelected = (selectedMilestoneIdx === -1 && idx === milestoneCanaries.length - 1) || (selectedMilestoneIdx === idx);
+        btn.className = `scrub-btn ${isSelected ? 'active' : ''}`;
+        btn.innerText = m.label || `Step ${m.step}`;
+        btn.onclick = () => {
+          selectedMilestoneIdx = idx;
+          renderScrubber();
+          renderSelectedCanaries();
+        };
+        container.appendChild(btn);
+      });
+    }
+
+    function renderSelectedCanaries() {
+      const grid = document.getElementById('canaryGrid');
+      const labelEl = document.getElementById('viewingMilestoneLabel');
+      if (!grid || milestoneCanaries.length === 0) return;
+
+      const activeIdx = (selectedMilestoneIdx === -1) ? (milestoneCanaries.length - 1) : selectedMilestoneIdx;
+      const milestone = milestoneCanaries[activeIdx] || milestoneCanaries[milestoneCanaries.length - 1];
+
+      // Comparison milestone (defaults to Step 100 baseline or previous milestone)
+      const baselineMilestone = milestoneCanaries[0] || milestone;
+
+      if (labelEl) {
+        const valLossStr = milestone.val_loss ? ` (Val Loss: ${milestone.val_loss.toFixed(4)})` : '';
+        labelEl.innerText = `${milestone.label || 'Step ' + milestone.step}${valLossStr}`;
+      }
+
+      grid.innerHTML = '';
+      let canaries = milestone.canaries || [];
+
+      // Filter by domain if requested
+      if (canaryCategoryFilter !== 'ALL') {
+        const filt = canaryCategoryFilter.toLowerCase();
+        canaries = canaries.filter(c => {
+          const t = inferCanaryTag(c, c.prompt).toLowerCase();
+          const cat = (c.category || '').toLowerCase();
+          if (filt === 'sql') return t.includes('sql') || cat.includes('sql');
+          if (filt === 'python') return t.includes('python') || cat.includes('python');
+          if (filt.includes('tool') || filt.includes('json')) return t.includes('tool') || t.includes('json') || cat.includes('tool') || cat.includes('json');
+          if (filt.includes('math')) return t.includes('math') || cat.includes('math') || t.includes('reasoning');
+          if (filt.includes('knowledge')) return t.includes('knowledge') || cat.includes('knowledge') || t.includes('learning') || t.includes('science');
+          return t.includes(filt) || cat.includes(filt);
+        });
+      }
+
+      canaries.forEach(c => {
+        const card = document.createElement('div');
+        card.className = 'canary-card';
+
+        let promptText = c.prompt || '';
+        let completionText = c.completion || '';
+
+        if (!isCompareMode) {
+          // Standard Single-Milestone Tailored View
+          card.innerHTML = renderCanaryContent(c, promptText, completionText);
+        } else {
+          // Side-by-Side Milestone Comparison Mode
+          const baseCanary = baselineMilestone.canaries?.find(bc => bc.tag === c.tag) || c;
+          const basePrompt = baseCanary.prompt || promptText;
+          const baseComp = baseCanary.completion || '';
+
+          card.innerHTML = `
+            <div class="canary-card-header">
+              <div class="canary-header-left">
+                <span class="canary-tag tag-${c.tag.toLowerCase().includes('sql') ? 'sql' : c.tag.toLowerCase().includes('python') ? 'python' : c.tag.toLowerCase().includes('tool') ? 'tool' : c.tag.toLowerCase().includes('math') ? 'math' : 'general'}">${escapeHtml(c.tag)}</span>
+                <span class="canary-title-text">${escapeHtml(c.tag)} Qualitative Progression</span>
+              </div>
+              <div class="canary-header-right-tools">
+                <span class="canary-eval-badge eval-badge-purple">Comparison View</span>
+                <button class="copy-btn" onclick="copyCanaryText(this, \`${escapeHtml(completionText).replace(/`/g, '\\`')}\`)">Copy Current</button>
+              </div>
+            </div>
+            <div class="canary-prompt-banner">
+              <span class="canary-prompt-label">Prompt:</span>
+              <span>${escapeHtml(promptText.replace(/\n/g, ' '))}</span>
+            </div>
+            <div class="canary-split-comparison">
+              <div class="compare-pane">
+                <div class="compare-pane-title">
+                  <span>${escapeHtml(baselineMilestone.label || 'Step 100 Baseline')}</span>
+                  <span style="color: var(--amber);">Early Weights</span>
+                </div>
+                <div class="code-editor-box">
+                  <div class="code-line"><span class="line-text" style="color: var(--text-dim);">${escapeHtml(baseComp)}</span></div>
+                </div>
+              </div>
+              <div class="compare-pane">
+                <div class="compare-pane-title">
+                  <span>${escapeHtml(milestone.label || 'Current Milestone')}</span>
+                  <span style="color: var(--emerald);">Active Weights</span>
+                </div>
+                <div class="code-editor-box">
+                  <div class="code-line"><span class="line-text">${escapeHtml(completionText)}</span></div>
+                </div>
+              </div>
+            </div>
+          `;
+        }
+
+        grid.appendChild(card);
+      });
+    }
+
+    async function updateDashboard() {
+      try {
+        const res = await fetch('/api/status');
+        if (!res.ok) throw new Error('Status error');
+        const data = await res.json();
+
+        const statusDot = document.getElementById('statusDot');
+        const statusText = document.getElementById('liveStatusText');
+
+        if (!data || data.status === 'idle') {
+          if (statusDot) {
+            statusDot.classList.add('offline');
+            statusDot.classList.remove('cooling');
+          }
+          statusText.innerText = 'Standby';
+          statusText.style.color = 'var(--text-dim)';
+          return;
+        }
+
+        const coolingBanner = document.getElementById('coolingBanner');
+        if (data.status === 'cooling') {
+          if (statusDot) {
+            statusDot.classList.remove('offline');
+            statusDot.classList.add('cooling');
+          }
+          const rem = data.cooling_remaining_s || 0;
+          const total = data.cooling_total_s || 120;
+          const pct = Math.max(0, Math.min(100, (rem / total) * 100));
+
+          statusText.innerText = `Cooling (${rem}s)`;
+          statusText.style.color = 'var(--amber)';
+
+          if (coolingBanner) {
+            coolingBanner.style.display = 'flex';
+            const countdownEl = document.getElementById('coolingCountdown');
+            if (countdownEl) countdownEl.innerText = `${rem}s`;
+            const meterEl = document.getElementById('coolingMeterFill');
+            if (meterEl) meterEl.style.width = `${pct}%`;
+          }
+        } else {
+          if (statusDot) {
+            statusDot.classList.remove('offline');
+            statusDot.classList.remove('cooling');
+          }
+          statusText.innerText = 'Active Run';
+          statusText.style.color = 'var(--emerald)';
+          if (coolingBanner) coolingBanner.style.display = 'none';
+        }
+
+        // 1. Dynamic Model Architecture & Hardware Badges
+        if (data.model_config) {
+          const mc = data.model_config;
+          lastModelConfig = mc;
+          const k = data.num_pulses || mc.num_pulses || 3;
+          const nCore = mc.n_core || 8;
+          const effL = nCore * k;
+          const bCore = document.getElementById('hdrBadgeCore');
+          if (bCore) bCore.innerText = `Core: ${nCore}L → ${effL}L (${k} Pulse${k > 1 ? 's' : ''})`;
+
+          const bMoE = document.getElementById('hdrBadgeMoE');
+          if (bMoE) {
+            bMoE.innerText = (mc.n_routed_experts > 0)
+              ? `MoE: ${mc.n_shared_experts || 1} Shared + ${mc.n_routed_experts} Routed (Top-${mc.top_k || 2})`
+              : `Dense SwiGLU FFN`;
+          }
+
+          const bAttn = document.getElementById('hdrBadgeAttn');
+          if (bAttn) bAttn.innerText = `${((mc.max_seq_len || 32768) / 1024).toFixed(0)}k Hybrid Attention`;
+
+          const bParams = document.getElementById('hdrBadgeParams');
+          if (bParams) {
+            const totM = ((mc.total_params || 298552384) / 1e6).toFixed(1);
+            const actM = ((mc.active_params || 146800640) / 1e6).toFixed(1);
+            bParams.innerText = `${totM}M Total (${actM}M Active)`;
+          }
+        }
+        if (data.device_name) {
+          const bDev = document.getElementById('hdrBadgeDevice');
+          if (bDev) bDev.innerText = data.device_name;
+        }
+
+        // 2. Dual Horizon Progress Bars
+        const step = data.step || 0;
+        const maxSteps = data.max_steps || (data.total_steps || 100);
+        const targetSteps = data.target_steps || data.active_target || maxSteps;
+        const stepPct = Math.min(100, ((step / targetSteps) * 100)).toFixed(1);
+        document.getElementById('valStepText').innerText = (data.target_steps && data.target_steps < maxSteps)
+            ? `Step ${step.toLocaleString()} / ${targetSteps.toLocaleString()} (Curriculum: ${maxSteps.toLocaleString()})`
+            : `Step ${step.toLocaleString()} / ${maxSteps.toLocaleString()}`;
+        document.getElementById('valStepPct').innerText = `${stepPct}%`;
+        document.getElementById('stepProgressBar').style.width = `${stepPct}%`;
+        document.getElementById('valPhase').innerText = data.phase || (step >= targetSteps ? 'Target Completed' : 'Stable Phase');
+        document.getElementById('valETA').innerText = data.eta_str || '--:--';
+        document.getElementById('valElapsed').innerText = data.elapsed_str || '--';
+
+        // Run Completion / Milestone Status Banner
+        const runBanner = document.getElementById('runStatusBanner');
+        if (runBanner) {
+          if (step >= targetSteps && targetSteps > 0) {
+            runBanner.style.display = 'flex';
+            document.getElementById('runStatusTitle').innerText = `SESSION TARGET REACHED (${targetSteps} STEPS)`;
+            document.getElementById('runStatusBadge').innerText = `Best Val: ${data.best_val_loss ? data.best_val_loss.toFixed(4) : '--'}`;
+            document.getElementById('runStatusDesc').innerText = `Target step ${targetSteps} reached successfully. Checkpoint saved to checkpoints/latest.pt and checkpoints/milestone_step_${targetSteps}.pt.`;
+          } else {
+            runBanner.style.display = 'none';
+          }
+        }
+
+        const tokensSeen = data.tokens_seen || 0;
+        const datasetTokens = data.train_dataset_tokens || 950387366;
+        const numShards = data.num_train_shards || 2;
+        const datasetPct = ((tokensSeen / datasetTokens) * 100).toFixed(2);
+        
+        // Dynamic Shard Traversal & Epoch Math
+        const shardSize = datasetTokens / Math.max(1, numShards);
+        const currentShardIdx = Math.min(numShards, Math.floor(tokensSeen / shardSize) + 1);
+        const tokensInCurrentShard = tokensSeen % shardSize;
+        const shardPct = ((tokensInCurrentShard / shardSize) * 100).toFixed(1);
+        const tokensRemainingInShard = Math.max(0, shardSize - tokensInCurrentShard);
+        const batchTokens = data.global_batch_tokens || 131072;
+        const stepsToNextShard = Math.ceil(tokensRemainingInShard / batchTokens);
+        const totalEpochSteps = Math.ceil(datasetTokens / batchTokens);
+
+        const horizonTitleEl = document.getElementById('datasetHorizonTitle');
+        if (horizonTitleEl) horizonTitleEl.innerText = `Dataset Horizon (${numShards} Shards Zero-Copy)`;
+        
+        const shardsTextEl = document.getElementById('valShardsText');
+        if (shardsTextEl) shardsTextEl.innerText = `Shard ${currentShardIdx}/${numShards} (${(tokensInCurrentShard / 1e6).toFixed(1)}M / ${(shardSize / 1e6).toFixed(1)}M • ${shardPct}%)`;
+
+        const batchEl = document.getElementById('valBatchText');
+        if (batchEl) batchEl.innerText = `${batchTokens.toLocaleString()} tok/step (~${stepsToNextShard.toLocaleString()} steps to Shard ${currentShardIdx < numShards ? currentShardIdx + 1 : 1})`;
+
+        document.getElementById('valTokensText').innerText = `${(tokensSeen / 1e6).toFixed(2)}M / ${(datasetTokens / 1e6).toFixed(1)}M Total Tokens (${totalEpochSteps.toLocaleString()} steps / epoch)`;
+        document.getElementById('valDatasetPct').innerText = `${datasetPct}%`;
+        document.getElementById('datasetProgressBar').style.width = `${Math.min(100, datasetPct)}%`;
+
+        // 3. Top 6 High-Signal KPI Stat Cards
+        const kPulses = data.num_pulses || (data.model_config ? data.model_config.num_pulses : 3);
+        const nCore = data.model_config ? data.model_config.n_core : 8;
+        const effLayers = nCore * kPulses;
+
+        const card1Badge = document.getElementById('kpiValBadge');
+        if (card1Badge) card1Badge.innerText = `${effLayers}L`;
+        const card1Title = document.getElementById('kpiValTitle');
+        if (card1Title) card1Title.innerText = kPulses > 1 ? `Val Loss (Pulse ${kPulses})` : `Validation Loss`;
+
+        const vpl = data.val_pulse_losses || [];
+        const vppl = data.val_pulse_ppls || [];
+        const lLast = (vpl.length > 0 && vpl[vpl.length - 1] !== null) ? vpl[vpl.length - 1] : data.val_loss;
+        const pplLast = (vppl.length > 0 && vppl[vppl.length - 1] !== null) ? vppl[vppl.length - 1] : (lLast ? Math.exp(Math.min(lLast, 15)).toFixed(2) : null);
+
+        // Card 1: Val Loss P_K
+        document.getElementById('kpiValL3').innerText = lLast ? lLast.toFixed(4) : (step < 50 ? 'Eval @ 50' : 'Pending');
+        document.getElementById('kpiValPPL3').innerText = pplLast ? pplLast : (step < 50 ? 'Scheduled' : '--');
+        document.getElementById('kpiBestVal').innerText = data.best_val_loss ? data.best_val_loss.toFixed(4) : '--';
+
+        // Card 2: Train Loss & Real Recursive EMA
+        const trLoss = data.train_loss || 0;
+        document.getElementById('kpiTrainLoss').innerText = trLoss ? trLoss.toFixed(4) : '--';
+        document.getElementById('kpiTrainPPL').innerText = data.train_ppl ? data.train_ppl.toFixed(2) : '--';
+
+        let realEMA = trLoss;
+        if (rawHistory && rawHistory.length > 0) {
+          const losses = rawHistory.map(r => r.train_loss).filter(x => x !== null && x !== undefined);
+          if (losses.length > 0) {
+            const emaSeries = computeEMA(losses, 0.85);
+            realEMA = emaSeries[emaSeries.length - 1];
+          }
+        }
+        document.getElementById('kpiTrainEMA').innerText = realEMA ? realEMA.toFixed(4) : '--';
+
+        const delta = data.loss_delta || 0;
+        const deltaPill = document.getElementById('kpiLossDeltaPill');
+        if (deltaPill) {
+          const sign = delta > 0 ? '+' : '';
+          deltaPill.innerText = `Δ: ${sign}${delta.toFixed(4)}`;
+          deltaPill.className = `kpi-pill ${delta <= 0 ? 'kpi-pill-emerald' : 'kpi-pill-rose'}`;
+        }
+
+        // Card 3: Recurrent Pulse Gain & Reasoning Refinement
+        const stepPulses = data.pulse_losses && data.pulse_losses.length > 0 ? data.pulse_losses : null;
+        const evalPulses = (vpl && vpl.length > 0 && vpl[0] !== null) ? vpl : null;
+        const activePulses = stepPulses || evalPulses;
+
+        if (activePulses && activePulses.length > 1) {
+          const plFirst = activePulses[0];
+          const plLast = activePulses[activePulses.length - 1];
+          const netLossGain = plFirst - plLast;
+          const pplFirst = Math.exp(Math.min(plFirst, 15));
+          const pplFinal = Math.exp(Math.min(plLast, 15));
+          const relPPLGainPct = pplFirst > 0 ? (((pplFirst - pplFinal) / pplFirst) * 100) : 0;
+          const sign = netLossGain >= 0 ? '−' : '+';
+
+          document.getElementById('kpiRecurrentGain').innerText = `Δ ${sign}${Math.abs(netLossGain).toFixed(4)} nats`;
+          document.getElementById('kpiRecurrentPPLGain').innerText = `${relPPLGainPct >= 0 ? '+' : ''}${relPPLGainPct.toFixed(1)}% PPL`;
+
+          const pDeltas = [];
+          for (let p = 0; p < activePulses.length - 1; p++) {
+            const diff = activePulses[p] - activePulses[p + 1];
+            const pSign = diff >= 0 ? '-' : '+';
+            pDeltas.push(`P${p+1}→${p+2}: ${pSign}${Math.abs(diff).toFixed(3)}`);
+          }
+          document.getElementById('kpiPulseStepDeltas').innerText = pDeltas.join(' | ');
+        } else {
+          document.getElementById('kpiRecurrentGain').innerText = `Core Pass`;
+          document.getElementById('kpiRecurrentPPLGain').innerText = `--`;
+          document.getElementById('kpiPulseStepDeltas').innerText = `Standard Single-Pass (K=1)`;
+        }
+
+        // Card 4: Gradient Norm & Optimizer Clip (#1)
+        const grad = data.grad_norm_total ?? data.grad_total ?? 0;
+        document.getElementById('kpiGradTotal').innerText = grad > 0 ? grad.toFixed(3) : '--';
+        const gradBadge = document.getElementById('kpiGradBadge');
+        if (gradBadge) {
+          gradBadge.innerText = grad <= 1.0 ? 'Norm < 1.0 (Stable)' : 'Clipped 1.0';
+          gradBadge.className = `kpi-pill ${grad <= 1.0 ? 'kpi-pill-emerald' : 'kpi-pill-amber'}`;
+        }
+        const gMuon = data.grad_norm_muon ?? data.grad_muon ?? 0;
+        const gAdam = data.grad_norm_adam ?? data.grad_adam ?? 0;
+        document.getElementById('kpiSubGrads').innerText = `M: ${gMuon.toFixed(2)} | A: ${gAdam.toFixed(2)}`;
+        const gradRatio = gAdam > 0 ? (gMuon / gAdam).toFixed(2) : '--';
+        const ratioEl = document.getElementById('kpiGradRatio');
+        if (ratioEl) ratioEl.innerText = `M/A: ${gradRatio}×`;
+
+        // Card 5: Throughput & Hardware Efficiency (#2)
+        const tokSec = data.tok_per_sec ?? 0;
+        const mfu = data.mfu_pct ?? null;
+        const vram = data.vram_peak ?? null;
+        const maxVram = 8.0;
+        const headroom = vram !== null ? Math.max(0, maxVram - vram).toFixed(1) : null;
+        const stepTime = tokSec > 0 ? (batchTokens / tokSec).toFixed(2) : null;
+
+        document.getElementById('kpiTokPerSec').innerText = tokSec > 0 ? `${(tokSec / 1e3).toFixed(1)}k tok/s` : '-- tok/s';
+        const mfuTag = document.getElementById('kpiMfuBadge');
+        if (mfuTag) {
+          mfuTag.innerText = mfu !== null ? `${mfu.toFixed(1)}% MFU` : '-- MFU';
+          mfuTag.style.color = mfu === null ? 'var(--text-dim)' : (mfu >= 30 ? 'var(--emerald)' : (mfu >= 20 ? 'var(--amber)' : 'var(--rose)'));
+        }
+        document.getElementById('kpiStepTime').innerText = stepTime !== null ? `${stepTime}s/step` : '-- s/step';
+        document.getElementById('kpiVramHeadroom').innerText = vram !== null ? `${vram.toFixed(1)} / ${maxVram} GB (${headroom} GB Free)` : `-- / ${maxVram} GB`;
+
+        // Card 6: MoE Routing Uniformity & Balance (Shannon Entropy)
+        const ep = data.expert_pcts || [];
+        if (ep.length > 0) {
+          const sumP = ep.reduce((a, b) => a + b, 0);
+          let shannonH = 0;
+          for (const p of ep) {
+            const prob = p / Math.max(1e-5, sumP);
+            if (prob > 0) {
+              shannonH -= prob * Math.log(prob);
+            }
+          }
+          const maxH = Math.log(ep.length);
+          const hNormPct = Math.min(100, Math.max(0, (shannonH / maxH) * 100));
+          const minE = Math.min(...ep).toFixed(1);
+          const maxE = Math.max(...ep).toFixed(1);
+
+          const uniformEl = document.getElementById('kpiMoeUniformity');
+          if (uniformEl) {
+            uniformEl.innerText = `${hNormPct.toFixed(1)}% Uniform`;
+            uniformEl.style.color = hNormPct >= 95 ? 'var(--purple)' : (hNormPct >= 85 ? 'var(--amber)' : 'var(--rose)');
+          }
+
+          const diagUniformEl = document.getElementById('diagMoEUniformityVal');
+          if (diagUniformEl) {
+            diagUniformEl.innerText = `${hNormPct.toFixed(1)}%`;
+          }
+
+          const spreadEl = document.getElementById('kpiMoeSpreadSub');
+          if (spreadEl) {
+            spreadEl.innerText = `Spread: ${minE}%–${maxE}%`;
+          }
+
+          const biasEl = document.getElementById('kpiMoEBiasSub');
+          if (biasEl) {
+            biasEl.innerText = `Bias: ${(data.router_max_bias || 0).toFixed(3)}`;
+          }
+
+          const moeBadge = document.getElementById('kpiMoeUniformBadge');
+          if (moeBadge) {
+            moeBadge.innerText = `Top-${data.model_config?.top_k || 2} (${ep.length}E)`;
+          }
+
+          // Also update Chart 4 header status pill
+          const bEl = document.getElementById('badgeMoEBalance');
+          if (bEl) {
+            bEl.innerText = `Uniformity: ${hNormPct.toFixed(1)}% | Spread: ${minE}%–${maxE}% | Bias: ${(data.router_max_bias || 0).toFixed(3)}`;
+          }
+        }
+
+        // Badges in Charts
+        const gradStatusBadge = document.getElementById('badgeGradStatus');
+        if (gradStatusBadge) {
+          gradStatusBadge.innerText = `Total: ${grad > 0 ? grad.toFixed(3) : '--'} ${grad <= 1.0 ? '(Stable)' : '(Clipped)'}`;
+        }
+
+        const lrBadge = document.getElementById('badgeLRSchedule');
+        if (lrBadge) {
+          lrBadge.innerText = `Muon: ${(data.lr_muon || 0).toFixed(3)} | Adam: ${(data.lr_adam || 0).toExponential(1)}`;
+        }
+
+        // Subsystem Diagnostics Card 1 (Dynamic Recurrent Core Table)
+        const coreTitle = document.getElementById('diagCoreTitle');
+        if (coreTitle) coreTitle.innerText = `Pulsar Recurrent Core (${nCore} Layers Looped ${kPulses}× = ${effLayers} Effective Layers)`;
+
+        const tblBody = document.getElementById('recurrentCoreTblBody');
+        if (tblBody) {
+          const useLive = (data.pulse_losses && data.pulse_losses.length > 0 && data.pulse_losses[0] !== null);
+          const tablePulses = useLive ? data.pulse_losses : (vpl || []);
+          const tablePpls = tablePulses.map(x => x ? Math.exp(Math.min(x, 15)) : null);
+          const isLiveSuffix = useLive ? ' (Live)' : '';
+
+          if (tablePulses.length > 0) {
+            tblBody.innerHTML = '';
+            tablePulses.forEach((val, idx) => {
+              const pNum = idx + 1;
+              const pEffL = pNum * nCore;
+              const pName = pNum === 1 ? 'Fast Draft' : (pNum === tablePulses.length ? 'Deep Output' : 'Refine');
+              let gText = 'Baseline Draft';
+              if (idx > 0 && tablePulses[idx - 1] !== null && val !== null) {
+                const diff = val - tablePulses[idx - 1];
+                gText = `${diff > 0 ? '+' : ''}${diff.toFixed(4)}`;
+              }
+              const pplText = tablePpls[idx] !== null ? tablePpls[idx].toFixed(2) : '--';
+
+              const tr = document.createElement('tr');
+              tr.innerHTML = `
+                <td><strong style="color: ${idx === 0 ? 'var(--amber)' : (idx === tablePulses.length - 1 ? 'var(--emerald)' : 'var(--silver)')};">Pulse ${pNum}</strong></td>
+                <td>${pEffL} Layers (${pName})</td>
+                <td style="color: var(--white);">${val !== null ? `${val.toFixed(4)}${isLiveSuffix}` : '--'}</td>
+                <td>${pplText}</td>
+                <td style="color: ${idx === 0 ? 'var(--text-dim)' : (gText.startsWith('-') ? 'var(--emerald)' : 'var(--amber)')};">${gText}</td>
+              `;
+              tblBody.appendChild(tr);
+            });
+
+            if (tablePulses.length > 1 && tablePulses[0] !== null && tablePulses[tablePulses.length - 1] !== null) {
+              const totalGain = tablePulses[tablePulses.length - 1] - tablePulses[0];
+              const pplFirst = Math.exp(Math.min(tablePulses[0], 15));
+              const pplLast = Math.exp(Math.min(tablePulses[tablePulses.length - 1], 15));
+              const totalPPLGain = (pplFirst - pplLast).toFixed(2);
+              document.getElementById('diagTotalGain').innerText = `${totalGain.toFixed(4)} Loss (${totalPPLGain} PPL Gain)${isLiveSuffix}`;
+              const badgeGain = document.getElementById('badgePPLGain');
+              if (badgeGain) badgeGain.innerText = `+${totalPPLGain} PPL Saved by Recurrence`;
+            }
+          }
+        }
+
+        const lambda = data.mix_lambda ?? null;
+        document.getElementById('diagMixLambda').innerText = lambda !== null
+          ? `${(lambda * 100).toFixed(1)}% Input / ${((1 - lambda) * 100).toFixed(1)}% Recurrent`
+          : `-- / --`;
+
+        // Subsystem Diagnostics Card 2 (Dynamic MoE Geometry & Expert Breakdown)
+        if (data.model_config) {
+          const mc = data.model_config;
+          const moeTitle = document.getElementById('diagMoETitle');
+          if (moeTitle) {
+            moeTitle.innerText = (mc.n_routed_experts > 0)
+              ? `Sparse MoE Routing & Expert Specialization (${mc.n_shared_experts || 1} Shared + ${mc.n_routed_experts} Routed, Top-${mc.top_k || 2})`
+              : `Dense SwiGLU Backbone (No Mixture-of-Experts)`;
+          }
+          const geomEl = document.getElementById('diagMoEGeom');
+          if (geomEl) {
+            geomEl.innerText = (mc.n_routed_experts > 0)
+              ? `${mc.n_shared_experts || 1} Shared + ${mc.n_routed_experts} Routed (Top-${mc.top_k || 2})`
+              : `Dense SwiGLU`;
+          }
+          const ffnEl = document.getElementById('diagMoEActiveFFN');
+          if (ffnEl) {
+            ffnEl.innerText = `d_expert = ${mc.d_expert || 1024} | ${mc.active_ffn_dim || 3072} Active FFN Width`;
+          }
+          const compEl = document.getElementById('diagActiveCompute');
+          if (compEl) {
+            compEl.innerText = `${((mc.active_params || 146800640) / 1e6).toFixed(1)}M Active`;
+          }
+          const paramDetEl = document.getElementById('diagActiveParamsDetail');
+          if (paramDetEl) {
+            const nEmbedM = ((mc.non_embed_active_params || 96468992) / 1e6).toFixed(1);
+            const totM = ((mc.total_params || 298552384) / 1e6).toFixed(1);
+            paramDetEl.innerText = `${nEmbedM}M non-embed | ${totM}M total`;
+          }
+        }
+
+        const distEl = document.getElementById('diagMoEDist');
+        if (distEl) {
+          distEl.innerText = ep.length > 0 ? `[${ep.map((x, i) => x.toFixed(1) + '%').join(' ')}]` : `Dense (100% Core)`;
+        }
+        const entEl = document.getElementById('diagMoEEntropy');
+        if (entEl) entEl.innerText = `Max Bias |b_i|: ${(data.router_max_bias || 0).toFixed(3)}`;
+        const rConfEl = document.getElementById('diagRouterConf');
+        if (rConfEl) {
+          if (ep.length > 1) {
+            const meanE = ep.reduce((a, b) => a + b, 0) / ep.length;
+            const varE = ep.reduce((a, b) => a + (b - meanE) ** 2, 0) / ep.length;
+            const cv = meanE > 0 ? (Math.sqrt(varE) / meanE) * 100 : 0;
+            rConfEl.innerText = `±${cv.toFixed(1)}% CV`;
+            rConfEl.title = 'Coefficient of variation of expert load (0% = perfectly even)';
+          } else {
+            rConfEl.innerText = '--';
+          }
+        }
+
+        // Refresh milestones when a new evaluation step occurs
+        if (data.val_loss !== null && data.val_loss !== undefined) {
+          fetchCanaryMilestones();
+        }
+      } catch (err) {
+        console.warn('Dashboard poll error', err);
+      }
+    }
+
+    // Startup
+    fetchHistory();
+    fetchCanaryMilestones();
+    updateDashboard();
+    setInterval(updateDashboard, 1500);
+    setInterval(fetchHistory, 10000);
+    setInterval(fetchCanaryMilestones, 15000);
+  </script>
+</body>
+</html>

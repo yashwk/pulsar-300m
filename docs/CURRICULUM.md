@@ -1,0 +1,190 @@
+# Pulsar-300M Training Curriculum & Corpus Specification
+
+- **Total Pretraining Budget:** **6.00 Billion Tokens** across 12 Strictly Disjoint Shards
+- **Training Progression:** 3-Stage Staged Context & Reasoning Curriculum ($1\text{k} \to 2\text{k} \to 32\text{k}$)
+- **Curriculum Architecture:** NVIDIA Nemotron 5-Pillar Stack
+- **Learning Rate Schedule:** Warmup-Stable-Decay (WSD) with 150-step linear warmup, flat 100% peak LR stable plateau, and late-stage annealing cooldown.
+- **Hardware Profile:** Local Node (NVIDIA GeForce RTX 4060 Laptop 8GB VRAM) / Single-GPU nodes
+
+---
+
+## 1. 3-Stage Curriculum Architecture
+
+The 6.0 Billion token pretraining curriculum is partitioned into 3 progressive stages across 12 disjoint 500M-token shards:
+
+```mermaid
+flowchart TD
+    subgraph S1 ["Stage 1: Foundation Pretraining (4.0B Tokens)"]
+        direction TB
+        S1_DATA["Shards 0-7 (4.0B Tokens, Context T = 1,024)"]
+        S1_MIX["NVIDIA Nemotron 5-Pillar Mix (80% Direct / 20% CoT):
+        • 30% Code, SWE & CLI (22% Direct / 8% CoT)
+        • 25% Math & Proofs (15% Direct / 10% CoT)
+        • 15% Agentic MCP (3-Way Multi-Harness)
+        • 22% Clean STEM (finewiki / fineweb-edu)
+        • 8% Dialogue (6% Direct / 2% CoT)"]
+        S1_WSD["WSD Schedule:
+        • Steps 1-150: Linear Warmup (0 -> Peak LR)
+        • Steps 151-30,281: Flat Stable Plateau (100% LR)"]
+        S1_DATA --> S1_MIX --> S1_WSD
+    end
+
+    subgraph S2 ["Stage 2: High-Density Reasoning Upsample (1.5B Tokens)"]
+        direction TB
+        S2_DATA["Shards 8-10 (1.5B Tokens, Context T = 2,048)"]
+        S2_MIX["Targeted Reasoning Mix:
+        • 35% Deep Code (R1 CoT traces)
+        • 30% Olympiad Math (AIMO-2)
+        • 20% Multi-Step Agentic MCP
+        • 10% Advanced STEM Papers
+        • 5% Latent Thinking Chains"]
+        S2_WSD["WSD Schedule:
+        • Steps 30,282-41,636: Continuous Stable Plateau (100% LR)
+        • Zero Cooldown Decay"]
+        S2_DATA --> S2_MIX --> S2_WSD
+    end
+
+    subgraph S3 ["Stage 3: 32k Long-Context & Annealing Cooldown (0.5B Tokens)"]
+        direction TB
+        S3_DATA["Shard 11 (0.5B Tokens, Long-Context T up to 32,768)"]
+        S3_MIX["Extended Context Corpus:
+        • Full Technical Books & Repositories
+        • Monograph Proof Chains
+        • Extended Multi-Turn Tool Traces"]
+        S3_WSD["WSD Schedule (The 'D' in WSD):
+        • Steps 41,637-45,421: Cosine Cooldown Decay
+        • Decays Peak LR -> 1% Min LR
+        • Final Basin Convergence"]
+        S3_DATA --> S3_MIX --> S3_WSD
+    end
+
+    S1 --> S2 --> S3
+```
+
+---
+
+## 2. Stage Breakdown & Domain Ratios
+
+### Stage 1: Foundation Core Mix (4.0 Billion Tokens | Shards 0–7)
+- **Token Budget:** $4,000,000,000$ tokens ($8 \text{ shards} \times 500\text{M}$ tokens each).
+- **Optimizer Steps:** **`30,281 steps`** (at 132,096 tokens per step).
+- **Sequence Length ($T$):** Fixed context window $T = 1,024$ tokens.
+- **Learning Rate Dynamics:** 
+  - Steps 1 $\to$ 150: Linear warmup from 0 to full peak LR (`Muon: 0.02`, `Adam: 6e-4`).
+  - Steps 151 $\to$ 30,281: Flat stable plateau at 100% peak LR (zero cooldown).
+- **Domain Composition (NVIDIA Nemotron 5-Pillar Blend across 9 Sub-Streams):**
+  Enforces a strict **80% Direct / 20% CoT** balance to prevent competitive reasoning monologues from overwhelming factual knowledge and direct code generation:
+
+  1. **Pillar 1 — Code, SWE, CLI & Algorithms (30.0% / 1.20B tokens):**
+     - **Sub-stream 1A (22.0% / 880M tokens — Direct Clean Source Code):** Pure implementations in Python, C++, Rust, CUDA, Bash, and shell scripts without chain-of-thought overhead.
+       - *Sources:* `tokyotech-llm/swallow-code-v2`, `HuggingFaceTB/issues-kaggle-notebooks`.
+     - **Sub-stream 1B (8.0% / 320M tokens — Explicit CoT Code Reasoning):** Algorithmic and software architecture reasoning formatted inside `<|think|>...<|/think|>`.
+       - *Sources:* `nvidia/OpenCodeReasoning`, `nvidia/Nemotron-SFT-Competitive-Programming-v2`.
+  2. **Pillar 2 — Mathematics, Proofs & Symbolic Logic (25.0% / 1.00B tokens):**
+     - **Sub-stream 2A (15.0% / 600M tokens — Direct Solutions & Explanations):** Step-by-step arithmetic, algebra, calculus, discrete math without puzzle monologues.
+       - *Sources:* `nvidia/Nemotron-CC-Math-v1`, `HuggingFaceTB/FineMath`.
+     - **Sub-stream 2B (10.0% / 400M tokens — Explicit CoT Math Reasoning):** Deep mathematical derivations and Olympiad problem-solving wrapped in `<|think|>...<|/think|>`.
+       - *Sources:* `nvidia/OpenMathReasoning`.
+  3. **Pillar 3 — Agentic Tool Calling & Structured Schemas (15.0% / 0.60B tokens):**
+     - **Sub-stream 3A (15.0% / 600M tokens — Multi-Harness Agentic MCP):** Multi-turn tool execution traces, JSON schemas, and CLI commands randomized across 3 popular agent harness syntaxes (Native, XML, and Markdown JSON).
+       - *Sources:* `Agent-Ark/Toucan-1.5M`, `TaskTrove`.
+  4. **Pillar 4 — High-Density STEM & Educational Knowledge (22.0% / 0.88B tokens):**
+     - **Sub-stream 4A (22.0% / 880M tokens — Clean Factual Knowledge):** Encyclopedic science, physics, biology, and computer science textbooks without R1 reasoning pollution.
+       - *Sources:* `finewiki`, `fineweb-edu` (strictly excludes `InfiniByte-Reasoning` so biological concepts like "cell" are preserved factually).
+  5. **Pillar 5 — Multi-Turn Conversational Reasoning (8.0% / 0.32B tokens):**
+     - **Sub-stream 5A (6.0% / 240M tokens — Direct Dialogue):** Multi-turn conversational exchanges, instruction-following, and direct queries.
+       - *Sources:* `Magpie-Ultra-v0.1`.
+     - **Sub-stream 5B (2.0% / 80M tokens — Deep CoT Conversational Reasoning):** Multi-turn dialogue with explicit `<|think|>...<|/think|>` reflective chains.
+       - *Sources:* `OpenThoughts3`.
+
+---
+
+### Stage 2: High-Density Reasoning & Niche Upsample (1.5 Billion Tokens | Shards 8–10)
+- **Token Budget:** $1,500,000,000$ tokens ($3 \text{ shards} \times 500\text{M}$ tokens each).
+- **Optimizer Steps:** **`11,355 steps`** (Steps 30,282 $\to$ 41,636).
+- **Sequence Length ($T$):** Doubled context window $T = 2,048$ tokens.
+- **Learning Rate Dynamics:** Continues at **100% peak LR** (no decay).
+- **Domain Shift:**
+  - **35% Deep Code:** System-level engineering, multi-file codebases, R1 reasoning traces.
+  - **30% Olympiad Math:** AIMO-2, Putnam competitions, formal Olympiad proof chains.
+  - **20% Multi-Step Agentic MCP:** Multi-agent dialogue loops and sequential tool dependencies.
+  - **10% Advanced STEM:** Advanced research literature and technical papers.
+  - **5% Explicit Thinking Chains:** Formatted with `<|think|> ... <|/think|>` latent CoT reasoning.
+
+---
+
+### Stage 3: 32k Long-Context & Annealing Cooldown (0.5 Billion Tokens | Shard 11)
+- **Token Budget:** $500,000,000$ tokens (Shard 11).
+- **Optimizer Steps:** **`3,785 steps`** (Steps 41,637 $\to$ 45,421).
+- **Sequence Length ($T$):** Variable long-context $T \in [2,048, 32,768]$ tokens.
+- **Corpus Selection:** Strictly documents $\ge 2,048$ tokens (complete software repositories, full textbooks, formal mathematical monographs, lengthy tool logs).
+- **Learning Rate Dynamics (The "D" in WSD):**
+  - **This is the only stage where cooldown occurs.**
+  - Cosine decay from $100\%$ peak LR down to $1\%$ minimum LR over these final 3,785 steps.
+  - Anneals the model into the sharpest, flattest global loss basin, delivering a 15–25% reduction in validation perplexity.
+
+---
+
+## 3. Disjoint Shard Architecture & Pre-Flight Audit Status
+
+All shards are stored as memory-mapped flat binary files of 16-bit unsigned integers (`uint16`) on NVMe SSD:
+
+- **Train Shard:** `data/train_shard{N}.bin` (~476,000,000 tokens $\approx 952\text{ MB}$).
+- **Val Shard:** `data/val_shard{N}.bin` (~24,000,000 tokens $\approx 48\text{ MB}$).
+- **Disjoint Partitioning Guarantee:** Parquet source files are partitioned strictly via modulo math (`file_idx % 12 == shard_idx`) and row-level modulo partition for multi-gigabyte cached files (`finewiki`, `fineweb-edu`), ensuring **0% data duplication** across Shards 0 through 11 without duplicate disk storage.
+- **Zero Network Latency During Training:** `StreamingPinnedBatchLoader` streams tokens directly from NVMe using `np.memmap`, eliminating HTTP streaming bottlenecks and PyTorch worker IPC overhead.
+
+### Current Shard Status & Verified Audit Metrics
+
+| Shard Index | Stage & Focus | Train Tokens | Val Tokens | Total Tokens | Sub-Stream Delta | Audit Status |
+| :---: | :--- | :---: | :---: | :---: | :---: | :---: |
+| **Pre-Flight Test** | 10M Test Verification | 9,500,000 | 500,000 | 10,000,000 | $\le \pm 0.06\%$ | **100% Passed** |
+| **Shard 1** | Stage 1 Foundation (Nemotron 5-Pillar) | 476,102,464 | 23,915,490 | 500,017,954 | $0.00\%$ | **100% Passed** |
+| **Shard 2** | Stage 1 Foundation (Nemotron 5-Pillar) | 476,333,688 | 23,690,781 | 500,024,469 | $0.00\%$ | **100% Passed** |
+| **Launchpad Total** | **Clean Tokens on Disk** | **952,436,152** | **47,606,271** | **1,000,042,423** | **0.00%** | **Ready for Stage 1** |
+
+---
+
+## 4. Tokenizer Specification & Pre-Flight Quality Guards (`data/pulsar_tokenizer`)
+
+- **Vocabulary Size:** `49,152` tokens (optimized for 4-warp GPU alignment).
+- **Type:** Byte-Level Byte-Pair Encoding (BPE).
+- **Number Representation:** **Strict single-digit splitting (`0-9`)**. Numbers are never merged into multi-digit tokens, preventing BPE fragmentation and directly enhancing arithmetic and line-number reasoning in code.
+- **Special Tokens & Atomic IDs (0..8):**
+  All special tokens are registered as atomic `AddedToken(..., special=True)` so they are never split into constituent subwords:
+  - `ID 0: <|endoftext|>` — Sequence boundary and document delimiter.
+  - `ID 1: <|im_start|>` — Chat message / role boundary start.
+  - `ID 2: <|im_end|>` — Chat message / role boundary end.
+  - `ID 3: <|think|>` — Latent Chain-of-Thought reasoning start (normalized from `<think>`).
+  - `ID 4: <|/think|>` — Latent Chain-of-Thought reasoning end (normalized from `</think>`).
+  - `ID 5: <|tool_call|>` — Agentic tool call invocation start.
+  - `ID 6: <|/tool_call|>` — Agentic tool call invocation end.
+  - `ID 7: <|tool_response|>` — Tool execution response / observation start.
+  - `ID 8: <|/tool_response|>` — Tool execution response / observation end.
+
+### Data Normalization & Quality Guards
+
+1. **Reasoning Trace Conciseness Guard ($\le 2,400$ chars):**
+   - Natural reasoning traces $\le 2,400$ characters are preserved 100% intact so prompt + `<|think|>...<|/think|>` + code/math solution fits unbroken inside the 1,024-token context window.
+   - For traces exceeding 2,400 characters, slicing occurs strictly at clean sentence boundaries (`. \n`, `! \n`, `? \n`) while explicitly preserving the final concluding sentence before `<|/think|>`. The pipeline **never** hard-slices mid-word or mid-sentence.
+2. **Multi-Harness Tool-Calling Format Randomization (Sub-stream 3A):**
+   To ensure compatibility with any autonomous agent harness, tool-calling examples are probabilistically formatted with matching instructions dynamically injected into the system prompt:
+   - **70% Native Fast Format:** System prompt instructs `<|tool_call|>{"name": ..., "arguments": ...}<|/tool_call|>`.
+   - **15% XML Format (Claude / Cline style):** System prompt instructs `<|tool_call|><invoke name="...">...</invoke><|/tool_call|>`.
+   - **15% Markdown JSON Format:** System prompt instructs ````json\n{"tool": ..., "arguments": ...}\n````.
+3. **Comprehensive Tool-Call Normalization:**
+   - Handles singular OpenAI `function_call`, plural `tool_calls` lists, inline `<tool_call>` strings, and maps tool/environment observation roles into `<|tool_response|>...<|/tool_response|>`.
+
+---
+
+## 5. Hardware Runtime Invariants & Operational Constraints
+
+| Dimension | Specification | Architecture Invariant |
+| :--- | :---: | :--- |
+| **Micro-Batch Size ($MBS$)** | `3` | 3 sequences $\times$ 1024 tokens = 3,072 tokens per micro-batch |
+| **Gradient Accumulation** | `43` | $43 \times 3,072 = \mathbf{132,096\text{ tokens / optimizer step}}$ |
+| **VRAM Operational Ceiling** | $\le \mathbf{7.20\text{ GB}}$ | Strictly bounded within 8.00 GB hardware limit with zero activation checkpointing |
+| **Compute Precision** | Pure BF16 / FP32 | BF16 matrix compute; strict FP32 for 1D parameters, router weights, and norms |
+| **Thermal Protection Policy** | `Every 100 steps` | Periodic 100-second cooling pause to prevent hardware thermal throttling |
+| **Validation Interval** | `Every 50 steps` | Evaluates loss across held-out validation shards and logs generation canaries |
+| **Checkpoint Cadence** | `Every 50 steps` | Atomically writes `latest.pt` and tracks running `best.pt` validation records |

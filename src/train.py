@@ -831,7 +831,11 @@ def train():
                         "tag": tag,
                         "category": category,
                         "prompt": prompt,
-                        "completion": generation_clean
+                        "completion": generation_clean,
+                        # Which step produced this sample. Without it the fallback
+                        # repeated the previous text silently and a single generation
+                        # looked like N consecutive identical results.
+                        "generated_at_step": step,
                     })
                 except Exception as e:
                     print(f"  [{tag}] Canary error: {e}")
@@ -975,7 +979,10 @@ def train():
             "val_ppl": round(val_ppl if val_ppl is not None else last_val_ppl, 2) if (val_ppl is not None or last_val_ppl is not None) else None,
             "val_pulse_losses": [round(x, 4) for x in cur_vpl] if cur_vpl is not None else None,
             "val_pulse_ppls": [round(x, 2) for x in cur_vppl] if cur_vppl is not None else None,
-            "canaries": latest_canaries,
+            # Fall back to the last generated set: on non-eval steps latest_canaries is
+            # empty, which made the canary panel blank out between evals even though the
+            # last generation was still the current state of the model.
+            "canaries": latest_canaries if latest_canaries else last_live_canaries,
         }
         with open(live_tmp, "w", encoding="utf-8") as f:
             json.dump(live_payload, f, indent=2)

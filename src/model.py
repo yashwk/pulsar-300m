@@ -557,9 +557,18 @@ def compute_token_slots(
         counts.index_add_(0, flat_e, torch.ones(M, device=device, dtype=torch.long))
         start_off = counts.cumsum(0) - counts            # [E] group start per expert
 
-        # Fast path: everything fits. Rank within expert is the token-ordered position.
+        # Fast path: everything fits.
+        #
+        # The rank must be the assignment's ORDINAL WITHIN ITS EXPERT, not its position
+        # in the flattened token order. `arange(M) - start_off[flat_e]` is only correct
+        # when assignments are already grouped by expert; the router emits them in token
+        # order, so with interleaved experts (e.g. [[0,1],[0,1]]) it produced
+        # [0, -1, 2, 1]: slot 0 and 1 land in expert 0, and 2/1 collide or overflow.
+        # The stable sort by expert id establishes that grouping.
         if int(counts.max()) <= capacity:
-            rank = torch.arange(M, device=device) - start_off[flat_e]
+            order = torch.argsort(flat_e, stable=True)
+            rank = torch.empty(M, device=device, dtype=torch.long)
+            rank[order] = torch.arange(M, device=device) - start_off[flat_e[order]]
             return rank.to(torch.int32).view(N, K)
 
         # Slow path: order by (expert asc, weight desc) so low-weight assignments drop.
@@ -810,9 +819,12 @@ class PulsarMoEMLP(nn.Module):
                     0, count_idx,
                     torch.ones(topk_idx.numel(), device=x.device, dtype=torch.float32),
                 )
-            # Suppressed while torch.utils.checkpoint recomputes this block during
-            # backward, otherwise every counter would increment twice.
-            if not _RECOMPUTING.active:
+            # Counters feed the auxiliary-loss-free bias update, so only TRAINING
+            # forwards may move them. Validation and generation were accumulating too:
+            # one eval forward added 768 assignments and shifted the routing bias before
+            # the next optimizer step. Suppressed during checkpoint recompute as well,
+            # otherwise every counter would increment twice.
+            if self.training and (not _RECOMPUTING.active):
                 self.expert_counts_accum.add_(bincounts)
                 self.expert_pulse_counts[pulse_idx].add_(bincounts)
                 # Drop accounting stays on the GPU; drained by pop_moe_stats().

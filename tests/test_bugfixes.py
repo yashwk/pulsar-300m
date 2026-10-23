@@ -156,7 +156,9 @@ def test_padded_positions_do_not_reach_routing_statistics():
 
     cfg = make_cfg(n_core=2, d_model=128, vocab_size=512, top_k=2)
     torch.manual_seed(0)
-    model = PulsarForCausalLM(cfg).eval()
+    # Counters are training-only now (eval contamination was a bug), so this must run
+    # in train mode for the statistics to accumulate at all.
+    model = PulsarForCausalLM(cfg).train()
 
     x = torch.randint(1, cfg.vocab_size, (1, 16))
     x[0, 10:] = 0                       # simulate 6 padded positions
@@ -608,3 +610,177 @@ def test_swiglu_accepts_noncontiguous_input():
     out = _FusedSwiGLUFunction.apply(gu, 128)
     assert out.shape == (4, 16, 128)
     assert torch.isfinite(out).all()
+
+
+# ---------------------------------------------------------------------------
+# Re-audit: MoE slot assignment, stat isolation, SR checkpoint state
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("routing", [
+    [[0, 1], [0, 1]],                       # interleaved - the failing case
+    [[0, 1], [2, 3], [4, 5], [6, 7]],       # balanced, every expert distinct
+    [[0, 0], [0, 0], [1, 1], [1, 1]],       # imbalanced, duplicate within token
+    [[3, 3], [3, 3]],                       # single expert
+    [[0, 1], [1, 0]],                       # reversed pairs
+])
+def test_moe_slots_unique_per_expert(routing):
+    """Fast path produced [0,-1,2,1] for interleaved experts: wrong and out of range.
+
+    `arange(M) - start_off[flat_e]` only works if assignments are already grouped by
+    expert. The router emits them in token order, so expert-local slots collided and
+    overflowed capacity even when every expert fit.
+    """
+    from src.model import compute_token_slots
+
+    ti = torch.tensor(routing)
+    weights = torch.ones(*ti.shape)
+    # Capacity must cover the WORST expert's load, not the number of rows: with
+    # [[3,3],[3,3]] one expert receives all 4 assignments.
+    E = 8
+    C = int(ti.reshape(-1).bincount(minlength=E).max().item())
+    slots = compute_token_slots(ti, weights, E, C)
+
+    flat_e, flat_s = ti.reshape(-1), slots.reshape(-1)
+    for e in range(E):
+        sel = (flat_e == e)
+        if not bool(sel.any()):
+            continue
+        got = flat_s[sel].tolist()
+        assert all(0 <= s < C for s in got), f"expert {e}: slot out of range {got}"
+        assert len(set(got)) == len(got), f"expert {e}: duplicate slots {got}"
+        assert sorted(got) == list(range(len(got))), f"expert {e}: not contiguous {got}"
+
+
+def test_moe_slots_match_reference_on_random_routing():
+    """Compare against an obviously-correct per-expert reference implementation."""
+    from src.model import compute_token_slots
+
+    torch.manual_seed(0)
+    for trial in range(5):
+        N, K, E, C = 64, 2, 8, 12
+        ti = torch.randint(0, E, (N, K))
+        tw = torch.rand(N, K)
+        got = compute_token_slots(ti, tw, E, C)
+
+        want = torch.full((N * K,), -1, dtype=torch.int32)
+        fe, fw = ti.reshape(-1), tw.reshape(-1)
+        for e in range(E):
+            idx = (fe == e).nonzero().squeeze(-1)
+            if idx.numel() == 0:
+                continue
+            order = torch.argsort(fw[idx], descending=True, stable=True)
+            for r, pos in enumerate(order.tolist()):
+                if r < C:
+                    want[idx[pos]] = r
+        assert torch.equal(got.reshape(-1).to(torch.int32), want), f"trial {trial} mismatch"
+
+
+def test_moe_slot_gradients_match_reference():
+    """The slot bug corrupted MoE parameter gradients by ~100%."""
+    import src.model as M
+    from src.model import PulsarConfig, PulsarForCausalLM
+
+    cfg = make_cfg(n_core=2, d_model=128, vocab_size=512, top_k=2)
+    orig = M.compute_token_slots
+
+    def reference(ti, tw, E, C):
+        N, K = ti.shape
+        s = torch.full((N * K,), -1, dtype=torch.int32, device=ti.device)
+        fe, fw = ti.reshape(-1), tw.reshape(-1).float()
+        for e in range(E):
+            idx = (fe == e).nonzero().squeeze(-1)
+            if idx.numel() == 0:
+                continue
+            order = torch.argsort(fw[idx], descending=True, stable=True)
+            for r, pos in enumerate(order.tolist()):
+                if r < C:
+                    s[idx[pos]] = r
+        return s.view(N, K)
+
+    def grads(slot_fn):
+        torch.manual_seed(0)
+        m = PulsarForCausalLM(cfg)
+        m.train()
+        x = torch.randint(0, cfg.vocab_size, (2, 16))
+        y = torch.randint(0, cfg.vocab_size, (2, 16))
+        M.compute_token_slots = slot_fn
+        try:
+            m.zero_grad()
+            _, loss, _ = m(x, labels=y, num_pulses=2)
+            loss.backward()
+        finally:
+            M.compute_token_slots = orig
+        return {n: p.grad.clone() for n, p in m.named_parameters() if p.grad is not None}
+
+    g_fixed = grads(orig)
+    g_ref = grads(reference)
+    for name in g_fixed:
+        torch.testing.assert_close(g_fixed[name], g_ref[name], rtol=1e-4, atol=1e-6,
+                                   msg=lambda m: f"gradient mismatch at {name}: {m}")
+
+
+@pytest.mark.skipif(not HAS_CUDA, reason="needs CUDA for the fused MoE path")
+def test_eval_forward_does_not_accumulate_routing_counters():
+    """Validation forwards fed the bias-update counters, shifting routing."""
+    from src.model import PulsarConfig, PulsarForCausalLM
+
+    cfg = make_cfg(n_core=2, d_model=128, vocab_size=512, top_k=2)
+    torch.manual_seed(0)
+    model = PulsarForCausalLM(cfg)
+    model.to_training_precision(torch.bfloat16)
+    x = torch.randint(0, cfg.vocab_size, (1, 16))
+
+    def total_counts():
+        return sum(float(b.mlp.expert_counts_accum.sum()) for b in model.core)
+
+    model.eval()
+    with torch.no_grad():
+        model(x, labels=None, num_pulses=2)
+    assert total_counts() == 0, "eval forward accumulated training counters"
+
+    model.train()
+    with torch.no_grad():
+        model(x, labels=None, num_pulses=2)
+    assert total_counts() > 0, "train forward stopped accumulating counters"
+
+
+def test_stochastic_rounding_state_round_trips():
+    """_step_count seeds the SR noise; omitting it replays the same sequence on resume."""
+    import torch.nn as nn
+
+    from src.optim import Muon
+
+    p = nn.Parameter(torch.ones(4, 4, dtype=torch.bfloat16))
+    opt = Muon([p], lr=0.1, stochastic_rounding=True, seed=7)
+    opt._step_count = 42
+    state = opt._sr_state()
+    assert state["step_count"] == 42 and state["seed"] == 7
+
+    p2 = nn.Parameter(torch.ones(4, 4, dtype=torch.bfloat16))
+    other = Muon([p2], lr=0.1, stochastic_rounding=True, seed=7)
+    other._load_sr_state(state)
+    assert other._sr_state() == state
+
+    # A resumed optimizer must not replay step-0 noise.
+    g = torch.device("cpu")
+    a = torch.randint(0, 1 << 16, (8,), generator=opt._gen(g))
+    opt._step_count += 1
+    b = torch.randint(0, 1 << 16, (8,), generator=opt._gen(g))
+    assert not torch.equal(a, b)
+
+
+def test_dual_optimizer_checkpoint_includes_sr_state():
+    from src.model import PulsarForCausalLM
+    from src.optim import PulsarDualOptimizer
+
+    cfg = make_cfg(n_core=2, d_model=128, vocab_size=512, top_k=2)
+    torch.manual_seed(0)
+    model = PulsarForCausalLM(cfg)
+    model.to_training_precision(torch.bfloat16)
+    opt = PulsarDualOptimizer(model, muon_lr=0.02, adam_lr=6e-4, weight_decay=0.1, seed=3)
+    sd = opt.state_dict()
+    assert "sr_muon" in sd and "sr_adam" in sd
+    assert sd["sr_muon"]["seed"] == 3
+    # Loading a legacy checkpoint without the SR block must not raise.
+    legacy = {k: v for k, v in sd.items() if not k.startswith("sr_")}
+    opt.load_state_dict(legacy)

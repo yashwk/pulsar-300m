@@ -89,6 +89,23 @@ class _SRMixin:
         )
         return self._generator
 
+    def _sr_state(self) -> dict:
+        return {
+            "seed": self.seed,
+            "step_count": self._step_count,
+            "stochastic_rounding": self.stochastic_rounding,
+        }
+
+    def _load_sr_state(self, state: dict | None):
+        # Backward compatible: older checkpoints have no SR block, so the step counter
+        # simply restarts. Callers that care about exact resume use the new format.
+        if not state:
+            return
+        self.seed = int(state.get("seed", self.seed))
+        self._step_count = int(state.get("step_count", 0))
+        if "stochastic_rounding" in state:
+            self.stochastic_rounding = bool(state["stochastic_rounding"])
+
 
 class Muon(_SRMixin, Optimizer):
     """Muon with FP32 update accumulation and stochastic rounding on write-back."""
@@ -317,10 +334,15 @@ class PulsarDualOptimizer:
         self.opt_adam.step()
 
     def state_dict(self) -> dict:
+        # The stochastic-rounding sequence is seeded from (seed, step_count), so both
+        # must travel with the optimizer state. Omitting them made a resumed run replay
+        # the SAME rounding noise from step 0 instead of continuing the sequence.
         return {
             "opt_muon": self.opt_muon.state_dict(),
             "opt_adam_sr": self.opt_adam_sr.state_dict(),
             "opt_adam": self.opt_adam.state_dict(),
+            "sr_muon": self.opt_muon._sr_state(),
+            "sr_adam": self.opt_adam_sr._sr_state(),
         }
 
     def load_state_dict(self, state_dict: dict):
@@ -330,3 +352,6 @@ class PulsarDualOptimizer:
             self.opt_adam_sr.load_state_dict(state_dict["opt_adam_sr"])
         if state_dict.get("opt_adam") is not None:
             self.opt_adam.load_state_dict(state_dict["opt_adam"])
+        # Absent in checkpoints written before this fix; ignored gracefully.
+        self.opt_muon._load_sr_state(state_dict.get("sr_muon"))
+        self.opt_adam_sr._load_sr_state(state_dict.get("sr_adam"))

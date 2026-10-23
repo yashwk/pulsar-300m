@@ -297,6 +297,9 @@ def train():
     parser.add_argument("--eval-every", type=int, default=25, help="Steps between validation and canary generation")
     parser.add_argument("--eval-iters", type=int, default=10, help="Batches evaluated during validation")
     parser.add_argument("--save-every", type=int, default=25, help="Steps between saving latest.pt")
+    parser.add_argument("--no-save", action="store_true",
+                        help="Never write checkpoints (smoke tests). A full checkpoint is "
+                             "~1.3 GB; writing one per short test run fills small volumes.")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--output-ckpt", type=str, default=None, help="Explicit filepath to save output checkpoints")
     parser.add_argument("--resume", nargs="?", const="latest", default=None, help="Resume training from checkpoint")
@@ -437,6 +440,8 @@ def train():
     cfg.per_pulse_bias = args.per_pulse_bias
     if args.per_pulse_bias:
         print("[Pulsar] Per-pulse balancing bias: ON")
+    if args.no_save:
+        print("[Pulsar] Checkpoint saving: DISABLED (--no-save)")
     print(f"[Pulsar] MoE capacity factor: {cfg.moe_capacity_factor} "
           f"(align {cfg.moe_capacity_align}) | drop warning above {args.drop_warn_pct}%")
     model = PulsarForCausalLM(cfg).to(device=device)
@@ -676,6 +681,18 @@ def train():
         # Drop statistics are per-pulse on purpose: drops concentrate on whichever pulse
         # routes most unevenly, so a single global rate would hide the case that matters.
         moe_stats = raw_model.pop_moe_stats() if hasattr(raw_model, "pop_moe_stats") else {}
+        # Learned-scale diagnostics (one sync per log step; cheap and worth seeing).
+        with torch.no_grad():
+            # Only the pulses this run actually uses; slots beyond K stay at init and
+            # would otherwise clutter the log with meaningless values.
+            K = args.num_pulses
+            pulse_res_scale_mean = (
+                raw_model.pulse_res_scale.detach().float().mean(dim=1)[:K].tolist()
+            )
+            routed_scale_mean = torch.stack([
+                blk.mlp.routed_scale.detach().float().mean(dim=1)[:K]
+                for blk in raw_model.core
+            ]).mean(dim=0).tolist()
         drop_str = ""
         if moe_stats.get("per_pulse"):
             rates = [f"P{d['pulse']}:{d['drop_rate']*100:.2f}%" for d in moe_stats["per_pulse"] if d["assigned"] > 0]
@@ -745,7 +762,7 @@ def train():
                     print(f"  [{tag}] Canary error: {e}")
             print("-----------------------------------------------------------------")
 
-            if is_best:
+            if is_best and not args.no_save:
                 best_ckpt_path = os.path.join(args.checkpoint_dir, "best.pt")
                 if args.output_ckpt is not None:
                     best_ckpt_path = args.output_ckpt
@@ -794,6 +811,21 @@ def train():
             "router_max_bias": round(max_bias, 4),
             "expert_pcts": [round(x, 2) for x in e_pcts],
             "mix_lambda": round(mix_lambda, 4),
+            # MoE drop accounting, per pulse. Drops concentrate on whichever pulse routes
+            # most unevenly, so a single global rate hides the case that matters.
+            "moe_capacity": int(moe_stats["capacity"]) if moe_stats else None,
+            "moe_drop_rate": round(moe_stats["drop_rate"], 6) if moe_stats else None,
+            "moe_drop_per_pulse": [
+                {"pulse": d["pulse"], "assigned": int(d["assigned"]), "drop_rate": round(d["drop_rate"], 6)}
+                for d in moe_stats.get("per_pulse", []) if d["assigned"] > 0
+            ] if moe_stats else None,
+            # Latent gain: p1 - pK over the whole validation set. Positive means the
+            # recurrent pulses help; this is the signal on whether looping pays off.
+            "latent_gain": round(latent_gain, 4) if val_loss is not None else None,
+            # Learned scales - these were provably frozen before the precision fix, so
+            # logging them makes a regression immediately visible.
+            "pulse_res_scale_mean": [round(float(v), 5) for v in pulse_res_scale_mean],
+            "routed_scale_mean": [round(float(v), 5) for v in routed_scale_mean],
             "canaries": latest_canaries if latest_canaries else (last_live_canaries if 'last_live_canaries' in locals() else []),
         }
 
@@ -853,12 +885,12 @@ def train():
         os.replace(live_tmp, live_file)
 
         # Periodic Checkpoint Saving
-        if step % args.save_every == 0 or step == stop_step or interrupted:
+        if not args.no_save and (step % args.save_every == 0 or step == stop_step or interrupted):
             save_checkpoint(latest_ckpt_path, model, optimizer, cfg, step, tokens_seen, best_val_loss, num_pulses=args.num_pulses)
             print(f"[Pulsar] Saved checkpoint -> {latest_ckpt_path} (step {step})")
 
         # Session Target or Milestone Checkpoint Saving
-        if (args.target_step is not None and step == args.target_step) or (step % 1000 == 0):
+        if not args.no_save and ((args.target_step is not None and step == args.target_step) or (step % 1000 == 0)):
             milestone_path = os.path.join(args.checkpoint_dir, f"milestone_step_{step}.pt")
             save_checkpoint(milestone_path, model, optimizer, cfg, step, tokens_seen, best_val_loss, num_pulses=args.num_pulses)
             print(f"[Pulsar] Milestone Checkpoint Saved -> {milestone_path} (step {step})")

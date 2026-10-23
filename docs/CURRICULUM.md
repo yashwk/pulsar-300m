@@ -153,6 +153,12 @@ flowchart TD
 - **Corpus Selection:** Strictly documents $\ge 2,048$ tokens (complete software repositories, full textbooks, formal mathematical monographs, lengthy tool logs).
 - **Short-data mixing:** `--mix-short-fraction 0.5` (recommended): half of Stage 3
   tokens come from earlier short-context shards, to limit forgetting as context grows.
+- **Short-context evaluation point:** Stage 2 ends at peak LR, so there is no annealed
+  short-context checkpoint to evaluate. `scripts/branch_decay.py` produces one without
+  disturbing the main run: it takes the Stage-2 checkpoint, runs a short cosine cooldown
+  to the 1% floor in a **separate** output directory, and writes `branch_decay.pt`.
+  It refuses to write into the source directory and does not restore optimizer state,
+  so the main run's trajectory is unaffected.
 - **Learning Rate Dynamics (The "D" in WSD):**
   - **This is the only stage where cooldown occurs.**
   - Cosine decay from $100\%$ peak LR down to $1\%$ minimum LR over these final 3,785 steps.

@@ -301,3 +301,108 @@ def test_routing_mask_excludes_padding():
     # routing must cover exactly the real content positions, never the padding tail
     assert int(mask.sum()) == n_real
     assert bool(mask[0, :n_real].all()) and not bool(mask[0, n_real:].any())
+
+
+# ---------------------------------------------------------------------------
+# WI-07 guarantees
+# ---------------------------------------------------------------------------
+
+def _shards_in_source_blocks(n_sources=10, per_source=400, seed=0):
+    """Documents appended source-by-source, as a shard written in blocks looks."""
+    rng = np.random.default_rng(seed)
+    lens = []
+    for _ in range(n_sources):
+        lens.extend(rng.integers(200, 1200, per_source).tolist())
+    return np.asarray(lens, dtype=np.int64), per_source
+
+
+def test_windows_are_globally_shuffled_not_source_blocked():
+    """A sequential plan would feed one source at a time; packing must interleave.
+
+    Shards are built source-by-source, so document indices are contiguous per source.
+    A plan that walked indices in order would show ~100% adjacent-in-index pairs and a
+    single source dominating every prefix. Require broad interleaving instead.
+    """
+    lens, per_source = _shards_in_source_blocks()
+    plan = plan_epoch(lens, 2048, seed=0, epoch=0)
+
+    seen = []
+    seen_set = set()
+    for w in plan.windows:
+        for d in w.docs:
+            d = int(d)
+            if d not in seen_set:
+                seen_set.add(d)
+                seen.append(d)
+        if len(seen) >= 3000:
+            break
+
+    arr = np.asarray(seen[:3000])
+    adjacent = float((np.diff(arr) == 1).mean())
+    assert adjacent < 0.01, f"plan looks sequential: {adjacent:.2%} adjacent doc ids"
+
+    sources = arr // per_source
+    n_sources = len(sources) and int(sources.max()) + 1
+    # every source must appear within the first few hundred emitted documents
+    early = set(sources[:500].tolist())
+    assert len(early) >= n_sources - 1, f"only {len(early)}/{n_sources} sources in first 500 docs"
+
+    # and no source should dominate a prefix (perfect interleave would be ~1/n each)
+    counts = np.bincount(sources[:1000], minlength=n_sources)
+    share = counts / counts.sum()
+    assert share.max() < 4.0 / n_sources, f"one source dominates: max share {share.max():.1%}"
+
+
+def test_plan_is_pure_function_of_seed_and_epoch():
+    """Resume exactness: window k must not depend on how many windows were consumed."""
+    rng = np.random.default_rng(7)
+    lens = rng.integers(100, 3000, 1500).astype(np.int64)
+
+    a = plan_epoch(lens, 2048, seed=11, epoch=0)
+    b = plan_epoch(lens, 2048, seed=11, epoch=0)
+    assert len(a) == len(b)
+    for wa, wb in zip(a.windows, b.windows):
+        assert np.array_equal(wa.docs, wb.docs)
+        assert np.array_equal(wa.offs, wb.offs)
+        assert np.array_equal(wa.lens, wb.lens)
+
+    # a different seed must change the plan
+    c = plan_epoch(lens, 2048, seed=12, epoch=0)
+    differs = any(not np.array_equal(wa.docs, wc.docs) for wa, wc in zip(a.windows, c.windows))
+    assert differs, "different seeds produced identical plans"
+
+
+def test_resume_midplan_matches_uninterrupted():
+    """Windows [n:] are identical whether produced fresh or after consuming [0:n)."""
+    rng = np.random.default_rng(8)
+    lens = rng.integers(50, 900, 600).astype(np.int64)
+    full = plan_epoch(lens, 1024, seed=3, epoch=2)
+
+    # "resume": rebuild the plan from the same (seed, epoch) and skip n windows
+    n = len(full) // 2
+    resumed = plan_epoch(lens, 1024, seed=3, epoch=2)
+    for k in range(n, len(full)):
+        assert np.array_equal(full.windows[k].docs, resumed.windows[k].docs)
+        assert np.array_equal(full.windows[k].offs, resumed.windows[k].offs)
+        assert np.array_equal(full.windows[k].lens, resumed.windows[k].lens)
+
+
+def test_each_token_covered_exactly_once_per_epoch():
+    """No token is dropped and none is trained on twice (padding aside)."""
+    rng = np.random.default_rng(9)
+    lens = np.concatenate([
+        rng.integers(20, 400, 300),
+        rng.integers(500, 2500, 150),
+    ]).astype(np.int64)
+
+    for T in (512, 1024, 2048):
+        plan = plan_epoch(lens, T, seed=0, epoch=0)
+        counts = np.zeros(int(lens.sum()), dtype=np.int32)
+        base = np.concatenate(([0], np.cumsum(lens)[:-1]))
+        for w in plan.windows:
+            for d, off, ln in zip(w.docs, w.offs, w.lens):
+                d, off, ln = int(d), int(off), int(ln)
+                counts[base[d] + off: base[d] + off + ln] += 1
+        assert counts.min() == 1 and counts.max() == 1, (
+            f"T={T}: expected every token exactly once, got min={counts.min()} max={counts.max()}"
+        )

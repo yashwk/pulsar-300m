@@ -126,3 +126,91 @@ python scripts/analyze_agentic_lengths.py --mode dry-run --stage 1 --shard-idx 1
    or move accordingly? `SUBSTREAM_CONFIG_LONG` is a proposal, not a decision.
 2. Should the 32k cap ever cut a document, or should oversized documents be filtered
    instead? Not exercised by current sources.
+
+---
+
+## WI-07 / WI-10 groundwork: EOS-aligned packing (`src/packing.py`)
+
+**Status: implemented and measured; not yet wired into `train.py` (that is WI-07's CLI work).**
+
+### Why the flat sampler under-delivers
+
+The flat sampler draws fixed-stride windows from a concatenated token stream. A document
+of length `L` straddles a stride-`T` boundary with probability about `L/T`, so at
+`T=2,048` a median CoT document (1,278 tokens) is cut roughly 62% of the time *even
+though it fits*. At `T=1,024` a median CoT document cannot fit at all.
+
+This corrects an earlier framing in this report: "94.2% of CoT documents fit T=2,048"
+measured whether a document would fit *if* a window happened to start at its beginning.
+It is an upper bound on intactness, not the rate the sampler actually achieves.
+
+### Strategy C'
+
+1. **Whole documents first.** Every document of at most `T` tokens is placed whole,
+   best-fit with bounded lookahead (64 candidates) rather than first-fit.
+2. **Filler only from documents longer than `T`.** Those can never be intact under any
+   scheme, so cutting them costs nothing already lost.
+3. **Padding only at epoch end,** and only when both pools are exhausted. Padding
+   positions get `ignore_index` labels and are excluded from MoE routing and expert
+   counts: a pad run would otherwise route to the same few experts, inflating overflow
+   drops and distorting the auxiliary-loss-free balancing bias.
+
+### Measured on `data/train_shard1.bin` (475,000,000 tokens, 328,440 documents)
+
+| T | intact among fittable (flat → packed) | token-weighted | intact over all docs | padding waste | filler share |
+|---|---|---|---|---|---|
+| 2,048 | 59.3% → **100.0%** | 43.1% → **100.0%** | 50.2% → 84.8% | 0.000% (832 tok) | 51.1% |
+| 8,192 | 85.2% → **100.0%** | 70.1% → **100.0%** | 83.5% → 98.1% | 0.001% | 17.5% |
+| 32,768 | 95.7% → **100.0%** | 87.1% → **100.0%** | 95.6% → 100.0% | 0.001% | 1.9% |
+
+**Filler supply is covered at every T:** padding stays at the terminal-window floor.
+
+**The 51.1% filler share at T=2,048 is a corpus property, not a packer defect.**
+Documents longer than 2,048 tokens are 15.2% of documents but **51.1% of tokens**
+(median of that tail: 3,395 tokens; the largest document is 363,955 tokens). Half the
+token mass therefore lives in documents that can never be intact, and it necessarily
+arrives as mid-document filler. This is recorded in `docs/CURRICULUM.md` so Stage 2 is
+not read as 100% whole-document training.
+
+**Loader throughput:** 135M tok/s packed vs 31.7M tok/s flat (4.3x faster - a few large
+sequential reads per window instead of strided seeking), against a training demand of
+~8.6k tok/s. Packing adds no I/O bottleneck. (Both figures are page-cache reads; this
+compares I/O shape, not cold-disk throughput.)
+
+### Resumability and coverage guarantees (tested)
+
+* **Globally shuffled per epoch.** A shard written source-by-source has contiguous
+  document indices per source. Measured on a 10-source synthetic shard: 0.00%
+  adjacent-index pairs, all 10 sources present in the first 500 emitted documents, and
+  no source exceeding 4x its uniform share in a 1,000-document prefix. A sequential plan
+  would show ~100% adjacent pairs and one source at a time.
+* **Pure function of `(seed, epoch)`.** Rebuilding a plan reproduces every window
+  exactly; window `k` does not depend on how many windows were consumed, so resume is
+  exact. Different seeds produce different plans.
+* **Each token covered exactly once per epoch.** Verified token-by-token at T=512/1024/
+  2048: zero missing positions, zero overlapping positions.
+
+### Stage assignment
+
+Packing is used for **Stage 2, the 8-16k stage and Stage 3**. **Stage 1 keeps the flat
+permuted sampler**, because a median CoT document cannot fit a 1,024-token window, so
+packing buys little there while complicating the data path.
+
+### Open question
+
+Whether intact arcs improve reasoning is **unmeasured**. The recommended signal is the
+small GSM8K and HumanEval evals at the end of Stage 2, not a flat-vs-packed loss run.
+
+---
+
+## Baseline evaluation (Before numbers)
+
+The 250-step baseline (150-step warmup, seed 42, MBS 3x1024) runs on the current shards.
+`evaluate_loss` currently returns **the weighted sum of all three pulse losses plus
+z-loss** (0.15/0.25/0.60), not the final-pulse loss. That makes it unsuitable as the
+primary "before" metric for the final model, which is WI-06's finding.
+
+Action, scheduled with WI-06: after `--eval-full-pulses` lands, load the baseline
+checkpoint and recompute `val_ce_final`, `val_ce_p1`, `val_ce_p2`, `val_ce_p3` at 100%
+of tokens, and record them here as the comparable "before". **Training loss is directly
+comparable across the change** and is recorded as-is from the baseline run.

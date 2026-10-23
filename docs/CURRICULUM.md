@@ -69,6 +69,11 @@ flowchart TD
 - **Token Budget:** $4,000,000,000$ tokens ($8 \text{ shards} \times 500\text{M}$ tokens each).
 - **Optimizer Steps:** **`30,281 steps`** (at 132,096 tokens per step).
 - **Sequence Length ($T$):** Fixed context window $T = 1,024$ tokens.
+- **Sampler:** **Flat permuted windows** (the default for this stage). Best-fit packing
+  is deliberately *not* used here: a median CoT document is 1,278 tokens, so most cannot
+  fit a 1,024-token window anyway, and packing would buy little while complicating the
+  data path. Stage 1 therefore uses the global per-epoch permutation over
+  non-overlapping windows (see WI-07).
 - **Learning Rate Dynamics:** 
   - Steps 1 $\to$ 150: Linear warmup from 0 to full peak LR (`Muon: 0.02`, `Adam: 6e-4`).
   - Steps 151 $\to$ 30,281: Flat stable plateau at 100% peak LR (zero cooldown).
@@ -103,6 +108,16 @@ flowchart TD
 - **Token Budget:** $1,500,000,000$ tokens ($3 \text{ shards} \times 500\text{M}$ tokens each).
 - **Optimizer Steps:** **`11,355 steps`** (Steps 30,282 $\to$ 41,636).
 - **Sequence Length ($T$):** Doubled context window $T = 2,048$ tokens.
+- **Sampler:** **EOS-aligned packed windows** (`--pack bestfit`). Whole documents fill
+  each window, so a document shorter than $T$ is presented intact rather than being cut
+  by a fixed stride. Leftover space is filled from documents longer than $T$, which
+  cannot be intact under any sampler.
+  - **Caveat — roughly half of Stage 2 tokens are mid-document filler.** Measured on
+    the Stage 1 shards at $T=2{,}048$: documents longer than the window are 15.2% of
+    documents but **51.1% of tokens**, so ~51% of content arrives as continued chunks.
+    Stage 2 is therefore *not* 100% whole-document training. It is 100% whole-document
+    for every document that can fit (up from 59.3% under the flat sampler), with the
+    remainder necessarily mid-document.
 - **Learning Rate Dynamics:** Continues at **100% peak LR** (no decay).
 - **Domain Shift:**
   - **35% Deep Code:** System-level engineering, multi-file codebases, R1 reasoning traces.
@@ -113,11 +128,31 @@ flowchart TD
 
 ---
 
+### Intermediate Stage: 8–16k Long-Context Bridge (0.25B Tokens, proposed)
+- **Token Budget:** ~$0.25$B tokens, carved from the Stage 2 allocation
+  ($1.5$B $\to$ $1.25$B). **Proposed** — pending owner confirmation.
+- **Sequence Length ($T$):** $T \in [8{,}192, 16{,}384]$, one $T$ per optimizer step.
+- **Sampler:** EOS-aligned packed windows (`--pack bestfit`), which is where whole
+  reasoning arcs become possible: at $T=8{,}192$, 100% of documents that fit are
+  intact and only 17.5% of content is filler (vs 51.1% at $T=2{,}048$).
+- **Mix:** reasoning-heavy (`SUBSTREAM_CONFIG_LONG`: 1B 15%, 2B 15%, 3A 12% — 42%
+  reasoning total), because 53–80% of these traces fit whole at 8k+. **Proposed.**
+  Stages 1 and 2 keep the documented 20% CoT mix.
+- **Purpose:** gives an annealed short/long-context checkpoint and a clean
+  full-arc reasoning stage before the 32k cooldown.
+
+---
+
 ### Stage 3: 32k Long-Context & Annealing Cooldown (0.5 Billion Tokens | Shard 11)
 - **Token Budget:** $500,000,000$ tokens (Shard 11).
 - **Optimizer Steps:** **`3,785 steps`** (Steps 41,637 $\to$ 45,421).
 - **Sequence Length ($T$):** Variable long-context $T \in [2,048, 32,768]$ tokens.
+- **Sampler:** **EOS-aligned packed windows** (`--pack bestfit`), with the document-aligned
+  loader so windows start at document boundaries. At $T=32{,}768$ only 1.9% of content
+  is filler and 100% of documents that can fit are intact.
 - **Corpus Selection:** Strictly documents $\ge 2,048$ tokens (complete software repositories, full textbooks, formal mathematical monographs, lengthy tool logs).
+- **Short-data mixing:** `--mix-short-fraction 0.5` (recommended): half of Stage 3
+  tokens come from earlier short-context shards, to limit forgetting as context grows.
 - **Learning Rate Dynamics (The "D" in WSD):**
   - **This is the only stage where cooldown occurs.**
   - Cosine decay from $100\%$ peak LR down to $1\%$ minimum LR over these final 3,785 steps.

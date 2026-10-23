@@ -24,6 +24,11 @@ class PulsarConfig:
     rope_theta_local: float = 10000.0  # 10k theta for 6 local high-precision layers
     rope_theta_global: float = 1000000.0  # 1M theta for 2 global 32k anchor layers
     sliding_window: int = 1024  # Local sliding window size
+    # Local-attention implementation: "auto" picks the best available (flex_attention
+    # with a cached BlockMask, else sdpa_mask). "sdpa_mask" builds a dense boolean mask
+    # and is only sane for small T - it is kept as the reference implementation for
+    # tests, not for production long context.
+    local_attn_impl: str = "auto"
     n_routed_experts: int = 8
     top_k: int = 2
     eos_token_id: int = 0
@@ -186,6 +191,89 @@ class RMSNorm(nn.Module):
         return (w.float() * x_normed).to(x.dtype)
 
 
+# ---------------------------------------------------------------------------
+# Local (sliding-window) attention implementations
+# ---------------------------------------------------------------------------
+
+# Cached BlockMask per (B, H, T, window, device) - building one costs ~100 ms.
+_BLOCK_MASK_CACHE: dict[tuple, object] = {}
+_FLEX_ATTENTION = None
+# Disable flex_attention globally (e.g. for the reference comparison in tests).
+flex_enabled = True
+
+
+def _flex_attention_available() -> bool:
+    global _FLEX_ATTENTION
+    if _FLEX_ATTENTION is not None:
+        return _FLEX_ATTENTION
+    try:
+        from torch.nn.attention.flex_attention import flex_attention  # noqa: F401
+        _FLEX_ATTENTION = True
+    except Exception:
+        _FLEX_ATTENTION = False
+    return _FLEX_ATTENTION
+
+
+def _get_local_block_mask(B: int, H: int, T: int, window: int, device) -> object:
+    """Cached BlockMask for the causal sliding-window pattern."""
+    key = (B, H, T, window, str(device))
+    cached = _BLOCK_MASK_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        return (q_idx >= kv_idx) & ((q_idx - kv_idx) < window)
+
+    # _compile=True is REQUIRED, not an optimisation. With the default (_compile=False)
+    # this torch version builds a full T x T mask tensor internally just to derive the
+    # block metadata - 8 GB at T=32768 - which defeats the entire point of using
+    # flex_attention. The compiled path computes block counts directly.
+    block_mask = create_block_mask(mask_mod, B, H, T, T, device=device, _compile=True)
+    _BLOCK_MASK_CACHE[key] = block_mask
+    return block_mask
+
+
+_FLEX_COMPILED = None
+
+
+def _compiled_flex_attention():
+    """flex_attention wrapped in torch.compile.
+
+    Uncompiled flex_attention warns that it "materialises the full scores matrix", which
+    defeats the purpose of using it. Compiled, it generates a fused kernel and never
+    allocates T x T.
+    """
+    global _FLEX_COMPILED
+    if _FLEX_COMPILED is None:
+        from torch.nn.attention.flex_attention import flex_attention
+
+        try:
+            _FLEX_COMPILED = torch.compile(flex_attention, dynamic=False)
+        except Exception:  # pragma: no cover - compile unavailable
+            _FLEX_COMPILED = flex_attention
+    return _FLEX_COMPILED
+
+
+def _local_attn_flex(q, k, v, window: int, enable_gqa: bool):
+    """Sliding-window attention via flex_attention (no dense mask, no T x T allocation).
+
+    This torch build's flex_attention does not support GQA, so K/V are expanded with
+    repeat_interleave when head counts differ. K/V are the small side (n_kv_heads), so
+    the expansion is cheap relative to the query side.
+    """
+    B, H, T, D = q.shape
+    KVH = k.shape[1]
+    if enable_gqa and KVH != H:
+        rep = H // KVH
+        k = torch.repeat_interleave(k, rep, dim=1)
+        v = torch.repeat_interleave(v, rep, dim=1)
+
+    block_mask = _get_local_block_mask(B, H, T, window, q.device)
+    return _compiled_flex_attention()(q, k, v, block_mask=block_mask)
+
+
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim: int, max_seq_len: int = 32768, theta: float = 10000.0):
         super().__init__()
@@ -328,11 +416,24 @@ class PulsarAttention(nn.Module):
 
         enable_gqa = (self.num_queries_per_kv > 1)
         if self.is_local and T > self.cfg.sliding_window:
-            col_idx = torch.arange(T, device=x.device).unsqueeze(0)
-            row_idx = torch.arange(T, device=x.device).unsqueeze(1)
-            diff = row_idx - col_idx
-            mask = (diff >= 0) & (diff < self.cfg.sliding_window)
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=enable_gqa)
+            # Sliding window. The old implementation materialised T x T int64 index
+            # tensors (8.6 GB at T=32768) and a boolean mask (1.07 GB) just to express
+            # "causal, within `window`" - impossible on the target 8 GB card, and it
+            # forced SDPA onto the math backend.
+            impl = self.cfg.local_attn_impl
+            if impl == "auto":
+                impl = "flex" if (flex_enabled and _flex_attention_available()) else "sdpa_mask"
+            if impl == "flex":
+                out = _local_attn_flex(q, k, v, self.cfg.sliding_window, enable_gqa)
+            elif impl == "flash_attn":
+                raise RuntimeError("flash_attn backend requested but not installed")
+            else:
+                # Reference path: correct but O(T^2) memory. Small T / tests only.
+                col_idx = torch.arange(T, device=x.device).unsqueeze(0)
+                row_idx = torch.arange(T, device=x.device).unsqueeze(1)
+                diff = row_idx - col_idx
+                mask = (diff >= 0) & (diff < self.cfg.sliding_window)
+                out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=enable_gqa)
         else:
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
 

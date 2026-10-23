@@ -34,6 +34,7 @@ def test_no_unused_function_parameters():
     ignored = {
         "self", "cls", "ctx", "args", "kwargs",
         "sig", "frame",                    # signal.signal handler signature
+        "b", "h",                          # flex_attention mask_mod(b, h, q_idx, kv_idx)
     }
     offenders = []
     for path in _python_files():

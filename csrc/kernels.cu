@@ -277,7 +277,13 @@ std::vector<torch::Tensor> rmsnorm_backward_cuda(torch::Tensor dy, torch::Tensor
     auto dx = torch::empty_like(x);
     auto dweight = torch::zeros_like(weight);
 
-    int threads = std::min(1024, std::max(32, num_vec));
+    // blockDim.x must be a whole number of warps: the kernel computes
+    // num_warps = blockDim.x / WARP_SIZE, which truncates (48/32 = 1), dropping the
+    // partial warp's contribution to total_dy_x_w (corrupting dx) and running
+    // __shfl_down_sync with a full mask over a partially active warp. Rounding up
+    // keeps every warp full; the surplus threads simply find v >= num_vec and add 0.
+    //   dim=384 -> num_vec=48 -> threads=64 (was 48: 2.9e-1 dx error)
+    int threads = std::min(1024, ((std::max(32, num_vec) + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE);
     int blocks = std::min(total_tokens, 256);
     rmsnorm_backward_vec8_kernel<<<blocks, threads>>>(
         reinterpret_cast<const __nv_bfloat16*>(dy.data_ptr<c10::BFloat16>()),
@@ -613,6 +619,10 @@ torch::Tensor rope_forward_cuda(torch::Tensor qk, torch::Tensor cos, torch::Tens
     TORCH_CHECK(qk.scalar_type() == torch::kBFloat16, "qk must be bfloat16");
 
     auto out = torch::empty_like(qk);
+    // A zero-sized tensor would produce grid.x == 0, which is an invalid launch.
+    if (qk.numel() == 0) {
+        return out;
+    }
     // One block per (b, h, t) flattened onto x, which supports 2^31-1 blocks.
     dim3 grid(B * T * num_heads);
     dim3 block(head_dim / 2);

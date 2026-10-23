@@ -247,6 +247,58 @@ def test_forward_backward_in_both_dtypes_on_cuda():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.skipif(not HAS_CUDA, reason="needs CUDA kernels")
+@pytest.mark.parametrize("dim", [384, 96, 768, 1536])
+def test_rmsnorm_backward_partial_warp_dims(dim):
+    """num_vec not a multiple of 32 truncated the block reduction.
+
+    blockDim.x was set to num_vec (48 for dim=384), and the kernel derives
+    num_warps = blockDim.x / 32 = 1, so the second warp's partial sum was written to
+    s_sum[1] and never added. That corrupted dx (~2.9e-1 error) while leaving dweight
+    nearly correct, so only checking dweight would have missed it entirely.
+    """
+    import pulsar_cuda
+
+    torch.manual_seed(0)
+    x = torch.randn(8, dim, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(dim, device="cuda")
+    dy = torch.randn(8, dim, device="cuda", dtype=torch.bfloat16)
+    rsqrt = torch.rsqrt(x.float().pow(2).mean(-1) + 1e-6)
+    dx, dweight = pulsar_cuda.rmsnorm_backward(dy, x, w, rsqrt)
+
+    xr = x.float().requires_grad_(True)
+    wr = w.detach().clone().requires_grad_(True)
+    yr = wr * xr * torch.rsqrt(xr.pow(2).mean(-1, keepdim=True) + 1e-6)
+    (yr * dy.float()).sum().backward()
+
+    # bf16 inputs put a ~1.5e-2 floor on dx from rounding alone; the bug was ~2.9e-1.
+    dx_err = (dx.float() - xr.grad).abs().max().item()
+    dw_err = (dweight - wr.grad).abs().max().item()
+    assert dx_err < 5e-2, (
+        f"dx error {dx_err:.2e} at dim={dim} (num_vec={dim // 8}): the partial warp's "
+        f"contribution was dropped from the block reduction"
+    )
+    assert dw_err < 1e-4, f"dweight error {dw_err:.2e} at dim={dim}"
+
+
+@pytest.mark.skipif(not HAS_CUDA, reason="needs CUDA kernels")
+def test_rope_empty_tensor_does_not_launch():
+    """An empty input must return an empty result.
+
+    Honest note: this test does NOT fail without the early-return guard. CUDA silently
+    no-ops a kernel launch with gridDim.x == 0 on this driver, so the guard is
+    correct-by-construction rather than observable. It is kept as a contract test.
+    """
+    import pulsar_cuda
+
+    q = torch.empty(1, 1, 0, 64, device="cuda", dtype=torch.bfloat16)
+    cos = torch.empty(0, 32, device="cuda")
+    sin = torch.empty(0, 32, device="cuda")
+    out = pulsar_cuda.rope_forward(q, cos, sin)
+    assert out.shape == q.shape
+    assert out.numel() == 0
+
+
+@pytest.mark.skipif(not HAS_CUDA, reason="needs CUDA kernels")
 @pytest.mark.parametrize("dim", [1024, 2048, 4096])
 def test_rmsnorm_backward_dweight_correct_above_1024(dim):
     """Above dim=1024 a thread handled several channel groups and mixed their sums."""

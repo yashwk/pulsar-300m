@@ -1622,8 +1622,16 @@ torch::Tensor fused_softcap_ce_backward_cuda(
 // 11. Fused MoE Router Top-2 + Sigmoid + Z-Loss (E = 8, K = 2)
 // ------------------------------------------------------------------------
 
+__device__ __forceinline__ float load_logit(const __nv_bfloat16 v) { return __bfloat162float(v); }
+__device__ __forceinline__ float load_logit(const float v) { return v; }
+
+template <typename logit_t> __device__ __forceinline__ logit_t store_logit(float v);
+template <> __device__ __forceinline__ __nv_bfloat16 store_logit<__nv_bfloat16>(float v) { return __float2bfloat16(v); }
+template <> __device__ __forceinline__ float store_logit<float>(float v) { return v; }
+
+template <typename logit_t>
 __global__ void moe_router_topk_forward_kernel(
-    const __nv_bfloat16* __restrict__ logits,      // [N, 8]
+    const logit_t* __restrict__ logits,            // [N, 8], fp32 or bf16
     const float* __restrict__ expert_bias,         // [8]
     int64_t* __restrict__ topk_idx,                // [N, 2]
     __nv_bfloat16* __restrict__ topk_weights,      // [N, 2]
@@ -1634,7 +1642,7 @@ __global__ void moe_router_topk_forward_kernel(
     int tok = blockIdx.x * blockDim.x + threadIdx.x;
     if (tok >= N) return;
 
-    const __nv_bfloat16* l_tok = logits + tok * 8;
+    const logit_t* l_tok = logits + tok * 8;
     float l[8];
     float s[8];
     float b[8];
@@ -1642,7 +1650,7 @@ __global__ void moe_router_topk_forward_kernel(
 
     #pragma unroll
     for (int e = 0; e < 8; ++e) {
-        float val = __bfloat162float(l_tok[e]);
+        float val = load_logit(l_tok[e]);
         l[e] = val;
         max_l = fmaxf(max_l, val);
         float sig = 1.0f / (1.0f + __expf(-val));
@@ -1693,26 +1701,27 @@ __global__ void moe_router_topk_forward_kernel(
     z_loss_out[tok] = z_loss_weight * (lse * lse);
 }
 
+template <typename logit_t>
 __global__ void moe_router_topk_backward_kernel(
     const __nv_bfloat16* __restrict__ d_topk_weights, // [N, 2]
-    const __nv_bfloat16* __restrict__ logits,         // [N, 8]
+    const logit_t* __restrict__ logits,               // [N, 8]
     const int64_t* __restrict__ topk_idx,             // [N, 2]
-    __nv_bfloat16* __restrict__ d_logits,             // [N, 8]
+    logit_t* __restrict__ d_logits,                   // [N, 8]
     float z_loss_weight,
     int N
 ) {
     int tok = blockIdx.x * blockDim.x + threadIdx.x;
     if (tok >= N) return;
 
-    const __nv_bfloat16* l_tok = logits + tok * 8;
-    __nv_bfloat16* dl_tok = d_logits + tok * 8;
+    const logit_t* l_tok = logits + tok * 8;
+    logit_t* dl_tok = d_logits + tok * 8;
 
     float l[8];
     float s[8];
     float max_l = -1e20f;
     #pragma unroll
     for (int e = 0; e < 8; ++e) {
-        float val = __bfloat162float(l_tok[e]);
+        float val = load_logit(l_tok[e]);
         l[e] = val;
         max_l = fmaxf(max_l, val);
         s[e] = 1.0f / (1.0f + __expf(-val));
@@ -1748,7 +1757,7 @@ __global__ void moe_router_topk_backward_kernel(
         float g = z_factor * p_e;
         if (e == e0) g += du0;
         if (e == e1) g += du1;
-        dl_tok[e] = __float2bfloat16(g);
+        dl_tok[e] = store_logit<logit_t>(g);
     }
 }
 
@@ -1759,21 +1768,27 @@ std::vector<torch::Tensor> moe_router_topk_forward_cuda(
 ) {
     int N = logits.size(0);
     auto topk_idx = torch::empty({N, 2}, torch::TensorOptions().dtype(torch::kInt64).device(logits.device()));
-    auto topk_weights = torch::empty({N, 2}, logits.options());
+    // Weights are always bf16 for the combine kernel, regardless of logits dtype.
+    auto topk_weights = torch::empty(
+        {N, 2}, torch::TensorOptions().dtype(torch::kBFloat16).device(logits.device()));
     auto z_loss_per_token = torch::empty({N}, torch::TensorOptions().dtype(torch::kFloat32).device(logits.device()));
 
     if (N > 0) {
         int threads = 128;
         int blocks = (N + threads - 1) / threads;
-        moe_router_topk_forward_kernel<<<blocks, threads>>>(
-            reinterpret_cast<const __nv_bfloat16*>(logits.data_ptr<c10::BFloat16>()),
-            expert_bias.data_ptr<float>(),
-            topk_idx.data_ptr<int64_t>(),
-            reinterpret_cast<__nv_bfloat16*>(topk_weights.data_ptr<c10::BFloat16>()),
-            z_loss_per_token.data_ptr<float>(),
-            z_loss_weight,
-            N
-        );
+        auto* tkw = reinterpret_cast<__nv_bfloat16*>(topk_weights.data_ptr<c10::BFloat16>());
+        if (logits.scalar_type() == torch::kFloat32) {
+            moe_router_topk_forward_kernel<float><<<blocks, threads>>>(
+                logits.data_ptr<float>(), expert_bias.data_ptr<float>(),
+                topk_idx.data_ptr<int64_t>(), tkw,
+                z_loss_per_token.data_ptr<float>(), z_loss_weight, N);
+        } else {
+            moe_router_topk_forward_kernel<__nv_bfloat16><<<blocks, threads>>>(
+                reinterpret_cast<const __nv_bfloat16*>(logits.data_ptr<c10::BFloat16>()),
+                expert_bias.data_ptr<float>(),
+                topk_idx.data_ptr<int64_t>(), tkw,
+                z_loss_per_token.data_ptr<float>(), z_loss_weight, N);
+        }
     }
     auto z_loss = z_loss_per_token.sum() / (float)std::max(1, N);
     return {topk_idx, topk_weights, z_loss};
@@ -1790,14 +1805,19 @@ torch::Tensor moe_router_topk_backward_cuda(
     if (N > 0) {
         int threads = 128;
         int blocks = (N + threads - 1) / threads;
-        moe_router_topk_backward_kernel<<<blocks, threads>>>(
-            reinterpret_cast<const __nv_bfloat16*>(d_topk_weights.data_ptr<c10::BFloat16>()),
-            reinterpret_cast<const __nv_bfloat16*>(logits.data_ptr<c10::BFloat16>()),
-            topk_idx.data_ptr<int64_t>(),
-            reinterpret_cast<__nv_bfloat16*>(d_logits.data_ptr<c10::BFloat16>()),
-            z_loss_weight,
-            N
-        );
+        auto* dtw = reinterpret_cast<const __nv_bfloat16*>(d_topk_weights.data_ptr<c10::BFloat16>());
+        if (logits.scalar_type() == torch::kFloat32) {
+            moe_router_topk_backward_kernel<float><<<blocks, threads>>>(
+                dtw, logits.data_ptr<float>(), topk_idx.data_ptr<int64_t>(),
+                d_logits.data_ptr<float>(), z_loss_weight, N);
+        } else {
+            moe_router_topk_backward_kernel<__nv_bfloat16><<<blocks, threads>>>(
+                dtw,
+                reinterpret_cast<const __nv_bfloat16*>(logits.data_ptr<c10::BFloat16>()),
+                topk_idx.data_ptr<int64_t>(),
+                reinterpret_cast<__nv_bfloat16*>(d_logits.data_ptr<c10::BFloat16>()),
+                z_loss_weight, N);
+        }
     }
     return d_logits;
 }

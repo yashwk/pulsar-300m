@@ -486,11 +486,21 @@ class PackedBatchLoader:
         if window_ids is None:
             ids = [self._cursor + k for k in range(self.micro_batch_size)]
             self._cursor += self.micro_batch_size
+        elif isinstance(window_ids, int):
+            # The trainer's loop calls get_batch(seed); for a packed plan the seed is
+            # unused - the plan already fixes the order - so advance sequentially and
+            # keep the call site identical to the flat loader's.
+            ids = [self._cursor + k for k in range(self.micro_batch_size)]
+            self._cursor += self.micro_batch_size
         else:
             ids = list(window_ids)
         xs, ys = [], []
+        n_windows = len(self.plan.windows)
         for wid in ids:
-            if wid >= len(self.plan.windows):
+            if n_windows == 0:
+                break
+            wid = wid % n_windows   # next epoch: reuse the plan cyclically
+            if wid >= n_windows:
                 break
             toks, n_real = self._build_window(self.plan.windows[wid])
             y = np.full(self.seq_len, self.ignore_index, dtype=np.int64)

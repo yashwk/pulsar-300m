@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import threading
 import warnings
 from dataclasses import asdict, dataclass
 import torch
@@ -189,6 +190,37 @@ class RMSNorm(nn.Module):
         norm = x.float().pow(2).mean(-1, keepdim=True)
         x_normed = x.float() * torch.rsqrt(norm + self.eps)
         return (w.float() * x_normed).to(x.dtype)
+
+
+# Set while torch.utils.checkpoint is recomputing a block during backward. The MoE
+# forward mutates counters (expert_counts_accum, drop stats); a recomputation must not
+# apply those side effects twice.
+class _RecomputeState(threading.local):
+    active = False
+
+
+_RECOMPUTING = _RecomputeState()
+
+
+class _RecomputeContext:
+    """Context manager that sets the recomputation flag for its duration."""
+
+    def __init__(self, flag: bool):
+        self.flag = flag
+        self.prev = False
+
+    def __enter__(self):
+        self.prev = _RECOMPUTING.active
+        _RECOMPUTING.active = self.flag
+        return self
+
+    def __exit__(self, *exc):
+        _RECOMPUTING.active = self.prev
+        return False
+
+
+def _set_recomputing(flag: bool) -> _RecomputeContext:
+    return _RecomputeContext(flag)
 
 
 # ---------------------------------------------------------------------------
@@ -687,8 +719,13 @@ class PulsarMoEMLP(nn.Module):
         x_flat = x.view(N, D)
 
         # 1. Pulse-indexed router logits
-        router_w = self.router_weight[pulse_idx].to(x.dtype)
-        logits = F.linear(x_flat, router_w)  # [N, n_routed_experts]
+        # Router logits in FP32. bf16 spacing near |logit|=1 is ~0.008, comparable to
+        # the 0.001 expert-bias step, so routing decisions near ties were quantised.
+        # The transients are small (N x E), unlike an FP32 copy of x.
+        router_w = self.router_weight[pulse_idx]
+        logits = F.linear(
+            x_flat.float(), router_w.float() if router_w.dtype != torch.float32 else router_w
+        )  # [N, E] fp32
 
         # 2. Router selection: fused top-2 + sigmoid + weight normalisation (CUDA),
         #    with z-loss computed in PyTorch so autograd scales it correctly. The z
@@ -731,18 +768,20 @@ class PulsarMoEMLP(nn.Module):
                 0, topk_idx.reshape(-1),
                 torch.ones(topk_idx.numel(), device=x.device, dtype=torch.float32),
             )
-            self.expert_counts_accum.add_(bincounts)
-            self.expert_pulse_counts[pulse_idx].add_(bincounts)
-            # Drop accounting stays on the GPU; drained by pop_moe_stats().
-            # Tracked per pulse as well as in total: drops are a per-pulse phenomenon
-            # (early pulses route differently from late ones), so a single global rate
-            # would hide the case that matters.
-            dropped_per_expert = (bincounts - capacity).clamp(min=0.0)
-            self.drop_counts_accum.add_(dropped_per_expert.sum())
-            self.assigned_counts_accum.add_(bincounts.sum())
-            self.pulse_drop_accum[pulse_idx].add_(dropped_per_expert.sum())
-            self.pulse_assigned_accum[pulse_idx].add_(bincounts.sum())
-            self.capacity_last.fill_(float(capacity))
+            # Suppressed while torch.utils.checkpoint recomputes this block during
+            # backward, otherwise every counter would increment twice.
+            if not _RECOMPUTING.active:
+                self.expert_counts_accum.add_(bincounts)
+                self.expert_pulse_counts[pulse_idx].add_(bincounts)
+                # Drop accounting stays on the GPU; drained by pop_moe_stats().
+                # Tracked per pulse as well as in total: drops are a per-pulse
+                # phenomenon, so a single global rate would hide the case that matters.
+                dropped_per_expert = (bincounts - capacity).clamp(min=0.0)
+                self.drop_counts_accum.add_(dropped_per_expert.sum())
+                self.assigned_counts_accum.add_(bincounts.sum())
+                self.pulse_drop_accum[pulse_idx].add_(dropped_per_expert.sum())
+                self.pulse_assigned_accum[pulse_idx].add_(bincounts.sum())
+                self.capacity_last.fill_(float(capacity))
 
         if HAS_PULSAR_CUDA and x_flat.is_cuda and hasattr(pulsar_cuda, "moe_dispatch_forward"):
             token_to_slot = compute_token_slots(
@@ -923,6 +962,9 @@ class PulsarForCausalLM(nn.Module):
         # Unit-Normalized Per-Pulse Prompt Anchor
         self.pulse_state_norm = RMSNorm(cfg.d_model, cfg.rms_eps)
         self.anchor_norm = RMSNorm(cfg.d_model, cfg.rms_eps)
+        # Gradient checkpointing for long context: recompute each core block in
+        # backward instead of retaining activations. Off by default.
+        self.grad_checkpoint = False
         # Initialized to -1.3863 so sigmoid(-1.3863) = 0.200 exact
         self.input_mix_logit = nn.Parameter(torch.full((cfg.max_pulses, cfg.d_model), -1.3863, dtype=torch.float32))
 
@@ -1099,9 +1141,23 @@ class PulsarForCausalLM(nn.Module):
             for i, block in enumerate(self.core):
                 cos = cos_local if block.attn.is_local else cos_global
                 sin = sin_local if block.attn.is_local else sin_global
-                h_curr, v_first, z_loss, gate_weight_mean, bincounts = block(
-                    h_curr, cos, sin, pulse_idx=k, v_first=v_first
-                )
+                if self.grad_checkpoint and self.training:
+                    from torch.utils.checkpoint import checkpoint
+
+                    # Blocks mutate MoE counters as a side effect. Recompute during
+                    # backward would double-count them, so counters are frozen around
+                    # recompute, suppressed by a thread-local flag (see _RECOMPUTING).
+                    # context_fn tells the checkpoint machinery to raise the flag
+                    # while recomputing, so MoE counter side effects are skipped.
+                    h_curr, v_first, z_loss, gate_weight_mean, bincounts = checkpoint(
+                        block, h_curr, cos, sin,
+                        pulse_idx=k, v_first=v_first, use_reentrant=False,
+                        context_fn=lambda: (_set_recomputing(True), _set_recomputing(False)),
+                    )
+                else:
+                    h_curr, v_first, z_loss, gate_weight_mean, bincounts = block(
+                        h_curr, cos, sin, pulse_idx=k, v_first=v_first
+                    )
                 total_z_loss = total_z_loss + z_loss
                 gate_confidence_accum = gate_confidence_accum + gate_weight_mean
                 global_expert_counts = global_expert_counts + bincounts

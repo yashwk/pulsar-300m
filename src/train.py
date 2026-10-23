@@ -24,6 +24,7 @@ from transformers import AutoTokenizer
 
 from src.model import PulsarConfig, PulsarForCausalLM
 from src.optim import PulsarDualOptimizer
+from src.packing import PackedBatchLoader, build_doc_index, plan_epoch
 
 
 def format_duration(seconds: float) -> str:
@@ -292,7 +293,7 @@ def train():
     parser.add_argument("--lr-schedule", type=str, choices=["wsd", "cosine"], default="wsd", help="Learning rate schedule")
     parser.add_argument("--warmup-steps", type=int, default=100, help="Linear warmup steps")
     parser.add_argument("--cooldown-steps", type=int, default=0, help="Cooldown steps for WSD decay")
-    parser.add_argument("--min-lr-ratio", type=float, default=0.01, help="Minimum LR ratio during cooldown (docs specify 1%)")
+    parser.add_argument("--min-lr-ratio", type=float, default=0.01, help="Minimum LR ratio during cooldown (docs specify 1 percent)")
     parser.add_argument("--eval-every", type=int, default=25, help="Steps between validation and canary generation")
     parser.add_argument("--eval-iters", type=int, default=10, help="Batches evaluated during validation")
     parser.add_argument("--save-every", type=int, default=25, help="Steps between saving latest.pt")
@@ -308,6 +309,12 @@ def train():
     parser.add_argument("--per-pulse-bias", action="store_true",
                         help="Per-pulse MoE balancing bias (default off). Changes training dynamics; "
                              "old [E] checkpoints migrate by broadcasting.")
+    parser.add_argument("--grad-checkpoint", action="store_true",
+                        help="Recompute core blocks in backward instead of retaining activations. "
+                             "Needed for long context (T >= 8k); trades ~30% speed for large savings.")
+    parser.add_argument("--sampler", type=str, choices=["flat", "bestfit"], default="flat",
+                        help="flat: fixed-stride windows (Stage 1). bestfit: EOS-aligned packing, "
+                             "so documents that fit are presented intact (Stage 2+).")
     parser.add_argument("--moe-capacity-factor", type=float, default=None,
                         help="Override MoE capacity headroom (default 1.12). Raising it mid-run is "
                              "safe: capacity changes no checkpoint format.")
@@ -369,8 +376,37 @@ def train():
         except Exception as e:
             val_shards.append(np.fromfile(p, dtype=np.uint16))
 
-    train_loader = StreamingPinnedBatchLoader(train_shards, args.micro_batch_size, args.seq_len, device)
-    val_loader = StreamingPinnedBatchLoader(val_shards, args.micro_batch_size, args.seq_len, device)
+    if args.sampler == "bestfit":
+        # EOS-aligned packing: whole documents fill each window; leftover space comes
+        # only from documents longer than seq_len (which can never be intact anyway).
+        # See docs/AUDIT.md for the measured intactness and the filler-share caveat.
+        _t0 = time.time()
+        train_index = build_doc_index(train_shards)
+        train_plan = plan_epoch(
+            train_index.length.astype(np.int64), args.seq_len,
+            seed=args.seed, epoch=0, strategy="bestfit",
+        )
+        train_loader = PackedBatchLoader(
+            train_shards, train_index, train_plan,
+            micro_batch_size=args.micro_batch_size, device=device,
+        )
+        pad_frac = train_plan.pad_tokens / max(1, train_plan.capacity_tokens)
+        print(f"[Pulsar] Sampler: bestfit | {len(train_plan):,} windows | "
+              f"padding {pad_frac*100:.3f}% | built in {time.time()-_t0:.1f}s")
+        val_index = build_doc_index(val_shards)
+        val_plan = plan_epoch(
+            val_index.length.astype(np.int64), args.seq_len,
+            seed=args.seed + 1, epoch=0, strategy="bestfit",
+        )
+        val_loader = PackedBatchLoader(
+            val_shards, val_index, val_plan,
+            micro_batch_size=args.micro_batch_size, device=device,
+        )
+        train_loader.total_tokens = int(train_index.length.sum())
+        val_loader.total_tokens = int(val_index.length.sum())
+    else:
+        train_loader = StreamingPinnedBatchLoader(train_shards, args.micro_batch_size, args.seq_len, device)
+        val_loader = StreamingPinnedBatchLoader(val_shards, args.micro_batch_size, args.seq_len, device)
     print(f"[Pulsar] Total Train Dataset: {train_loader.total_tokens:,} tokens across {len(train_shards)} shards")
     print(f"[Pulsar] Total Val Dataset:   {val_loader.total_tokens:,} tokens across {len(val_shards)} shards")
 
@@ -409,6 +445,9 @@ def train():
     # missed pulse_res_scale / routed_scale / attn_gate / pulse_step_emb (left frozen in
     # bf16) and cast every buffer, including the MoE expert counters and RoPE caches.
     model.to_training_precision(torch.bfloat16)
+    if args.grad_checkpoint:
+        model.grad_checkpoint = True
+        print("[Pulsar] Gradient checkpointing: ON")
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"[Pulsar] Pulsar-MoE Model Initialized: {total_params:,} parameters ({total_params/1e6:.2f}M)")

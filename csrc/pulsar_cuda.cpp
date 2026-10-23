@@ -4,32 +4,15 @@
 
 std::vector<torch::Tensor> rmsnorm_forward_cuda(torch::Tensor x, torch::Tensor weight, float eps);
 std::vector<torch::Tensor> rmsnorm_backward_cuda(torch::Tensor dy, torch::Tensor x, torch::Tensor weight, torch::Tensor rsqrt);
-std::vector<torch::Tensor> fused_add_rmsnorm_cuda(torch::Tensor x, torch::Tensor residual, torch::Tensor weight, float eps);
 
-torch::Tensor swiglu_forward_cuda(torch::Tensor gate, torch::Tensor up);
-std::vector<torch::Tensor> swiglu_backward_cuda(torch::Tensor dout, torch::Tensor gate, torch::Tensor up);
+
+
 torch::Tensor fused_swiglu_forward_cuda(torch::Tensor gu, int64_t d_ff);
 torch::Tensor fused_swiglu_backward_cuda(torch::Tensor dout, torch::Tensor gu, int64_t d_ff);
 
 torch::Tensor rope_forward_cuda(torch::Tensor qk, torch::Tensor cos, torch::Tensor sin);
 
-torch::Tensor engram_hash_gather_cuda(
-    torch::Tensor input_ids,
-    torch::Tensor canonical_map,
-    torch::Tensor table,
-    int engram_heads,
-    int slots_per_head,
-    int head_dim,
-    int eos_id
-);
 
-torch::Tensor engram_hash_cuda(
-    torch::Tensor input_ids,
-    torch::Tensor canonical_map,
-    int engram_heads,
-    int slots_per_head,
-    int eos_id
-);
 
 void muon_step_cuda(
     torch::Tensor param,
@@ -128,16 +111,11 @@ torch::Tensor moe_router_topk_backward_cuda(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rmsnorm_forward", &rmsnorm_forward_cuda, "RMSNorm Forward (CUDA)");
     m.def("rmsnorm_backward", &rmsnorm_backward_cuda, "RMSNorm Backward (CUDA)");
-    m.def("fused_add_rmsnorm", &fused_add_rmsnorm_cuda, "Fused Add + RMSNorm Forward (CUDA)");
-    m.def("swiglu_forward", &swiglu_forward_cuda, "SwiGLU Forward (CUDA)");
-    m.def("swiglu_backward", &swiglu_backward_cuda, "SwiGLU Backward (CUDA)");
+
     m.def("fused_swiglu_forward", &fused_swiglu_forward_cuda, "Fused SwiGLU Forward (CUDA)");
     m.def("fused_swiglu_backward", &fused_swiglu_backward_cuda, "Fused SwiGLU Backward (CUDA)");
     m.def("rope_forward", &rope_forward_cuda, "RoPE Forward (CUDA)");
-    m.def("engram_hash_gather", &engram_hash_gather_cuda, "Engram Hash and Gather (CUDA)");
-    m.def("engram_hash", &engram_hash_cuda, "Engram Hash Calculation (CUDA)");
-    m.def("muon_step", &muon_step_cuda, "Muon Optimizer Step (CUDA)");
-    m.def("adamw_step", &adamw_step_cuda, "AdamW Optimizer Step (CUDA)");
+
     m.def("moe_dispatch_forward", &moe_dispatch_forward_cuda, "Fused MoE Dispatch Forward (CUDA)");
     m.def("moe_dispatch_backward", &moe_dispatch_backward_cuda, "Fused MoE Dispatch Backward (CUDA)");
     m.def("moe_combine_forward", &moe_combine_forward_cuda, "Fused MoE Combine Forward (CUDA)",

@@ -72,7 +72,7 @@ def get_lr_factor(
     max_steps: int,
     schedule: str = "wsd",
     cooldown_steps: int = 0,
-    min_ratio: float = 0.05,
+    min_ratio: float = 0.01,
 ) -> float:
     """Calculate learning rate multiplier for WSD (Warmup-Stable-Decay) or Cosine schedule."""
     if warmup_steps > 0 and step <= warmup_steps:
@@ -197,29 +197,50 @@ def evaluate_loss(
     val_loader: StreamingPinnedBatchLoader,
     eval_iters: int,
     num_pulses: int,
-) -> tuple[float, list[float]]:
-    """Evaluate mean cross-entropy loss and per-pulse breakdown on validation data dynamically for any K."""
+) -> dict:
+    """Validate the model, returning the FINAL-pulse CE and the per-pulse breakdown.
+
+    The old version returned the model's total training loss: a weighted sum of three
+    pulse cross-entropies (0.15/0.25/0.60) plus z-loss, with intermediate pulses scored
+    on a 25% token subsample at different offsets per pulse. That number is not the
+    final model's loss and per-pulse values were computed on different tokens.
+
+    Now every pulse is scored on 100% of the tokens (``eval_full_pulses``), and
+    ``val_ce_final`` - the pulse-3 CE - is what checkpoint selection keys on.
+    """
     was_training = model.training
     model.eval()
-    losses = []
-    pulse_loss_accum = [[] for _ in range(num_pulses)]
+    totals = []
+    pulse_accum = [[] for _ in range(num_pulses)]
     with torch.no_grad():
         for i in range(eval_iters):
             seed_val = 999983 + i * 17
             x, y = val_loader.get_batch(seed_val)
-            _, loss, metrics = model(x, labels=y, num_pulses=num_pulses, subsample_offset=i)
-            losses.append(loss.item())
+            _, _, metrics = model(
+                x, labels=y, num_pulses=num_pulses,
+                subsample_offset=0, eval_full_pulses=True,
+            )
+            # Per-pulse CEs are the mean CE over all tokens for each pulse.
             step_pulses = metrics.get("pulse_losses", [])
-            for p_idx in range(min(num_pulses, len(step_pulses))):
-                val = step_pulses[p_idx]
-                pulse_loss_accum[p_idx].append(val if isinstance(val, (int, float)) else val.item())
+            vals = [float(v) if not isinstance(v, torch.Tensor) else v.item() for v in step_pulses]
+            for p_idx in range(min(num_pulses, len(vals))):
+                pulse_accum[p_idx].append(vals[p_idx])
+            if vals:
+                totals.append(sum(vals) / len(vals))  # unweighted mean for reference
 
     if was_training:
         model.train()
 
-    mean_loss = float(np.mean(losses)) if losses else 0.0
-    mean_pulses = [float(np.mean(pl)) if pl else mean_loss for pl in pulse_loss_accum]
-    return mean_loss, mean_pulses
+    per_pulse = [float(np.mean(v)) if v else float("nan") for v in pulse_accum]
+    val_ce_final = per_pulse[-1] if per_pulse else float("nan")
+    return {
+        "val_ce_final": val_ce_final,
+        "val_ppl": math.exp(min(val_ce_final, 20.0)) if val_ce_final == val_ce_final else float("nan"),
+        "per_pulse": per_pulse,
+        # Positive means later pulses help: the owner's main signal on whether looping pays.
+        "latent_gain": (per_pulse[0] - per_pulse[-1]) if len(per_pulse) > 1 else 0.0,
+        "mean_pulse_ce": float(np.mean(per_pulse)) if per_pulse else float("nan"),
+    }
 
 
 def save_checkpoint(
@@ -246,6 +267,7 @@ def save_checkpoint(
         "optimizer": optimizer.state_dict() if hasattr(optimizer, "state_dict") else None,
         "opt_muon": optimizer.opt_muon.state_dict(),
         "opt_adam": optimizer.opt_adam.state_dict(),
+        "opt_adam_sr": optimizer.opt_adam_sr.state_dict(),
     }
     tmp_path = filepath + ".tmp"
     torch.save(ckpt, tmp_path)
@@ -270,7 +292,7 @@ def train():
     parser.add_argument("--lr-schedule", type=str, choices=["wsd", "cosine"], default="wsd", help="Learning rate schedule")
     parser.add_argument("--warmup-steps", type=int, default=100, help="Linear warmup steps")
     parser.add_argument("--cooldown-steps", type=int, default=0, help="Cooldown steps for WSD decay")
-    parser.add_argument("--min-lr-ratio", type=float, default=0.05, help="Minimum LR ratio during cooldown")
+    parser.add_argument("--min-lr-ratio", type=float, default=0.01, help="Minimum LR ratio during cooldown (docs specify 1%)")
     parser.add_argument("--eval-every", type=int, default=25, help="Steps between validation and canary generation")
     parser.add_argument("--eval-iters", type=int, default=10, help="Batches evaluated during validation")
     parser.add_argument("--save-every", type=int, default=25, help="Steps between saving latest.pt")
@@ -283,6 +305,19 @@ def train():
     parser.add_argument("--adam-lr", type=float, default=6e-4, help="AdamW base LR for 1D norms and embeddings")
     parser.add_argument("--weight-decay", type=float, default=0.1, help="Muon weight decay")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Max gradient norm clip value")
+    parser.add_argument("--per-pulse-bias", action="store_true",
+                        help="Per-pulse MoE balancing bias (default off). Changes training dynamics; "
+                             "old [E] checkpoints migrate by broadcasting.")
+    parser.add_argument("--moe-capacity-factor", type=float, default=None,
+                        help="Override MoE capacity headroom (default 1.12). Raising it mid-run is "
+                             "safe: capacity changes no checkpoint format.")
+    parser.add_argument("--drop-warn-pct", type=float, default=2.0,
+                        help="Warn when overall MoE drop rate exceeds this percentage")
+    parser.add_argument("--no-stochastic-rounding", action="store_true",
+                        help="Disable stochastic rounding for bf16 weights (default: on). "
+                             "Without SR, sub-ulp updates and weight decay round away.")
+    parser.add_argument("--muon-momentum-fp32", action="store_true",
+                        help="Keep Muon momentum in FP32 (default: bf16, matching the weight)")
     parser.add_argument("--compile", action="store_true", default=False, help="Enable torch.compile")
     parser.add_argument("--thermal-cooldown-every", type=int, default=0, help="Cooldown pause frequency in steps")
     parser.add_argument("--thermal-cooldown-seconds", type=int, default=100, help="Duration of thermal cooldown pause")
@@ -361,12 +396,19 @@ def train():
         base_seq_len=1024,
         default_pulses=args.num_pulses,
     )
-    model = PulsarForCausalLM(cfg).to(device=device, dtype=torch.bfloat16)
-
-    # Invariant Rule: Ensure all 1D/norm parameters are in float32
-    for name, p in model.named_parameters():
-        if p.ndim == 1 or "norm" in name or "bias" in name or "router" in name or "mix_logit" in name:
-            p.data = p.data.float()
+    if args.moe_capacity_factor is not None:
+        cfg.moe_capacity_factor = args.moe_capacity_factor
+    cfg.per_pulse_bias = args.per_pulse_bias
+    if args.per_pulse_bias:
+        print("[Pulsar] Per-pulse balancing bias: ON")
+    print(f"[Pulsar] MoE capacity factor: {cfg.moe_capacity_factor} "
+          f"(align {cfg.moe_capacity_align}) | drop warning above {args.drop_warn_pct}%")
+    model = PulsarForCausalLM(cfg).to(device=device)
+    # Single source of truth for mixed precision (WI-01). The previous implementation
+    # cast the whole model to bf16 and then re-cast a name-based subset to FP32, which
+    # missed pulse_res_scale / routed_scale / attn_gate / pulse_step_emb (left frozen in
+    # bf16) and cast every buffer, including the MoE expert counters and RoPE caches.
+    model.to_training_precision(torch.bfloat16)
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"[Pulsar] Pulsar-MoE Model Initialized: {total_params:,} parameters ({total_params/1e6:.2f}M)")
@@ -377,7 +419,12 @@ def train():
         muon_lr=args.muon_lr,
         adam_lr=args.adam_lr,
         weight_decay=args.weight_decay,
+        stochastic_rounding=not args.no_stochastic_rounding,
+        seed=args.seed,
+        momentum_fp32=args.muon_momentum_fp32,
     )
+    print(f"[Pulsar] Stochastic rounding: {'ON' if not args.no_stochastic_rounding else 'OFF'}"
+          f" | Muon momentum: {'FP32' if args.muon_momentum_fp32 else 'bf16'}")
 
     # Setup Checkpointing and Resumption
     start_step = 0
@@ -402,6 +449,8 @@ def train():
                 optimizer.opt_muon.load_state_dict(ckpt["opt_muon"])
             if "opt_adam" in ckpt and ckpt["opt_adam"] is not None:
                 optimizer.opt_adam.load_state_dict(ckpt["opt_adam"])
+            if "opt_adam_sr" in ckpt and ckpt["opt_adam_sr"] is not None:
+                optimizer.opt_adam_sr.load_state_dict(ckpt["opt_adam_sr"])
 
             start_step = ckpt.get("global_step", 0)
             tokens_seen = ckpt.get("tokens_seen", 0)
@@ -531,7 +580,7 @@ def train():
         t_opt_start = time.time()
         optimizer.step()
         raw_model = getattr(model, "_orig_mod", model)
-        raw_model.update_expert_biases(bias_lr=0.001)
+        raw_model.update_expert_biases(bias_lr=0.001, num_pulses=args.num_pulses)
         t_opt_total = time.time() - t_opt_start
 
         # Step timing, speed and hardware utilization
@@ -585,7 +634,18 @@ def train():
             f"L{i+1}: {step_pulse_losses[i]:.4f} (d{i+1}: {step_pulse_deltas[i]:.2f})"
             for i in range(min(len(step_pulse_losses), len(step_pulse_deltas)))
         )
-        print(f"  ↳ MoE Experts: [{moe_str}] | Conf: {conf:4.2f} | MaxBias: {max_bias:5.3f}")
+        # Drop statistics are per-pulse on purpose: drops concentrate on whichever pulse
+        # routes most unevenly, so a single global rate would hide the case that matters.
+        moe_stats = raw_model.pop_moe_stats() if hasattr(raw_model, "pop_moe_stats") else {}
+        drop_str = ""
+        if moe_stats.get("per_pulse"):
+            rates = [f"P{d['pulse']}:{d['drop_rate']*100:.2f}%" for d in moe_stats["per_pulse"] if d["assigned"] > 0]
+            if rates:
+                drop_str = f" | Drops: [{' '.join(rates)}] cap {int(moe_stats['capacity'])}"
+                overall = moe_stats["drop_rate"] * 100.0
+                if overall > args.drop_warn_pct:
+                    drop_str += f" ⚠ overall {overall:.2f}% > {args.drop_warn_pct}% -> consider --moe-capacity-factor 1.25"
+        print(f"  ↳ MoE Experts: [{moe_str}] | Conf: {conf:4.2f} | MaxBias: {max_bias:5.3f}{drop_str}")
         print(f"  ↳ Pulses: {pulses_str} | λ: {mix_lambda:.3f}")
         print(
             f"  ↳ Gradients: Total: {total_grad_norm:5.2f} (Muon: {muon_grad_norm:4.2f}, Adam: {adam_grad_norm:4.2f})\n"
@@ -599,26 +659,29 @@ def train():
         val_pulse_ppls = None
         # Periodic Evaluation and Canary Generation
         if step % args.eval_every == 0 or step == args.max_steps or interrupted:
-            val_loss, val_pulse_losses = evaluate_loss(
+            eval_metrics = evaluate_loss(
                 model, val_loader, args.eval_iters, args.num_pulses
             )
-            val_ppl = math.exp(min(val_loss, 20.0))
+            val_loss = eval_metrics["val_ce_final"]      # checkpoint selection metric
+            val_ppl = eval_metrics["val_ppl"]
+            val_pulse_losses = eval_metrics["per_pulse"]
             val_pulse_ppls = [math.exp(min(pl, 20.0)) for pl in val_pulse_losses]
+            latent_gain = eval_metrics["latent_gain"]
             last_val_loss = val_loss
             last_val_ppl = val_ppl
             last_val_pulse_losses = val_pulse_losses
             last_val_pulse_ppls = val_pulse_ppls
+            # best.pt keys on the FINAL pulse CE on all tokens, not the weighted sum.
             is_best = val_loss < best_val_loss
             if is_best:
                 best_val_loss = val_loss
 
-            latent_gain = (val_pulse_losses[-1] - val_pulse_losses[0]) if len(val_pulse_losses) > 1 else 0.0
-            print(f"\n--- [Eval @ Step {step}] Overall Val Loss: {val_loss:.4f} (PPL: {val_ppl:.1f}) | Best: {best_val_loss:.4f} ---")
+            print(f"\n--- [Eval @ Step {step}] val_ce_final: {val_loss:.4f} (PPL: {val_ppl:.1f}) | Best: {best_val_loss:.4f} ---")
             for p_idx, pl in enumerate(val_pulse_losses):
                 eff_l = (p_idx + 1) * cfg.n_core
                 pl_ppl = math.exp(min(pl, 20.0))
-                refine_str = f" | Latent Refinement: {latent_gain:+.4f}" if (p_idx == len(val_pulse_losses) - 1 and len(val_pulse_losses) > 1) else ""
-                print(f"  ↳ Pulse {p_idx + 1} [{eff_l:2d} eff layers]: Val Loss = {pl:.4f} (PPL: {pl_ppl:.1f}){refine_str}")
+                refine_str = f" | latent_gain {latent_gain:+.4f}" if (p_idx == len(val_pulse_losses) - 1 and len(val_pulse_losses) > 1) else ""
+                print(f"  ↳ Pulse {p_idx + 1} [{eff_l:2d} eff layers]: CE = {pl:.4f} (PPL: {pl_ppl:.1f}, 100% tokens){refine_str}")
             print("--- Canary Generations Live ---")
             latest_canaries = []
             for canary_meta in canary_prompts:
@@ -671,6 +734,7 @@ def train():
             "train_loss": round(accum_loss, 4),
             "loss_delta": round(loss_delta, 4),
             "train_ppl": round(train_ppl, 2),
+            "val_ce_final": round(val_loss, 4) if val_loss is not None else None,
             "val_loss": round(val_loss, 4) if val_loss is not None else None,
             "val_ppl": round(val_ppl, 2) if val_ppl is not None else None,
             "val_pulse_losses": [round(x, 4) for x in cur_vpl] if cur_vpl is not None else None,

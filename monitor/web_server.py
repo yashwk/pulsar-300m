@@ -558,5 +558,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Pulsar Web Dashboard Server")
     parser.add_argument("--port", type=int, default=7860, help="Server port (default: 7860)")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Bind host (default: 127.0.0.1; use 0.0.0.0 to expose on the LAN)")
+    parser.add_argument(
+        "--checkpoint-dir", type=str, default=None,
+        help="Run directory to monitor (default: checkpoints). Point this at the trainer's "
+             "--checkpoint-dir, e.g. checkpoints/baseline.",
+    )
     args = parser.parse_args()
+
+    if args.checkpoint_dir:
+        CHECKPOINT_DIR = args.checkpoint_dir
+        LIVE_STATUS_FILE = os.path.join(CHECKPOINT_DIR, "live_status.json")
+        METRICS_JSONL_FILE = os.path.join(CHECKPOINT_DIR, "metrics.jsonl")
+
     run_server(port=args.port, host=args.host)

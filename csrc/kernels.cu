@@ -915,48 +915,34 @@ void adamw_step_cuda(
 __global__ void moe_dispatch_forward_kernel(
     const __nv_bfloat16* __restrict__ x,           // [N, D]
     const int64_t* __restrict__ topk_idx,          // [N, K]
+    const int32_t* __restrict__ token_to_slot,     // [N, K] precomputed, -1 = dropped
     __nv_bfloat16* __restrict__ expert_inputs,     // [E, C, D]
-    int32_t* __restrict__ token_to_slot,          // [N, K]
-    int32_t* __restrict__ expert_counts,          // [E]
     int N, int D, int K, int E, int C
 ) {
     int idx = blockIdx.x; // Block per (token, k): 0 <= idx < N * K
     if (idx >= N * K) return;
 
-    __shared__ int s_slot;
-    __shared__ int s_expert;
+    // Slot assignment is decided outside the kernel so that which assignments are
+    // dropped is deterministic: the caller keeps the highest routing weights and
+    // drops the rest, independent of block scheduling. This kernel only copies.
+    int slot = token_to_slot[idx];
+    if (slot < 0 || slot >= C) return;
 
-    if (threadIdx.x == 0) {
-        int64_t e_id = topk_idx[idx];
-        s_expert = (int)e_id;
-        if (s_expert >= 0 && s_expert < E) {
-            int slot = atomicAdd(&expert_counts[s_expert], 1);
-            s_slot = slot;
-            token_to_slot[idx] = (slot < C) ? slot : -1;
-        } else {
-            s_slot = -1;
-            token_to_slot[idx] = -1;
+    int expert_id = (int)topk_idx[idx];
+    if (expert_id < 0 || expert_id >= E) return;
+
+    int token_idx = idx / K;
+    const __nv_bfloat16* src = x + token_idx * D;
+    __nv_bfloat16* dst = expert_inputs + (expert_id * C + slot) * D;
+
+    if (D % 8 == 0) {
+        int num_vec = D / 8;
+        for (int v = threadIdx.x; v < num_vec; v += blockDim.x) {
+            *reinterpret_cast<uint4*>(dst + v * 8) = *reinterpret_cast<const uint4*>(src + v * 8);
         }
-    }
-    __syncthreads();
-
-    int slot = s_slot;
-    int expert_id = s_expert;
-
-    if (slot >= 0 && slot < C && expert_id >= 0 && expert_id < E) {
-        int token_idx = idx / K;
-        const __nv_bfloat16* src = x + token_idx * D;
-        __nv_bfloat16* dst = expert_inputs + (expert_id * C + slot) * D;
-
-        if (D % 8 == 0) {
-            int num_vec = D / 8;
-            for (int v = threadIdx.x; v < num_vec; v += blockDim.x) {
-                *reinterpret_cast<uint4*>(dst + v * 8) = *reinterpret_cast<const uint4*>(src + v * 8);
-            }
-        } else {
-            for (int d = threadIdx.x; d < D; d += blockDim.x) {
-                dst[d] = src[d];
-            }
+    } else {
+        for (int d = threadIdx.x; d < D; d += blockDim.x) {
+            dst[d] = src[d];
         }
     }
 }
@@ -1120,6 +1106,7 @@ __global__ void moe_combine_backward_kernel(
 std::vector<torch::Tensor> moe_dispatch_forward_cuda(
     torch::Tensor x,
     torch::Tensor topk_idx,
+    torch::Tensor token_to_slot,
     int64_t num_experts,
     int64_t capacity
 ) {
@@ -1129,9 +1116,20 @@ std::vector<torch::Tensor> moe_dispatch_forward_cuda(
     int E = (int)num_experts;
     int C = (int)capacity;
 
+    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+    TORCH_CHECK(topk_idx.is_cuda(), "topk_idx must be a CUDA tensor");
+    TORCH_CHECK(token_to_slot.is_cuda(), "token_to_slot must be a CUDA tensor");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(topk_idx.is_contiguous(), "topk_idx must be contiguous");
+    TORCH_CHECK(token_to_slot.is_contiguous(), "token_to_slot must be contiguous");
+    TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "x must be bfloat16");
+    TORCH_CHECK(topk_idx.scalar_type() == torch::kInt64, "topk_idx must be int64");
+    TORCH_CHECK(token_to_slot.scalar_type() == torch::kInt32, "token_to_slot must be int32");
+    TORCH_CHECK(token_to_slot.size(0) == N && token_to_slot.size(1) == K,
+                "token_to_slot must be [N, K]");
+    TORCH_CHECK(D % 8 == 0, "D must be a multiple of 8 for vectorised dispatch, got ", D);
+
     auto expert_inputs = torch::zeros({E, C, D}, x.options());
-    auto token_to_slot = torch::empty({N, K}, torch::TensorOptions().dtype(torch::kInt32).device(x.device()));
-    auto expert_counts = torch::zeros({E}, torch::TensorOptions().dtype(torch::kInt32).device(x.device()));
 
     if (N > 0 && K > 0) {
         int threads = (D == 768) ? 96 : 128;
@@ -1139,13 +1137,12 @@ std::vector<torch::Tensor> moe_dispatch_forward_cuda(
         moe_dispatch_forward_kernel<<<blocks, threads>>>(
             reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<c10::BFloat16>()),
             topk_idx.data_ptr<int64_t>(),
-            reinterpret_cast<__nv_bfloat16*>(expert_inputs.data_ptr<c10::BFloat16>()),
             token_to_slot.data_ptr<int32_t>(),
-            expert_counts.data_ptr<int32_t>(),
+            reinterpret_cast<__nv_bfloat16*>(expert_inputs.data_ptr<c10::BFloat16>()),
             N, D, K, E, C
         );
     }
-    return {expert_inputs, token_to_slot, expert_counts};
+    return {expert_inputs};
 }
 
 torch::Tensor moe_dispatch_backward_cuda(
@@ -1359,6 +1356,18 @@ std::vector<torch::Tensor> qk_rmsnorm_forward_cuda(
     int head_dim = x.size(-1);
     int total_vectors = x.numel() / head_dim;
     int num_heads = weight.size(0);
+
+    // The kernel assumes a full warp per vector: 32 lanes x 2 elements = 64. With any
+    // other head_dim the upper lanes read and write past the end of the vector, which
+    // corrupts neighbouring memory and injects garbage (intermittent NaNs) into the
+    // warp reduction. Fail loudly instead of computing silently wrong results.
+    TORCH_CHECK(head_dim == 64,
+                "qk_rmsnorm kernel requires head_dim == 64, got ", head_dim,
+                " (use the PyTorch fallback for other head dims)");
+    TORCH_CHECK(x.is_cuda() && x.is_contiguous(), "x must be a contiguous CUDA tensor");
+    TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "x must be bfloat16");
+    TORCH_CHECK(weight.scalar_type() == torch::kFloat32, "weight must be float32");
+    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
 
     auto y = torch::empty_like(x);
     auto rsqrt_out = torch::empty({total_vectors}, torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));

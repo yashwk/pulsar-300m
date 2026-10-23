@@ -52,6 +52,7 @@ void adamw_step_cuda(
 std::vector<torch::Tensor> moe_dispatch_forward_cuda(
     torch::Tensor x,
     torch::Tensor topk_idx,
+    torch::Tensor token_to_slot,
     int64_t num_experts,
     int64_t capacity
 );

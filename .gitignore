@@ -15,7 +15,10 @@ dist/
 *.o
 
 # --- Datasets & checkpoints (large, machine-specific) ---
-data/
+# Ignore the data directory's contents but keep the pipeline source, which is code.
+data/*
+!data/*.py
+!data/pulsar_tokenizer/
 checkpoints/
 *.bin
 *.pt

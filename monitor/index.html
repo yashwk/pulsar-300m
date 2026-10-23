@@ -3304,7 +3304,11 @@
           // Also update Chart 4 header status pill
           const bEl = document.getElementById('badgeMoEBalance');
           if (bEl) {
-            bEl.innerText = `Uniformity: ${hNormPct.toFixed(1)}% | Spread: ${minE}%–${maxE}% | Bias: ${(data.router_max_bias || 0).toFixed(3)}`;
+            // router_confidence was computed and shipped in the metrics but never
+            // rendered. It is the mean of each token's max gating weight: 0.50 means a
+            // perfectly uniform router, higher means routing has sharpened.
+            const conf = (data.router_confidence != null) ? data.router_confidence.toFixed(3) : '--';
+            bEl.innerText = `Uniformity: ${hNormPct.toFixed(1)}% | Spread: ${minE}%–${maxE}% | Bias: ${(data.router_max_bias || 0).toFixed(3)} | Conf: ${conf}`;
           }
         }
 

@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import warnings
 from dataclasses import asdict, dataclass
 import torch
 import torch.nn as nn
@@ -50,8 +51,24 @@ class PulsarConfig:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, d: dict) -> "PulsarConfig":
+    def from_dict(cls, d: dict, *, strict: bool = False) -> "PulsarConfig":
+        """Build a config from a dict, reporting keys this class does not define.
+
+        Silently dropping unknown keys let a typo'd or stale key carry an intention
+        that never took effect - the same failure mode as a flag that is accepted and
+        ignored. Unknown keys are now always reported; ``strict=True`` raises, and the
+        default warns and continues so loading older checkpoints stays possible.
+        """
         valid_keys = set(cls.__dataclass_fields__.keys())
+        unknown = sorted(set(d) - valid_keys)
+        if unknown:
+            msg = (
+                f"unknown PulsarConfig key(s): {', '.join(unknown)}. "
+                f"These were previously ignored silently; the value is NOT in effect."
+            )
+            if strict:
+                raise ValueError(msg)
+            warnings.warn(msg, RuntimeWarning, stacklevel=2)
         filtered = {k: v for k, v in d.items() if k in valid_keys}
         return cls(**filtered)
 
@@ -298,10 +315,16 @@ class PulsarAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
 
-        # Global layers (3 & 7): YaRN-style temperature scaling when sequence exceeds base pretraining length
+        # Global layers (3 & 7): YaRN-style temperature scaling. The scale is a function
+        # of each QUERY POSITION, not of the call's total length:
+        #     scale[t] = 1 + 0.1 * ln(max(t + 1, base) / base)   (1.0 for t < base)
+        # Using T made a query's scaling depend on how many tokens followed it, so the
+        # model was not prefix-invariant and a KV cache would have been incorrect.
         if not self.is_local and T > self.cfg.base_seq_len:
-            scale = math.log(T / self.cfg.base_seq_len) * 0.1 + 1.0
-            q = q * scale
+            base = self.cfg.base_seq_len
+            pos = torch.arange(1, T + 1, device=q.device, dtype=torch.float32)
+            scale = 1.0 + 0.1 * torch.log(pos.clamp_min(base) / base)
+            q = q * scale.view(1, 1, T, 1).to(q.dtype)
 
         enable_gqa = (self.num_queries_per_kv > 1)
         if self.is_local and T > self.cfg.sliding_window:
@@ -932,7 +955,6 @@ class PulsarForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         labels: torch.Tensor | None = None,
         num_pulses: int | None = None,
-        early_exit_threshold: float | None = None,
         subsample_offset: int = 0,
         eval_full_pulses: bool = False,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, dict[str, float]]:
@@ -1026,17 +1048,6 @@ class PulsarForCausalLM(nn.Module):
                     full_loss = self._chunked_ce(self.final_norm(h_pulse), labels)
                     total_loss = total_loss + (self.cfg.final_loss_weight * full_loss)
                     pulse_losses.append(full_loss)
-            elif early_exit_threshold is not None:
-                # Fast inference early-exit check
-                out_norm = self.final_norm(h_pulse)
-                raw_step_logits = self.lm_head(out_norm)
-                step_logits = self.cfg.logit_softcap * torch.tanh(raw_step_logits / self.cfg.logit_softcap)
-                probs = F.softmax(step_logits[:, -1, :], dim=-1)
-                max_prob = torch.max(probs).item()
-                if max_prob >= early_exit_threshold:
-                    logits = step_logits
-                    break
-
         if labels is not None:
             # Add average router z-loss
             avg_z_loss = total_z_loss / (self.cfg.n_core * K)

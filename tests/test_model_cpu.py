@@ -107,13 +107,8 @@ def test_lr_schedule_warmup_plateau_cooldown():
     assert vals[-1] == pytest.approx(0.01, rel=1e-3)
 
 
-@pytest.mark.xfail(
-    reason="WI-11 not yet implemented: --min-lr-ratio defaults to 0.05 while "
-           "docs/CURRICULUM.md documents a 1% floor. Remove this marker when WI-11 lands.",
-    strict=True,
-)
 def test_min_lr_ratio_default_is_one_percent():
-    """The CLI default must match docs/CURRICULUM.md after WI-11."""
+    """The CLI default must match the 1% floor documented in docs/CURRICULUM.md."""
     import inspect
     import re
 

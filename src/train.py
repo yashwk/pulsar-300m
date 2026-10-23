@@ -72,7 +72,7 @@ def get_lr_factor(
     max_steps: int,
     schedule: str = "wsd",
     cooldown_steps: int = 0,
-    min_ratio: float = 0.05,
+    min_ratio: float = 0.01,
 ) -> float:
     """Calculate learning rate multiplier for WSD (Warmup-Stable-Decay) or Cosine schedule."""
     if warmup_steps > 0 and step <= warmup_steps:
@@ -292,7 +292,7 @@ def train():
     parser.add_argument("--lr-schedule", type=str, choices=["wsd", "cosine"], default="wsd", help="Learning rate schedule")
     parser.add_argument("--warmup-steps", type=int, default=100, help="Linear warmup steps")
     parser.add_argument("--cooldown-steps", type=int, default=0, help="Cooldown steps for WSD decay")
-    parser.add_argument("--min-lr-ratio", type=float, default=0.05, help="Minimum LR ratio during cooldown")
+    parser.add_argument("--min-lr-ratio", type=float, default=0.01, help="Minimum LR ratio during cooldown (docs specify 1%)")
     parser.add_argument("--eval-every", type=int, default=25, help="Steps between validation and canary generation")
     parser.add_argument("--eval-iters", type=int, default=10, help="Batches evaluated during validation")
     parser.add_argument("--save-every", type=int, default=25, help="Steps between saving latest.pt")

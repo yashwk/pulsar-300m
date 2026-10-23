@@ -14,23 +14,7 @@ torch::Tensor rope_forward_cuda(torch::Tensor qk, torch::Tensor cos, torch::Tens
 
 
 
-void muon_step_cuda(
-    torch::Tensor param,
-    torch::Tensor grad,
-    torch::Tensor momentum_buffer,
-    float lr,
-    float momentum,
-    float weight_decay
-);
 
-void adamw_step_cuda(
-    torch::Tensor param,
-    torch::Tensor grad,
-    torch::Tensor exp_avg,
-    torch::Tensor exp_avg_sq,
-    float lr, float beta1, float beta2, float eps, float weight_decay,
-    int step
-);
 
 std::vector<torch::Tensor> moe_dispatch_forward_cuda(
     torch::Tensor x,

@@ -247,8 +247,12 @@ def _flex_attention_available() -> bool:
 
 
 def _get_local_block_mask(B: int, H: int, T: int, window: int, device) -> object:
-    """Cached BlockMask for the causal sliding-window pattern."""
-    key = (B, H, T, window, str(device))
+    """Cached BlockMask for the causal sliding-window pattern.
+
+    The mask depends only on (q_idx, kv_idx), so it is built with B=None, H=None:
+    passing real B and H replicates identical metadata B*H times (48x for B=3, H=16).
+    """
+    key = (T, window, str(device))
     cached = _BLOCK_MASK_CACHE.get(key)
     if cached is not None:
         return cached
@@ -262,7 +266,11 @@ def _get_local_block_mask(B: int, H: int, T: int, window: int, device) -> object
     # this torch version builds a full T x T mask tensor internally just to derive the
     # block metadata - 8 GB at T=32768 - which defeats the entire point of using
     # flex_attention. The compiled path computes block counts directly.
-    block_mask = create_block_mask(mask_mod, B, H, T, T, device=device, _compile=True)
+    block_mask = create_block_mask(mask_mod, None, None, T, T, device=device, _compile=True)
+
+    # Bound the cache: T can vary per stage, and an unbounded dict grows forever.
+    if len(_BLOCK_MASK_CACHE) >= 8:
+        _BLOCK_MASK_CACHE.pop(next(iter(_BLOCK_MASK_CACHE)))
     _BLOCK_MASK_CACHE[key] = block_mask
     return block_mask
 
@@ -419,7 +427,9 @@ class PulsarAttention(nn.Module):
         # any other value makes the upper lanes read and write past the end of the
         # vector (intermittent NaNs from garbage entering the warp reduction). Guard
         # here and fall back to the PyTorch path for other head dims.
-        if HAS_PULSAR_CUDA and self.head_dim == 64 and q.is_cuda and hasattr(pulsar_cuda, "qk_rmsnorm_forward"):
+        if (HAS_PULSAR_CUDA and self.head_dim == 64 and q.is_cuda
+                and q.dtype == torch.bfloat16 and not torch.compiler.is_compiling()
+                and hasattr(pulsar_cuda, "qk_rmsnorm_forward")):
             q = _FusedQK_RMSNormFunction.apply(q, self.q_norm_weight[pulse_idx], T, self.cfg.rms_eps)
             k = _FusedQK_RMSNormFunction.apply(k, self.k_norm_weight[pulse_idx], T, self.cfg.rms_eps)
         else:
@@ -713,7 +723,9 @@ class PulsarMoEMLP(nn.Module):
         self.register_buffer("pulse_drop_accum", torch.zeros(cfg.max_pulses, dtype=torch.float32), persistent=False)
         self.register_buffer("pulse_assigned_accum", torch.zeros(cfg.max_pulses, dtype=torch.float32), persistent=False)
 
-    def forward(self, x: torch.Tensor, pulse_idx: int = 0) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor, pulse_idx: int = 0, routing_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         B, T, D = x.shape
         N = B * T
         x_flat = x.view(N, D)
@@ -727,13 +739,26 @@ class PulsarMoEMLP(nn.Module):
             x_flat.float(), router_w.float() if router_w.dtype != torch.float32 else router_w
         )  # [N, E] fp32
 
+        # Padded positions must not influence routing statistics or z-loss: a run of
+        # identical pad tokens would all choose the same experts, inflating drop counts
+        # and distorting the balancing bias.
+        valid = None
+        if routing_mask is not None:
+            valid = routing_mask.reshape(-1).bool()
+
         # 2. Router selection: fused top-2 + sigmoid + weight normalisation (CUDA),
         #    with z-loss computed in PyTorch so autograd scales it correctly. The z
         #    tensor is [N, E] (a few hundred KB), negligible next to the router matmul.
-        z_loss = self.cfg.router_z_loss_weight * torch.logsumexp(
-            logits.float(), dim=-1
-        ).pow(2).mean()
-        if HAS_PULSAR_CUDA and logits.is_cuda and hasattr(pulsar_cuda, "moe_router_topk_forward"):
+        if valid is not None and not bool(valid.all()):
+            lse_sq = torch.logsumexp(logits.float(), dim=-1).pow(2)
+            z_loss = self.cfg.router_z_loss_weight * lse_sq[valid].mean()
+        else:
+            z_loss = self.cfg.router_z_loss_weight * torch.logsumexp(
+                logits.float(), dim=-1
+            ).pow(2).mean()
+        if (HAS_PULSAR_CUDA and logits.is_cuda
+                and not torch.compiler.is_compiling()
+                and hasattr(pulsar_cuda, "moe_router_topk_forward")):
             bias = self.expert_bias[pulse_idx] if self.cfg.per_pulse_bias else self.expert_bias
             topk_idx, topk_weights = _FusedMoERouterFunction.apply(logits, bias)
         else:
@@ -764,10 +789,20 @@ class PulsarMoEMLP(nn.Module):
         # pulses), so the sync was measurable.
         with torch.no_grad():
             bincounts = torch.zeros(self.cfg.n_routed_experts, device=x.device, dtype=torch.float32)
-            bincounts.index_add_(
-                0, topk_idx.reshape(-1),
-                torch.ones(topk_idx.numel(), device=x.device, dtype=torch.float32),
-            )
+            count_idx = topk_idx.reshape(-1)
+            if valid is not None and not bool(valid.all()):
+                # Map padded assignments onto a valid expert and weight them by 0, so
+                # index_add_ cannot add entries from padding.
+                weights = torch.ones(topk_idx.numel(), device=x.device, dtype=torch.float32)
+                weights = weights * valid.repeat_interleave(self.cfg.top_k).float()
+                count_idx = torch.where(valid.repeat_interleave(self.cfg.top_k), count_idx,
+                                        torch.zeros_like(count_idx))
+                bincounts.index_add_(0, count_idx, weights)
+            else:
+                bincounts.index_add_(
+                    0, count_idx,
+                    torch.ones(topk_idx.numel(), device=x.device, dtype=torch.float32),
+                )
             # Suppressed while torch.utils.checkpoint recomputes this block during
             # backward, otherwise every counter would increment twice.
             if not _RECOMPUTING.active:
@@ -783,7 +818,9 @@ class PulsarMoEMLP(nn.Module):
                 self.pulse_assigned_accum[pulse_idx].add_(bincounts.sum())
                 self.capacity_last.fill_(float(capacity))
 
-        if HAS_PULSAR_CUDA and x_flat.is_cuda and hasattr(pulsar_cuda, "moe_dispatch_forward"):
+        if (HAS_PULSAR_CUDA and x_flat.is_cuda and x_flat.dtype == torch.bfloat16
+                and not torch.compiler.is_compiling()
+                and hasattr(pulsar_cuda, "moe_dispatch_forward")):
             token_to_slot = compute_token_slots(
                 topk_idx, topk_weights, self.cfg.n_routed_experts, capacity
             )
@@ -869,13 +906,16 @@ class PulsarBlock(nn.Module):
         sin: torch.Tensor,
         pulse_idx: int = 0,
         v_first: torch.Tensor | None = None,
+        routing_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor]:
         attn_in = self.attn_norm(x, pulse_idx=pulse_idx)
         attn_out, v_first = self.attn(attn_in, cos, sin, pulse_idx=pulse_idx, v_first=v_first)
         x = x + attn_out
 
         mlp_in = self.mlp_norm(x, pulse_idx=pulse_idx)
-        mlp_out, z_loss, gate_weight_mean, bincounts = self.mlp(mlp_in, pulse_idx=pulse_idx)
+        mlp_out, z_loss, gate_weight_mean, bincounts = self.mlp(
+            mlp_in, pulse_idx=pulse_idx, routing_mask=routing_mask
+        )
         x = x + mlp_out
         return x, v_first, z_loss, gate_weight_mean, bincounts
 
@@ -1085,13 +1125,19 @@ class PulsarForCausalLM(nn.Module):
             hc = h_flat[i:i + chunk]
             tc = tgt_flat[i:i + chunk]
             raw = F.linear(hc, self.lm_head.weight)
-            if HAS_PULSAR_CUDA and raw.is_cuda and hasattr(pulsar_cuda, "fused_softcap_ce_forward"):
+            if (HAS_PULSAR_CUDA and raw.is_cuda and raw.dtype == torch.bfloat16
+                    and not torch.compiler.is_compiling()
+                    and hasattr(pulsar_cuda, "fused_softcap_ce_forward")):
                 part = _FusedSoftcapCrossEntropyFunction.apply(raw, tc, self.cfg.logit_softcap, "sum", -100)
             else:
                 sc = self.cfg.logit_softcap * torch.tanh(raw / self.cfg.logit_softcap)
                 part = F.cross_entropy(sc, tc, ignore_index=-100, reduction="sum")
             total = total + part
-        return total / h_flat.size(0)
+        # Divide by VALID tokens, not the total: ignored (-100) positions contribute
+        # zero to the sum, so dividing by all tokens deflates the loss (and its
+        # gradients). Any batch with padding or ignore_index was affected.
+        n_valid = (tgt_flat != -100).sum().clamp_min(1)
+        return total / n_valid
 
     def forward(
         self,
@@ -1100,6 +1146,7 @@ class PulsarForCausalLM(nn.Module):
         num_pulses: int | None = None,
         subsample_offset: int = 0,
         eval_full_pulses: bool = False,
+        routing_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, dict[str, float]]:
         B, T = input_ids.shape
         K = num_pulses if num_pulses is not None else self.cfg.default_pulses
@@ -1151,12 +1198,14 @@ class PulsarForCausalLM(nn.Module):
                     # while recomputing, so MoE counter side effects are skipped.
                     h_curr, v_first, z_loss, gate_weight_mean, bincounts = checkpoint(
                         block, h_curr, cos, sin,
-                        pulse_idx=k, v_first=v_first, use_reentrant=False,
+                        pulse_idx=k, v_first=v_first, routing_mask=routing_mask,
+                        use_reentrant=False,
                         context_fn=lambda: (_set_recomputing(True), _set_recomputing(False)),
                     )
                 else:
                     h_curr, v_first, z_loss, gate_weight_mean, bincounts = block(
-                        h_curr, cos, sin, pulse_idx=k, v_first=v_first
+                        h_curr, cos, sin, pulse_idx=k, v_first=v_first,
+                        routing_mask=routing_mask,
                     )
                 total_z_loss = total_z_loss + z_loss
                 gate_confidence_accum = gate_confidence_accum + gate_weight_mean
@@ -1185,7 +1234,10 @@ class PulsarForCausalLM(nn.Module):
                         h_sub = h_pulse[:, offset::4, :].contiguous()
                         lbl_sub = labels[:, offset::4].contiguous()
                         raw_logits_sub = F.linear(self.final_norm(h_sub), self.lm_head.weight)
-                        if HAS_PULSAR_CUDA and raw_logits_sub.is_cuda and hasattr(pulsar_cuda, "fused_softcap_ce_forward"):
+                        if (HAS_PULSAR_CUDA and raw_logits_sub.is_cuda
+                                and raw_logits_sub.dtype == torch.bfloat16
+                                and not torch.compiler.is_compiling()
+                                and hasattr(pulsar_cuda, "fused_softcap_ce_forward")):
                             loss_sub = _FusedSoftcapCrossEntropyFunction.apply(
                                 raw_logits_sub.view(-1, self.cfg.vocab_size),
                                 lbl_sub.view(-1),
@@ -1302,8 +1354,13 @@ class PulsarForCausalLM(nn.Module):
         eos_id = eos_token_id if eos_token_id is not None else self.cfg.eos_token_id
 
         curr_ids = input_ids.clone()
+        # Per-row completion tracking. Previously only B==1 stopped at EOS, so batched
+        # rollouts kept generating past the end of finished sequences.
+        finished = torch.zeros(curr_ids.size(0), dtype=torch.bool, device=device)
         for _ in range(max_new_tokens):
-            context_window = curr_ids[:, -self.cfg.base_seq_len:]
+            # Use the full configured context, not just the base pretraining length:
+            # capping at base_seq_len meant generate() could never exercise 32k.
+            context_window = curr_ids[:, -self.cfg.max_seq_len:]
             logits, _, _ = self(context_window, labels=None, num_pulses=num_pulses)
             next_logits = logits[:, -1, :].clone()
 
@@ -1338,8 +1395,13 @@ class PulsarForCausalLM(nn.Module):
             else:
                 next_token = torch.argmax(next_logits, dim=-1, keepdim=True)
 
+            # Finished rows emit EOS rather than continuing to sample.
+            next_token = torch.where(
+                finished.unsqueeze(-1), torch.full_like(next_token, eos_id), next_token
+            )
             curr_ids = torch.cat([curr_ids, next_token], dim=1)
-            if curr_ids.size(0) == 1 and next_token.item() == eos_id:
+            finished |= (next_token.squeeze(-1) == eos_id)
+            if bool(finished.all()):
                 break
 
         if was_training:

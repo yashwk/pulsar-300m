@@ -300,7 +300,7 @@ def plan_epoch(
         # there is still a document cursor left: this window simply cannot be filled.
         # Pad the remainder (labels masked, routing excluded) and never drop the
         # document - leaving it unfilled would silently lose tokens.
-        pad = space if (space > 0 and i < order.size) else space
+        pad = space
 
         if wd or pad:
             windows.append(Window(
@@ -495,6 +495,8 @@ class PackedBatchLoader:
         else:
             ids = list(window_ids)
         xs, ys = [], []
+        # Cleared per call: this was appended to forever, leaking memory over training.
+        self._last_n_real.clear()
         n_windows = len(self.plan.windows)
         for wid in ids:
             if n_windows == 0:
@@ -506,6 +508,13 @@ class PackedBatchLoader:
             y = np.full(self.seq_len, self.ignore_index, dtype=np.int64)
             if n_real > 1:
                 y[: n_real - 1] = toks[1:n_real]
+            # Cross-document transitions inside a packed window: at a document's
+            # terminating EOS the next token belongs to a DIFFERENT document, so
+            # predicting it from that EOS teaches an association that does not exist.
+            # The EOS itself remains a valid target (it is predicted from real text).
+            if n_real > 1:
+                eos_at = np.flatnonzero(toks[: n_real - 1] == self.eos_id)
+                y[eos_at] = self.ignore_index
             xs.append(toks)
             ys.append(y)
             self._last_n_real.append(int(n_real))

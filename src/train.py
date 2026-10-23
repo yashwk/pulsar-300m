@@ -105,9 +105,16 @@ def update_optimizer_lrs(
     base_muon: float,
     base_adam: float,
 ):
-    """Scale group learning rates across Muon and AdamW."""
+    """Scale group learning rates across all three sub-optimizers.
+
+    opt_adam_sr holds tok_emb/lm_head in bf16 (~17% of the model). It was omitted here,
+    so those weights ran at 100% peak LR from step 1 with no warmup and never decayed
+    during cooldown.
+    """
     for g in optimizer.opt_muon.param_groups:
         g["lr"] = base_muon * factor
+    for g in optimizer.opt_adam_sr.param_groups:
+        g["lr"] = base_adam * factor
     for g in optimizer.opt_adam.param_groups:
         g["lr"] = base_adam * factor
 
@@ -499,6 +506,14 @@ def train():
             start_step = ckpt.get("global_step", 0)
             tokens_seen = ckpt.get("tokens_seen", 0)
             best_val_loss = ckpt.get("best_val_loss", float("inf"))
+
+            # A packed loaders' position is its cursor, not the RNG seed: without this
+            # a resumed run restarts at window 0 and retrains the opening data.
+            if isinstance(train_loader, PackedBatchLoader):
+                consumed = start_step * grad_accum * args.micro_batch_size
+                train_loader._cursor = consumed
+                print(f"[Pulsar] Packed sampler resumed at window {consumed:,} "
+                      f"of {len(train_loader.plan.windows):,}")
             print(f"[Pulsar] Resumed successfully at global_step {start_step} ({tokens_seen:,} tokens, best_val_loss={best_val_loss:.4f})")
         else:
             print(f"[Pulsar] Notice: Checkpoint '{resume_file}' not found. Starting from Step 0.")
@@ -564,6 +579,7 @@ def train():
     last_val_loss = best_val_loss if best_val_loss != float("inf") else None
     last_val_ppl = math.exp(min(last_val_loss, 20.0)) if last_val_loss is not None else None
     last_val_pulse_losses = None
+    last_live_canaries = []
     last_val_pulse_ppls = None
     latest_canaries = []
 
@@ -596,7 +612,13 @@ def train():
             x, y = train_loader.get_batch(seed_micro)
 
             t0 = time.time()
-            _, loss, metrics = model(x, labels=y, num_pulses=args.num_pulses, subsample_offset=micro_step)
+            # Packed windows may contain padding; exclude those positions from routing
+            # statistics and z-loss. Flat windows are always full, so the mask is None.
+            rmask = train_loader.routing_mask(x) if hasattr(train_loader, "routing_mask") else None
+            _, loss, metrics = model(
+                x, labels=y, num_pulses=args.num_pulses,
+                subsample_offset=micro_step, routing_mask=rmask,
+            )
             t1 = time.time()
             scaled_loss = loss / grad_accum
             scaled_loss.backward()
@@ -612,7 +634,15 @@ def train():
 
         # Sub-optimizer gradient norms before clipping (fused foreach kernels)
         m_grads = [p.grad for group in optimizer.opt_muon.param_groups for p in group["params"] if p.grad is not None]
-        a_grads = [p.grad for group in optimizer.opt_adam.param_groups for p in group["params"] if p.grad is not None]
+        # Both AdamW sub-optimizers: opt_adam_sr holds the bf16 embedding (~17% of
+        # parameters), so omitting it hid most of the Adam gradient norm.
+        a_grads = [
+            p.grad
+            for sub in (optimizer.opt_adam, optimizer.opt_adam_sr)
+            for group in sub.param_groups
+            for p in group["params"]
+            if p.grad is not None
+        ]
         muon_grad_norm = torch.linalg.vector_norm(torch.stack(torch._foreach_norm(m_grads))).item() if m_grads else 0.0
         adam_grad_norm = torch.linalg.vector_norm(torch.stack(torch._foreach_norm(a_grads))).item() if a_grads else 0.0
 
@@ -740,6 +770,7 @@ def train():
                 print(f"  ↳ Pulse {p_idx + 1} [{eff_l:2d} eff layers]: CE = {pl:.4f} (PPL: {pl_ppl:.1f}, 100% tokens){refine_str}")
             print("--- Canary Generations Live ---")
             latest_canaries = []
+            _canaries_generated_this_step = True
             for canary_meta in canary_prompts:
                 canary_idx = canary_meta["id"]
                 prompt = canary_meta["prompt"]
@@ -762,6 +793,9 @@ def train():
                     print(f"  [{tag}] Canary error: {e}")
             print("-----------------------------------------------------------------")
 
+            if latest_canaries:
+                last_live_canaries = latest_canaries
+
             if is_best and not args.no_save:
                 best_ckpt_path = os.path.join(args.checkpoint_dir, "best.pt")
                 if args.output_ckpt is not None:
@@ -769,8 +803,10 @@ def train():
                 save_checkpoint(best_ckpt_path, model, optimizer, cfg, step, tokens_seen, best_val_loss, num_pulses=args.num_pulses)
                 print(f"[Pulsar] Saved best checkpoint (val_loss={best_val_loss:.4f}) -> {best_ckpt_path}")
 
-        cur_vpl = val_pulse_losses
-        cur_vppl = val_pulse_ppls
+        # On non-eval steps these are None; fall back to the last eval so the JSONL
+        # record keeps the most recent validation numbers instead of nulls.
+        cur_vpl = val_pulse_losses if val_pulse_losses is not None else last_val_pulse_losses
+        cur_vppl = val_pulse_ppls if val_pulse_ppls is not None else last_val_pulse_ppls
 
         raw_model = getattr(model, "_orig_mod", model)
         model_summary = raw_model.get_model_summary(args.num_pulses) if hasattr(raw_model, "get_model_summary") else {}
@@ -790,9 +826,11 @@ def train():
             "train_loss": round(accum_loss, 4),
             "loss_delta": round(loss_delta, 4),
             "train_ppl": round(train_ppl, 2),
-            "val_ce_final": round(val_loss, 4) if val_loss is not None else None,
+            "val_ce_final": round(val_loss, 4) if val_loss is not None else (
+                round(last_val_loss, 4) if last_val_loss is not None else None),
             "val_loss": round(val_loss, 4) if val_loss is not None else None,
-            "val_ppl": round(val_ppl, 2) if val_ppl is not None else None,
+            "val_ppl": round(val_ppl if val_ppl is not None else last_val_ppl, 2)
+            if (val_ppl is not None or last_val_ppl is not None) else None,
             "val_pulse_losses": [round(x, 4) for x in cur_vpl] if cur_vpl is not None else None,
             "val_pulse_ppls": [round(x, 2) for x in cur_vppl] if cur_vppl is not None else None,
             "best_val_loss": round(best_val_loss, 4) if best_val_loss != float("inf") else None,
@@ -826,7 +864,7 @@ def train():
             # logging them makes a regression immediately visible.
             "pulse_res_scale_mean": [round(float(v), 5) for v in pulse_res_scale_mean],
             "routed_scale_mean": [round(float(v), 5) for v in routed_scale_mean],
-            "canaries": latest_canaries if latest_canaries else (last_live_canaries if 'last_live_canaries' in locals() else []),
+            "canaries": latest_canaries if latest_canaries else last_live_canaries,
         }
 
         # Write to JSONL

@@ -257,14 +257,27 @@ std::vector<torch::Tensor> rmsnorm_backward_cuda(torch::Tensor dy, torch::Tensor
     int dim = x.sizes().back();
     int total_tokens = x.numel() / dim;
 
+    TORCH_CHECK(x.is_cuda() && x.is_contiguous(), "x must be a contiguous CUDA tensor");
+    TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "x must be bfloat16");
+    TORCH_CHECK(dy.scalar_type() == torch::kBFloat16, "dy must be bfloat16");
+    TORCH_CHECK(weight.scalar_type() == torch::kFloat32, "weight must be float32");
+
     if (total_tokens == 0) {
         return {torch::empty_like(x), torch::zeros_like(weight)};
     }
 
+    // The vec8 kernel accumulates per-thread dweight for the channel group at index
+    // threadIdx.x. If num_vec > blockDim.x a thread handles several groups and the
+    // partial sums for different channels get mixed. Keep one thread per group, and
+    // cap at the hardware limit.
+    TORCH_CHECK(dim % 8 == 0, "rmsnorm backward requires dim % 8 == 0, got ", dim);
+    int num_vec = dim / 8;
+    TORCH_CHECK(num_vec <= 1024, "rmsnorm backward supports num_vec <= 1024 (dim <= 8192), got dim ", dim);
+
     auto dx = torch::empty_like(x);
     auto dweight = torch::zeros_like(weight);
 
-    int threads = (dim >= 256) ? 128 : 32;
+    int threads = std::min(1024, std::max(32, num_vec));
     int blocks = std::min(total_tokens, 256);
     rmsnorm_backward_vec8_kernel<<<blocks, threads>>>(
         reinterpret_cast<const __nv_bfloat16*>(dy.data_ptr<c10::BFloat16>()),
@@ -568,9 +581,12 @@ __global__ void rope_forward_kernel(
     int B, int num_heads, int T, int head_dim
 ) {
     int half_dim = head_dim / 2;
-    int t = blockIdx.y;
-    int h = blockIdx.z;
-    int b = blockIdx.x;
+    // Flatten (b, h, t) onto blockIdx.x. The previous layout put T on gridDim.y, whose
+    // hardware limit is 65535, so T >= 65536 failed to launch silently.
+    int row = blockIdx.x;
+    int t = row % T;
+    int h = (row / T) % num_heads;
+    int b = row / (T * num_heads);
     int i = threadIdx.x;
 
     if (i < half_dim && t < T && h < num_heads && b < B) {
@@ -593,8 +609,12 @@ torch::Tensor rope_forward_cuda(torch::Tensor qk, torch::Tensor cos, torch::Tens
     int T = qk.size(2);
     int head_dim = qk.size(3);
 
+    TORCH_CHECK(qk.is_cuda() && qk.is_contiguous(), "qk must be a contiguous CUDA tensor");
+    TORCH_CHECK(qk.scalar_type() == torch::kBFloat16, "qk must be bfloat16");
+
     auto out = torch::empty_like(qk);
-    dim3 grid(B, T, num_heads);
+    // One block per (b, h, t) flattened onto x, which supports 2^31-1 blocks.
+    dim3 grid(B * T * num_heads);
     dim3 block(head_dim / 2);
 
     auto cos_f = (cos.scalar_type() == torch::kFloat32) ? cos.contiguous() : cos.to(torch::kFloat32).contiguous();

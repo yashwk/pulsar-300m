@@ -86,7 +86,13 @@ def test_loader_shapes_and_targets():
     x, y = loader.get_batch()
     assert x.shape == (2, 256) and y.shape == (2, 256)
     assert x.dtype == torch.int64
-    assert torch.equal(x[:, 1:], y[:, :-1]), "targets must be next-token"
+
+    # Targets are next-token, EXCEPT at a document's terminating EOS: the next token
+    # there belongs to a different document, so it is masked rather than taught.
+    is_eos = x[:, :-1] == 0
+    eq = x[:, 1:] == y[:, :-1]
+    assert bool(eq[~is_eos].all()), "non-boundary targets must be next-token"
+    assert bool((y[:, :-1][is_eos] == -100).all()), "cross-document targets must be masked"
 
 
 def test_filler_only_from_over_long_documents():

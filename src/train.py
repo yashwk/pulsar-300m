@@ -608,6 +608,7 @@ def train():
 
         # Accumulate gradients across micro-batches
         accum_loss_tensor = torch.zeros((), device=device, dtype=torch.float32)
+        metric_accum: dict = {}
         for micro_step in range(grad_accum):
             seed_micro = args.seed + step * 1000 + micro_step
             x, y = train_loader.get_batch(seed_micro)
@@ -628,7 +629,28 @@ def train():
             t_fwd_total += (t1 - t0)
             t_bwd_total += (t2 - t1)
             accum_loss_tensor += loss.detach() / grad_accum
-            step_metrics = metrics
+            # Average the reported per-pulse metrics across micro-batches. Keeping only
+            # the last one made `pulse_losses` describe 1 of 43 micro-batches while
+            # train_loss averaged all of them, so the two disagreed on every step
+            # (measured mean gap 2.57 over a historical run).
+            def _avg(prev, cur, n):
+                """Average per-micro-batch values, including lists of scalars."""
+                if cur is None:
+                    return prev
+                if isinstance(cur, (list, tuple)):
+                    if prev is None:
+                        return [x / n if x is not None else None for x in cur]
+                    return [
+                        (a + (b / n)) if (a is not None and b is not None) else (a if b is None else b)
+                        for a, b in zip(prev, cur)
+                    ]
+                if prev is None:
+                    return cur / n
+                return prev + cur / n
+
+            for _k, _v in metrics.items():
+                metric_accum[_k] = _avg(metric_accum.get(_k), _v, grad_accum)
+            step_metrics = metric_accum
 
         accum_loss = accum_loss_tensor.item()
         tokens_seen += effective_global_batch_tokens

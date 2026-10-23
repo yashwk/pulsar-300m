@@ -107,7 +107,54 @@ class _SRMixin:
             self.stochastic_rounding = bool(state["stochastic_rounding"])
 
 
-class Muon(_SRMixin, Optimizer):
+class _SROptimizerMixin(_SRMixin):
+    """Adds stochastic-rounding bookkeeping to the optimizer's own state_dict.
+
+    The generator is seeded from (seed, _step_count), so a checkpoint that omits the
+    counter replays the step-0 rounding noise on resume - the run diverges even though
+    every tensor round-trips. Keeping it inside state_dict means any caller that saves
+    optimizer state gets it for free, rather than depending on the trainer remembering.
+    """
+
+    def state_dict(self):
+        sd = super().state_dict()
+        sd["_sr"] = self._sr_state()
+        # Preserve FP32 master state exactly; see load_state_dict.
+        live = [p for g in self.param_groups for p in g["params"]]
+        fp32_block = {}
+        for idx, param in enumerate(live):
+            pstate = self.state.get(param)
+            if not pstate:
+                continue
+            keep = {k: v.detach().clone() for k, v in pstate.items() if torch.is_tensor(v)}
+            if keep:
+                fp32_block[idx] = keep
+        if fp32_block:
+            sd["_fp32_state"] = fp32_block
+        return sd
+
+    def load_state_dict(self, state_dict):
+        sd = dict(state_dict)
+        sr = sd.pop("_sr", None)
+        # Optimizer.load_state_dict casts every state tensor to the PARAMETER's dtype,
+        # which silently downcasts AdamWBF16SR's FP32 master moments (exp_avg /
+        # exp_avg_sq) to bf16 on the way in - precision is already gone by the time we
+        # could cast back. So the FP32 moments travel under a private key that torch
+        # does not touch, and are restored verbatim here.
+        fp32_state = sd.pop("_fp32_state", None)
+        super().load_state_dict(sd)
+        self._load_sr_state(sr)
+        if fp32_state:
+            for idx, param in enumerate(p for g in self.param_groups for p in g["params"]):
+                saved = fp32_state.get(idx)
+                pstate = self.state.get(param)
+                if not saved or pstate is None:
+                    continue
+                for key, val in saved.items():
+                    pstate[key] = val.clone()
+
+
+class Muon(_SROptimizerMixin, Optimizer):
     """Muon with FP32 update accumulation and stochastic rounding on write-back."""
 
     def __init__(
@@ -204,7 +251,7 @@ class Muon(_SRMixin, Optimizer):
                         p.copy_(w32)
 
 
-class AdamWBF16SR(_SRMixin, _Optimizer):
+class AdamWBF16SR(_SROptimizerMixin, _Optimizer):
     """AdamW for bf16 parameters with FP32 master state and stochastic rounding."""
 
     def __init__(

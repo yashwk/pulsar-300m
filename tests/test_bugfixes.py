@@ -784,3 +784,108 @@ def test_dual_optimizer_checkpoint_includes_sr_state():
     # Loading a legacy checkpoint without the SR block must not raise.
     legacy = {k: v for k, v in sd.items() if not k.startswith("sr_")}
     opt.load_state_dict(legacy)
+
+
+# ---------------------------------------------------------------------------
+# Broader audit: pulse-metric averaging, checkpoint resume exactness
+# ---------------------------------------------------------------------------
+
+def test_adamw_fp32_master_state_survives_checkpoint_load():
+    """Optimizer.load_state_dict casts state to the PARAM dtype.
+
+    AdamWBF16SR keeps FP32 exp_avg/exp_avg_sq over bf16 parameters. Loading a checkpoint
+    downcast them to bf16 before any post-hoc cast could run, so a resumed run diverged
+    even though every tensor round-tripped. The FP32 block now travels under a private
+    key that torch does not touch.
+    """
+    import copy
+
+    import torch.nn as nn
+
+    from src.optim import AdamWBF16SR
+
+    torch.manual_seed(0)
+    p = nn.Parameter(torch.randn(16, 16, dtype=torch.bfloat16))
+    opt = AdamWBF16SR([p], lr=6e-4, stochastic_rounding=True, seed=3)
+    g = (torch.randn(16, 16) * 1e-3).to(torch.bfloat16)
+    for _ in range(2):
+        p.grad = g.clone()
+        opt.step()
+
+    sd = copy.deepcopy(opt.state_dict())
+    saved_avg = opt.state[p]["exp_avg"].clone()
+    saved_step = opt._step_count
+
+    p2 = nn.Parameter(torch.randn(16, 16, dtype=torch.bfloat16))
+    opt2 = AdamWBF16SR([p2], lr=6e-4, stochastic_rounding=True, seed=3)
+    opt2.load_state_dict(sd)
+
+    restored = opt2.state[p2]["exp_avg"]
+    assert restored.dtype == torch.float32, f"master state downcast to {restored.dtype}"
+    assert torch.equal(restored, saved_avg), "FP32 master state not bit-exact after load"
+    assert opt2._step_count == saved_step, "SR step counter not restored"
+
+
+def test_resume_reproduces_uninterrupted_run_exactly():
+    """Save mid-run, resume, and continue: parameters must match bit-for-bit."""
+    import copy
+
+    from src.model import PulsarConfig, PulsarForCausalLM
+    from src.optim import PulsarDualOptimizer
+
+    cfg = make_cfg(n_core=2, d_model=128, vocab_size=512, top_k=2)
+
+    def steps(model, opt, n, seed0):
+        for i in range(n):
+            torch.manual_seed(seed0 + i)
+            x = torch.randint(0, cfg.vocab_size, (2, 16))
+            y = torch.randint(0, cfg.vocab_size, (2, 16))
+            model.zero_grad()
+            _, loss, _ = model(x, labels=y, num_pulses=2)
+            loss.backward()
+            opt.step()
+            for b in model.core:
+                b.mlp.update_biases(0.001, num_pulses=2)
+
+    torch.manual_seed(0)
+    model = PulsarForCausalLM(cfg)
+    model.to_training_precision(torch.bfloat16)
+    opt = PulsarDualOptimizer(model, muon_lr=0.02, adam_lr=6e-4, weight_decay=0.1, seed=5)
+
+    steps(model, opt, 3, 100)
+    opt_sd = copy.deepcopy(opt.state_dict())
+    model_sd = copy.deepcopy(model.state_dict())
+    steps(model, opt, 2, 200)
+    reference = [p.detach().clone() for p in model.parameters()]
+
+    torch.manual_seed(0)
+    model2 = PulsarForCausalLM(cfg)
+    model2.to_training_precision(torch.bfloat16)
+    model2.load_state_dict(model_sd)
+    opt2 = PulsarDualOptimizer(model2, muon_lr=0.02, adam_lr=6e-4, weight_decay=0.1, seed=5)
+    opt2.load_state_dict(opt_sd)
+    steps(model2, opt2, 2, 200)
+    resumed = [p.detach().clone() for p in model2.parameters()]
+
+    worst = max((a.float() - b.float()).abs().max().item()
+                for a, b in zip(reference, resumed))
+    assert worst == 0.0, f"resume diverged by {worst:.3e}"
+
+
+def test_training_counters_survive_checkpoint():
+    """update_biases() reads expert_counts_accum, so it must be persistent."""
+    from src.model import PulsarForCausalLM
+
+    cfg = make_cfg(n_core=2, d_model=128, vocab_size=512, top_k=2)
+    torch.manual_seed(0)
+    model = PulsarForCausalLM(cfg)
+    model.train()
+    x = torch.randint(0, cfg.vocab_size, (1, 16))
+    with torch.no_grad():
+        model(x, labels=None, num_pulses=2)
+
+    sd = model.state_dict()
+    assert any("expert_counts_accum" in k for k in sd), (
+        "expert_counts_accum is not persistent; a mid-run checkpoint loses the counts "
+        "that update_biases() depends on"
+    )

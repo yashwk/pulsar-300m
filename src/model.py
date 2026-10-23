@@ -729,8 +729,11 @@ class PulsarMoEMLP(nn.Module):
             )
         else:
             self.register_buffer("expert_bias", torch.zeros(cfg.n_routed_experts, dtype=torch.float32), persistent=True)
-        self.register_buffer("expert_counts_accum", torch.zeros(cfg.n_routed_experts, dtype=torch.float32), persistent=False)
-        self.register_buffer("expert_pulse_counts", torch.zeros(cfg.max_pulses, cfg.n_routed_experts, dtype=torch.float32), persistent=False)
+        # persistent=True: update_biases() reads these, so a checkpoint taken mid-step
+        # must carry them or the resumed run applies a different bias update. They are
+        # small (E and K*E floats), so the checkpoint cost is negligible.
+        self.register_buffer("expert_counts_accum", torch.zeros(cfg.n_routed_experts, dtype=torch.float32), persistent=True)
+        self.register_buffer("expert_pulse_counts", torch.zeros(cfg.max_pulses, cfg.n_routed_experts, dtype=torch.float32), persistent=True)
         # Drop statistics, accumulated on the GPU and drained by pop_moe_stats().
         # No .item() in the hot path: syncing per micro-batch would serialise the stream.
         self.register_buffer("drop_counts_accum", torch.zeros((), dtype=torch.float32), persistent=False)

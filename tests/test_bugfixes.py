@@ -404,3 +404,142 @@ def test_generate_stops_all_rows_at_eos():
     assert out.shape[0] == 3
     # Every row must be terminated (or stopped at max_new_tokens), not still sampling.
     assert out.shape[1] <= x.shape[1] + 8
+
+
+# ---------------------------------------------------------------------------
+# Final polish: reference/kernel precision parity, pulse weights, edge cases
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not HAS_CUDA, reason="needs CUDA kernels")
+def test_swiglu_fallback_matches_kernel():
+    """The fallback computed F.silu(gate) * up in bf16; the kernel uses FP32.
+
+    Measured: bf16 intermediates differ from the FP32 reference by ~1.3e-1, FP32
+    intermediates match bit-for-bit. Exercises _FusedSwiGLUFunction with the CUDA path
+    disabled, so it fails if the fallback regresses.
+    """
+    import src.model as M
+
+    torch.manual_seed(0)
+    gu = torch.randn(4, 16, 256, device="cuda", dtype=torch.bfloat16) * 2.0
+    d_ff = 128
+
+    orig = M.HAS_PULSAR_CUDA
+    try:
+        M.HAS_PULSAR_CUDA = False
+        fallback = M._FusedSwiGLUFunction.apply(gu, d_ff)
+    finally:
+        M.HAS_PULSAR_CUDA = orig
+
+    ref = (torch.nn.functional.silu(gu[..., :d_ff].float()) * gu[..., d_ff:].float()).to(gu.dtype)
+    err = (fallback.float() - ref.float()).abs().max().item()
+    assert err < 1e-2, (
+        f"fallback differs from the FP32 reference by {err:.3e}; bf16 intermediates "
+        f"give ~1.3e-1"
+    )
+
+
+@pytest.mark.skipif(not HAS_CUDA, reason="needs CUDA kernels")
+def test_swiglu_backward_fallback_matches_kernel():
+    import pulsar_cuda
+
+    torch.manual_seed(0)
+    gu = torch.randn(4, 16, 256, device="cuda", dtype=torch.bfloat16) * 2.0
+    dout = torch.randn(4, 16, 128, device="cuda", dtype=torch.bfloat16)
+    d_ff = 128
+
+    fused = pulsar_cuda.fused_swiglu_backward(dout.contiguous(), gu.contiguous(), d_ff)
+
+    g = gu[..., :d_ff].float()
+    u = gu[..., d_ff:].float()
+    sig = torch.sigmoid(g)
+    silu = g * sig
+    dg = dout.float() * u * (silu + sig * (1.0 - silu))
+    du = dout.float() * silu
+    ref = torch.cat([dg.to(gu.dtype), du.to(gu.dtype)], dim=-1)
+
+    err = (fused.float() - ref.float()).abs().max().item()
+    assert err < 5e-2, f"backward differ by {err:.3e}"
+
+
+@pytest.mark.skipif(not HAS_CUDA, reason="needs CUDA kernels")
+def test_rope_fallback_matches_kernel_exactly():
+    """The fallback downcast cos/sin to bf16; the kernel rotates in FP32.
+
+    Measured against the kernel: FP32 intermediates give a bit-exact match (0.0),
+    bf16 downcast of the tables gives 1.56e-2. The assertion is tight enough to
+    separate those two, and it exercises apply_rotary_emb rather than reimplementing
+    the formula, so it fails if the fallback regresses.
+    """
+    import src.model as M
+
+    torch.manual_seed(0)
+    B, H, T, D = 1, 2, 24, 64
+    x = torch.randn(B, H, T, D, device="cuda", dtype=torch.bfloat16)
+    angles = torch.rand(T, D // 2, device="cuda")
+    cos, sin = torch.cos(angles), torch.sin(angles)
+
+    from src.model import _RoPECUDAFunction
+    kernel_out = _RoPECUDAFunction.apply(x, cos, sin)
+
+    # Force the PyTorch fallback by pretending the fused kernel is unavailable.
+    orig = M.HAS_PULSAR_CUDA
+    try:
+        M.HAS_PULSAR_CUDA = False
+        fallback_out = M.apply_rotary_emb(x, cos, sin)
+    finally:
+        M.HAS_PULSAR_CUDA = orig
+
+    err = (kernel_out.float() - fallback_out.float()).abs().max().item()
+    assert err < 1e-3, (
+        f"fallback differs from the kernel by {err:.3e}; bf16 downcast of the cos/sin "
+        f"tables gives ~1.56e-2, FP32 intermediates give 0.0"
+    )
+
+
+def test_pulse_weights_normalised_for_any_k():
+    """At K=1 the single pulse carried 0.60, so loss was 60% of the true CE."""
+    from src.model import PulsarConfig, PulsarForCausalLM
+    import torch.nn.functional as F
+
+    cfg = make_cfg(n_core=2, d_model=128, vocab_size=512, top_k=2,
+                   aux_loss_weight_1=0.0, aux_loss_weight_2=0.0, router_z_loss_weight=0.0)
+    torch.manual_seed(0)
+    model = PulsarForCausalLM(cfg).eval()
+    x = torch.randint(0, cfg.vocab_size, (2, 8))
+    y = torch.randint(0, cfg.vocab_size, (2, 8))
+
+    with torch.no_grad():
+        _, loss, _ = model(x, labels=y, num_pulses=1)
+        logits, _, _ = model(x, labels=None, num_pulses=1)
+    sc = cfg.logit_softcap * torch.tanh(logits / cfg.logit_softcap)
+    ref = F.cross_entropy(sc.reshape(-1, cfg.vocab_size), y.reshape(-1), ignore_index=-100)
+
+    assert loss.item() == pytest.approx(ref.item(), rel=1e-3), (
+        f"K=1 loss {loss.item():.4f} != CE {ref.item():.4f}; the weight is not normalised"
+    )
+
+
+def test_invalid_pulse_count_rejected():
+    from src.model import PulsarForCausalLM
+
+    cfg = make_cfg(n_core=2, d_model=128, vocab_size=512)
+    model = PulsarForCausalLM(cfg).eval()
+    x = torch.randint(0, cfg.vocab_size, (1, 4))
+    for bad in (0, -1, cfg.max_pulses + 1):
+        with pytest.raises(ValueError):
+            model(x, labels=None, num_pulses=bad)
+
+
+def test_swiglu_accepts_noncontiguous_input():
+    """The kernel requires contiguous input; the wrapper must not trip on a slice."""
+    from src.model import _FusedSwiGLUFunction
+
+    if not HAS_CUDA:
+        pytest.skip("CUDA path only")
+    big = torch.randn(4, 16, 512, device="cuda", dtype=torch.bfloat16)
+    gu = big[..., ::2]           # non-contiguous view
+    assert not gu.is_contiguous()
+    out = _FusedSwiGLUFunction.apply(gu, 128)
+    assert out.shape == (4, 16, 128)
+    assert torch.isfinite(out).all()

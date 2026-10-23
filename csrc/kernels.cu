@@ -219,6 +219,9 @@ __global__ void rmsnorm_backward_vec8_kernel(
 }
 
 std::vector<torch::Tensor> rmsnorm_forward_cuda(torch::Tensor x, torch::Tensor weight, float eps) {
+    TORCH_CHECK(x.is_cuda() && x.is_contiguous(), "x must be a contiguous CUDA tensor");
+    TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "x must be bfloat16");
+    TORCH_CHECK(weight.scalar_type() == torch::kFloat32, "weight must be float32");
     auto orig_shape = x.sizes();
     int dim = orig_shape.back();
     int total_tokens = x.numel() / dim;
@@ -540,6 +543,8 @@ __global__ void fused_swiglu_backward_kernel(
 }
 
 torch::Tensor fused_swiglu_forward_cuda(torch::Tensor gu, int64_t d_ff) {
+    TORCH_CHECK(gu.is_cuda() && gu.is_contiguous(), "gu must be a contiguous CUDA tensor");
+    TORCH_CHECK(gu.scalar_type() == torch::kBFloat16, "gu must be bfloat16");
     int total_elements = gu.numel();
     if (total_elements == 0) {
         auto sizes = gu.sizes().vec();
@@ -560,6 +565,10 @@ torch::Tensor fused_swiglu_forward_cuda(torch::Tensor gu, int64_t d_ff) {
 }
 
 torch::Tensor fused_swiglu_backward_cuda(torch::Tensor dout, torch::Tensor gu, int64_t d_ff) {
+    TORCH_CHECK(gu.is_cuda() && gu.is_contiguous(), "gu must be a contiguous CUDA tensor");
+    TORCH_CHECK(gu.scalar_type() == torch::kBFloat16, "gu must be bfloat16");
+    TORCH_CHECK(dout.is_contiguous(), "dout must be contiguous");
+    TORCH_CHECK(dout.scalar_type() == torch::kBFloat16, "dout must be bfloat16");
     auto dgu = torch::empty_like(gu);
     int total_elements = gu.numel();
     if (total_elements == 0) {

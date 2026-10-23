@@ -43,14 +43,21 @@ Built from the ground up for consumer hardware (NVIDIA RTX 4060 8GB Laptop GPU) 
      $$\mathbf{y}_{\text{moe}} = \mathbf{y}_{\text{shared}} + \mathbf{y}_{\text{routed}} \odot \mathbf{r}_k$$
    - Balances foundational shared knowledge in early pulses with deep domain specialization in late pulses.
 
-4. **Multi-Harness Tool-Call Randomization:**
-   - Formats agentic tool calling probabilistically across 3 major agent ecosystems:
-     - **70% Native Fast Format:** `<|tool_call|>{"name": ..., "arguments": ...}<|/tool_call|>`
-     - **15% XML Format (Cline/Claude Code style):** `<|tool_call|><invoke name="..."><arguments>...</arguments></invoke><|/tool_call|>`
-     - **15% Markdown JSON Format:** ````json\n{"tool": ..., "arguments": ...}\n````
+4. **Tool-Call Format:**
+   - Agentic tool calls use a single, consistent format across the corpus:
+     `<|tool_call|>{"name": ..., "arguments": ...}<|/tool_call|>`
+   - Measured over the 952M-token corpus: 100,914 balanced open/close pairs, every
+     payload using the `{"name", "arguments"}` schema. (An earlier version of this README
+     described a 70/15/15 split across native, XML and Markdown-JSON formats; the corpus
+     does not contain such a split.)
 
-5. **Complete-Thought Sentence Guard:**
-   - Ensures `<|think|>` traces never cut mid-sentence or mid-word. Naturally concise traces ($\le 2,400$ chars) remain 100% intact, while longer traces preserve the opening problem setup, a clean `\n\n[...]\n\n` transition, and a complete concluding deduction terminating strictly with sentence punctuation.
+5. **Verbatim Reasoning Traces:**
+   - `<|think|>` traces are stored intact. Measured over the corpus: 114,893 balanced
+     open/close pairs and **zero** `\n\n[...]\n\n` splices. Every one of the 215
+     `[...]` occurrences is genuine source content (NumPy ellipsis, quoted text, name
+     elisions), not an inserted elision.
+   - Training on ungrounded "skip the middle" bridges would teach the model to emit
+     `[...]` and invent conclusions, so traces are kept verbatim instead.
 
 6. **32k Hybrid Attention Pattern:**
    - 6 Local High-Precision Layers ($\theta=10,000$, sliding window 1024) provide 4x sharper positional resolution for code, math, and JSON.
@@ -74,16 +81,23 @@ Built from the ground up for consumer hardware (NVIDIA RTX 4060 8GB Laptop GPU) 
 python setup.py build_ext --inplace
 ```
 
-### 2. Generate Shards (NVIDIA Nemotron 5-Pillar Mix)
+### 2. Check the Shards on Disk
+The corpus is already built and tokenized (`data/*.bin`, uint16 token ids); there is no
+shard-preparation script in this repository. See the state of what is present, including
+document-length structure and what packing at a given context length would cost:
 ```bash
-python data/prepare_shards.py --stage 1 --shard-idx 1 --total-tokens 500000000
-python data/prepare_shards.py --stage 1 --shard-idx 2 --total-tokens 500000000
+python scripts/measure_packing.py --seq-len 1024
+python scripts/analyze_agentic_lengths.py --tokenizer data/pulsar_tokenizer
 ```
 
-### 3. Verify Shard Integrity
+### 3. Sanity-Check the Trainer
 ```bash
-python data/audit_shard.py --shard-path data/train_shard1.bin --min-count 5000
+# 2-step smoke run: --no-save avoids writing a 1.3 GB checkpoint
+python -m src.train --max-steps 2 --warmup-steps 1 --no-save \
+    --micro-batch-size 3 --seq-len 1024 --checkpoint-dir checkpoints/smoke
 ```
+Omit `--no-save` for a real run; checkpoints go to `--checkpoint-dir` (default
+`checkpoints/`), and `latest.pt` / `best.pt` are overwritten in place.
 
 ### 4. Launch Web Telemetry Dashboard
 ```bash

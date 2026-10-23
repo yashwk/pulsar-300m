@@ -663,8 +663,12 @@ def train():
         t_step_prev = t_step_now
         tok_per_sec = effective_global_batch_tokens / max(1e-4, step_dt)
 
-        # MFU estimation: FLOPs/tok ≈ 6 * non_embed_active_params * K = 6 * 97.15M * 3 ≈ 2.05 GFLOPs/tok (Upgrade B)
-        achieved_tflops = tok_per_sec * 2.05e-3
+        # MFU estimation: FLOPs/tok scales with the number of pulses K.
+        # The K=3 baseline is 2.05 GFLOPs/tok (6 * 97.15M non-embed active params * 3,
+        # rounded to include attention). Scale linearly from that baseline so a 1- or
+        # 2-pulse run is not reported as if it did K=3 work.
+        flops_per_tok = 2.05e-3 * (args.num_pulses / 3.0)   # GFLOPs per token
+        achieved_tflops = tok_per_sec * flops_per_tok
         mfu_pct = (achieved_tflops / 60.0) * 100.0  # 60 TFLOPs dense BF16 baseline (RTX 4060 Laptop)
 
         # Loss delta, elapsed time & ETA calculation

@@ -361,10 +361,14 @@ def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> t
     if HAS_PULSAR_CUDA and x.is_cuda and x.dtype == torch.bfloat16 and not torch.compiler.is_compiling():
         return _RoPECUDAFunction.apply(x, cos, sin)
     d = x.shape[-1] // 2
-    x1, x2 = x[..., :d], x[..., d:]
-    cos = cos.unsqueeze(0).unsqueeze(0).to(x.dtype)
-    sin = sin.unsqueeze(0).unsqueeze(0).to(x.dtype)
-    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+    # FP32 intermediates: rope_forward_kernel rotates in FP32 with FP32 cos/sin tables
+    # and casts to bf16 at the end. Downcasting the tables to bf16 first made the
+    # fallback (and every torch.compile / CPU / FP32 run) drift from the kernel.
+    cos_f = cos.unsqueeze(0).unsqueeze(0).float()
+    sin_f = sin.unsqueeze(0).unsqueeze(0).float()
+    xf = x.float()
+    x1, x2 = xf[..., :d], xf[..., d:]
+    return torch.cat([x1 * cos_f - x2 * sin_f, x2 * cos_f + x1 * sin_f], dim=-1).to(x.dtype)
 
 
 class PulsarAttention(nn.Module):
@@ -495,17 +499,20 @@ class _FusedSwiGLUFunction(torch.autograd.Function):
         ctx.save_for_backward(gu)
         ctx.d_ff = d_ff
         if HAS_PULSAR_CUDA and gu.is_cuda and gu.dtype == torch.bfloat16 and not torch.compiler.is_compiling() and hasattr(pulsar_cuda, "fused_swiglu_forward"):
-            return pulsar_cuda.fused_swiglu_forward(gu, d_ff)
+            return pulsar_cuda.fused_swiglu_forward(gu.contiguous(), d_ff)
         gate = gu[..., :d_ff]
         up = gu[..., d_ff:]
-        return F.silu(gate) * up
+        # FP32 intermediates, matching fused_swiglu_forward_kernel and the backward
+        # fallback below. Computing in bf16 here made the reference path drift from the
+        # kernel it is supposed to validate (and from its own gradient).
+        return (F.silu(gate.float()) * up.float()).to(gu.dtype)
 
     @staticmethod
     def backward(ctx, dout):
         gu, = ctx.saved_tensors
         d_ff = ctx.d_ff
         if HAS_PULSAR_CUDA and dout.is_cuda and dout.dtype == torch.bfloat16 and not torch.compiler.is_compiling() and hasattr(pulsar_cuda, "fused_swiglu_backward"):
-            return pulsar_cuda.fused_swiglu_backward(dout, gu, d_ff), None
+            return pulsar_cuda.fused_swiglu_backward(dout.contiguous(), gu.contiguous(), d_ff), None
         gate = gu[..., :d_ff]
         up = gu[..., d_ff:]
         sig = torch.sigmoid(gate.float())
@@ -1150,7 +1157,8 @@ class PulsarForCausalLM(nn.Module):
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, dict[str, float]]:
         B, T = input_ids.shape
         K = num_pulses if num_pulses is not None else self.cfg.default_pulses
-        pulse_scale = 1.0 / math.sqrt(K)
+        if K < 1 or K > self.cfg.max_pulses:
+            raise ValueError(f"num_pulses must be in [1, {self.cfg.max_pulses}], got {K}")
 
         # Token embedding & RoPE frequencies (local 10k and global 1M)
         h_0 = self.tok_emb(input_ids)
@@ -1162,6 +1170,22 @@ class PulsarForCausalLM(nn.Module):
         v_first = None
         total_loss = torch.zeros((), device=input_ids.device, dtype=torch.float32) if labels is not None else None
         total_z_loss = torch.zeros((), device=input_ids.device, dtype=torch.float32)
+
+        # Deep-supervision weights, normalised over the K ACTIVE pulses so they always
+        # sum to 1.0. The configured 0.15/0.25/0.60 already sum to 1 at K=3, but at
+        # K=1 the single pulse would have carried 0.60 and the reported loss would be
+        # 60% of the true CE; at K=2 the pair would sum to 0.75.
+        w_mid = self.cfg.aux_loss_weight_2
+        w_final = self.cfg.final_loss_weight
+        w_sum = (self.cfg.aux_loss_weight_2 if K >= 2 else 0.0) * (K - 1) + w_final
+        w_first = self.cfg.aux_loss_weight_1 if K >= 2 else 0.0
+        w_sum += w_first
+        last_only = (K == 1)
+        pulse_weights = (
+            [w_final / w_sum] if last_only
+            else [(w_final if k == K - 1 else (w_first if k == 0 else w_mid)) / w_sum
+                  for k in range(K)]
+        )
 
         pulse_losses: list[torch.Tensor] = []
         pulse_deltas: list[torch.Tensor] = []
@@ -1249,13 +1273,12 @@ class PulsarForCausalLM(nn.Module):
                             logits_sub = self.cfg.logit_softcap * torch.tanh(raw_logits_sub / self.cfg.logit_softcap)
                             loss_sub = F.cross_entropy(logits_sub.view(-1, self.cfg.vocab_size), lbl_sub.view(-1), ignore_index=-100)
 
-                    w_k = self.cfg.aux_loss_weight_1 if k == 0 else self.cfg.aux_loss_weight_2
-                    total_loss = total_loss + (w_k * loss_sub)
+                    total_loss = total_loss + (pulse_weights[k] * loss_sub)
                     pulse_losses.append(loss_sub)
                 else:
                     # Final pulse: always 100% of tokens (chunked to bound VRAM)
                     full_loss = self._chunked_ce(self.final_norm(h_pulse), labels)
-                    total_loss = total_loss + (self.cfg.final_loss_weight * full_loss)
+                    total_loss = total_loss + (pulse_weights[k] * full_loss)
                     pulse_losses.append(full_loss)
         if labels is not None:
             # Add average router z-loss

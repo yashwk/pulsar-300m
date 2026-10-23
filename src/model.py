@@ -854,6 +854,24 @@ class PulsarForCausalLM(nn.Module):
             "per_pulse": per_pulse,
         }
 
+    def _chunked_ce(self, h: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Mean soft-capped cross-entropy over all tokens, chunked to bound VRAM."""
+        h_flat = h.reshape(-1, self.cfg.d_model)
+        tgt_flat = labels.reshape(-1)
+        chunk = getattr(self.cfg, "ce_chunk_size", 4096)
+        total = torch.zeros((), device=h_flat.device, dtype=torch.float32)
+        for i in range(0, h_flat.size(0), chunk):
+            hc = h_flat[i:i + chunk]
+            tc = tgt_flat[i:i + chunk]
+            raw = F.linear(hc, self.lm_head.weight)
+            if HAS_PULSAR_CUDA and raw.is_cuda and hasattr(pulsar_cuda, "fused_softcap_ce_forward"):
+                part = _FusedSoftcapCrossEntropyFunction.apply(raw, tc, self.cfg.logit_softcap, "sum", -100)
+            else:
+                sc = self.cfg.logit_softcap * torch.tanh(raw / self.cfg.logit_softcap)
+                part = F.cross_entropy(sc, tc, ignore_index=-100, reduction="sum")
+            total = total + part
+        return total / h_flat.size(0)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -861,6 +879,7 @@ class PulsarForCausalLM(nn.Module):
         num_pulses: int | None = None,
         early_exit_threshold: float | None = None,
         subsample_offset: int = 0,
+        eval_full_pulses: bool = False,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, dict[str, float]]:
         B, T = input_ids.shape
         K = num_pulses if num_pulses is not None else self.cfg.default_pulses
@@ -920,51 +939,36 @@ class PulsarForCausalLM(nn.Module):
             # 4. Multi-Step Deep Supervision with Output Logit Soft-Capping
             if labels is not None:
                 if k < K - 1:
-                    # Intermediate pulses: 25% subsampling with rotating disjoint offsets
-                    offset = (subsample_offset + k) % 4
-                    h_sub = h_pulse[:, offset::4, :].contiguous()
-                    lbl_sub = labels[:, offset::4].contiguous()
-                    raw_logits_sub = F.linear(self.final_norm(h_sub), self.lm_head.weight)
-                    if HAS_PULSAR_CUDA and raw_logits_sub.is_cuda and hasattr(pulsar_cuda, "fused_softcap_ce_forward"):
-                        loss_sub = _FusedSoftcapCrossEntropyFunction.apply(
-                            raw_logits_sub.view(-1, self.cfg.vocab_size),
-                            lbl_sub.view(-1),
-                            self.cfg.logit_softcap,
-                            "mean",
-                            -100,
-                        )
+                    if eval_full_pulses:
+                        # Eval path: score EVERY pulse on 100% of tokens (chunked, same
+                        # as the final pulse) so per-pulse CEs are comparable and
+                        # val_ce_final is the model's real loss. Training keeps the
+                        # cheaper 25% subsample.
+                        loss_sub = self._chunked_ce(self.final_norm(h_pulse), labels)
                     else:
-                        logits_sub = self.cfg.logit_softcap * torch.tanh(raw_logits_sub / self.cfg.logit_softcap)
-                        loss_sub = F.cross_entropy(logits_sub.view(-1, self.cfg.vocab_size), lbl_sub.view(-1), ignore_index=-100)
+                        # Training: 25% subsampling with rotating disjoint offsets
+                        offset = (subsample_offset + k) % 4
+                        h_sub = h_pulse[:, offset::4, :].contiguous()
+                        lbl_sub = labels[:, offset::4].contiguous()
+                        raw_logits_sub = F.linear(self.final_norm(h_sub), self.lm_head.weight)
+                        if HAS_PULSAR_CUDA and raw_logits_sub.is_cuda and hasattr(pulsar_cuda, "fused_softcap_ce_forward"):
+                            loss_sub = _FusedSoftcapCrossEntropyFunction.apply(
+                                raw_logits_sub.view(-1, self.cfg.vocab_size),
+                                lbl_sub.view(-1),
+                                self.cfg.logit_softcap,
+                                "mean",
+                                -100,
+                            )
+                        else:
+                            logits_sub = self.cfg.logit_softcap * torch.tanh(raw_logits_sub / self.cfg.logit_softcap)
+                            loss_sub = F.cross_entropy(logits_sub.view(-1, self.cfg.vocab_size), lbl_sub.view(-1), ignore_index=-100)
 
                     w_k = self.cfg.aux_loss_weight_1 if k == 0 else self.cfg.aux_loss_weight_2
                     total_loss = total_loss + (w_k * loss_sub)
                     pulse_losses.append(loss_sub)
                 else:
-                    # Final pulse: Full 100% token evaluation via chunked cross-entropy with soft-capping
-                    out_norm = self.final_norm(h_pulse)
-                    h_flat = out_norm.view(-1, self.cfg.d_model)
-                    tgt_flat = labels.view(-1)
-                    chunk_size = getattr(self.cfg, "ce_chunk_size", 4096)
-
-                    full_loss = torch.zeros((), device=input_ids.device, dtype=torch.float32)
-                    for c_i in range(0, h_flat.size(0), chunk_size):
-                        hc = h_flat[c_i : c_i + chunk_size]
-                        tc = tgt_flat[c_i : c_i + chunk_size]
-                        raw_c = F.linear(hc, self.lm_head.weight)
-                        if HAS_PULSAR_CUDA and raw_c.is_cuda and hasattr(pulsar_cuda, "fused_softcap_ce_forward"):
-                            chunk_loss = _FusedSoftcapCrossEntropyFunction.apply(
-                                raw_c,
-                                tc,
-                                self.cfg.logit_softcap,
-                                "sum",
-                                -100,
-                            )
-                        else:
-                            logits_c = self.cfg.logit_softcap * torch.tanh(raw_c / self.cfg.logit_softcap)
-                            chunk_loss = F.cross_entropy(logits_c, tc, ignore_index=-100, reduction="sum")
-                        full_loss = full_loss + chunk_loss
-                    full_loss = full_loss / h_flat.size(0)
+                    # Final pulse: always 100% of tokens (chunked to bound VRAM)
+                    full_loss = self._chunked_ce(self.final_norm(h_pulse), labels)
                     total_loss = total_loss + (self.cfg.final_loss_weight * full_loss)
                     pulse_losses.append(full_loss)
             elif early_exit_threshold is not None:

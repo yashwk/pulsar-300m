@@ -197,29 +197,50 @@ def evaluate_loss(
     val_loader: StreamingPinnedBatchLoader,
     eval_iters: int,
     num_pulses: int,
-) -> tuple[float, list[float]]:
-    """Evaluate mean cross-entropy loss and per-pulse breakdown on validation data dynamically for any K."""
+) -> dict:
+    """Validate the model, returning the FINAL-pulse CE and the per-pulse breakdown.
+
+    The old version returned the model's total training loss: a weighted sum of three
+    pulse cross-entropies (0.15/0.25/0.60) plus z-loss, with intermediate pulses scored
+    on a 25% token subsample at different offsets per pulse. That number is not the
+    final model's loss and per-pulse values were computed on different tokens.
+
+    Now every pulse is scored on 100% of the tokens (``eval_full_pulses``), and
+    ``val_ce_final`` - the pulse-3 CE - is what checkpoint selection keys on.
+    """
     was_training = model.training
     model.eval()
-    losses = []
-    pulse_loss_accum = [[] for _ in range(num_pulses)]
+    totals = []
+    pulse_accum = [[] for _ in range(num_pulses)]
     with torch.no_grad():
         for i in range(eval_iters):
             seed_val = 999983 + i * 17
             x, y = val_loader.get_batch(seed_val)
-            _, loss, metrics = model(x, labels=y, num_pulses=num_pulses, subsample_offset=i)
-            losses.append(loss.item())
+            _, _, metrics = model(
+                x, labels=y, num_pulses=num_pulses,
+                subsample_offset=0, eval_full_pulses=True,
+            )
+            # Per-pulse CEs are the mean CE over all tokens for each pulse.
             step_pulses = metrics.get("pulse_losses", [])
-            for p_idx in range(min(num_pulses, len(step_pulses))):
-                val = step_pulses[p_idx]
-                pulse_loss_accum[p_idx].append(val if isinstance(val, (int, float)) else val.item())
+            vals = [float(v) if not isinstance(v, torch.Tensor) else v.item() for v in step_pulses]
+            for p_idx in range(min(num_pulses, len(vals))):
+                pulse_accum[p_idx].append(vals[p_idx])
+            if vals:
+                totals.append(sum(vals) / len(vals))  # unweighted mean for reference
 
     if was_training:
         model.train()
 
-    mean_loss = float(np.mean(losses)) if losses else 0.0
-    mean_pulses = [float(np.mean(pl)) if pl else mean_loss for pl in pulse_loss_accum]
-    return mean_loss, mean_pulses
+    per_pulse = [float(np.mean(v)) if v else float("nan") for v in pulse_accum]
+    val_ce_final = per_pulse[-1] if per_pulse else float("nan")
+    return {
+        "val_ce_final": val_ce_final,
+        "val_ppl": math.exp(min(val_ce_final, 20.0)) if val_ce_final == val_ce_final else float("nan"),
+        "per_pulse": per_pulse,
+        # Positive means later pulses help: the owner's main signal on whether looping pays.
+        "latent_gain": (per_pulse[0] - per_pulse[-1]) if len(per_pulse) > 1 else 0.0,
+        "mean_pulse_ce": float(np.mean(per_pulse)) if per_pulse else float("nan"),
+    }
 
 
 def save_checkpoint(
@@ -632,26 +653,29 @@ def train():
         val_pulse_ppls = None
         # Periodic Evaluation and Canary Generation
         if step % args.eval_every == 0 or step == args.max_steps or interrupted:
-            val_loss, val_pulse_losses = evaluate_loss(
+            eval_metrics = evaluate_loss(
                 model, val_loader, args.eval_iters, args.num_pulses
             )
-            val_ppl = math.exp(min(val_loss, 20.0))
+            val_loss = eval_metrics["val_ce_final"]      # checkpoint selection metric
+            val_ppl = eval_metrics["val_ppl"]
+            val_pulse_losses = eval_metrics["per_pulse"]
             val_pulse_ppls = [math.exp(min(pl, 20.0)) for pl in val_pulse_losses]
+            latent_gain = eval_metrics["latent_gain"]
             last_val_loss = val_loss
             last_val_ppl = val_ppl
             last_val_pulse_losses = val_pulse_losses
             last_val_pulse_ppls = val_pulse_ppls
+            # best.pt keys on the FINAL pulse CE on all tokens, not the weighted sum.
             is_best = val_loss < best_val_loss
             if is_best:
                 best_val_loss = val_loss
 
-            latent_gain = (val_pulse_losses[-1] - val_pulse_losses[0]) if len(val_pulse_losses) > 1 else 0.0
-            print(f"\n--- [Eval @ Step {step}] Overall Val Loss: {val_loss:.4f} (PPL: {val_ppl:.1f}) | Best: {best_val_loss:.4f} ---")
+            print(f"\n--- [Eval @ Step {step}] val_ce_final: {val_loss:.4f} (PPL: {val_ppl:.1f}) | Best: {best_val_loss:.4f} ---")
             for p_idx, pl in enumerate(val_pulse_losses):
                 eff_l = (p_idx + 1) * cfg.n_core
                 pl_ppl = math.exp(min(pl, 20.0))
-                refine_str = f" | Latent Refinement: {latent_gain:+.4f}" if (p_idx == len(val_pulse_losses) - 1 and len(val_pulse_losses) > 1) else ""
-                print(f"  ↳ Pulse {p_idx + 1} [{eff_l:2d} eff layers]: Val Loss = {pl:.4f} (PPL: {pl_ppl:.1f}){refine_str}")
+                refine_str = f" | latent_gain {latent_gain:+.4f}" if (p_idx == len(val_pulse_losses) - 1 and len(val_pulse_losses) > 1) else ""
+                print(f"  ↳ Pulse {p_idx + 1} [{eff_l:2d} eff layers]: CE = {pl:.4f} (PPL: {pl_ppl:.1f}, 100% tokens){refine_str}")
             print("--- Canary Generations Live ---")
             latest_canaries = []
             for canary_meta in canary_prompts:
@@ -704,6 +728,7 @@ def train():
             "train_loss": round(accum_loss, 4),
             "loss_delta": round(loss_delta, 4),
             "train_ppl": round(train_ppl, 2),
+            "val_ce_final": round(val_loss, 4) if val_loss is not None else None,
             "val_loss": round(val_loss, 4) if val_loss is not None else None,
             "val_ppl": round(val_ppl, 2) if val_ppl is not None else None,
             "val_pulse_losses": [round(x, 4) for x in cur_vpl] if cur_vpl is not None else None,

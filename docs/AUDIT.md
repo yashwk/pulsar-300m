@@ -129,15 +129,15 @@ run. `muon_split_qkv` / `muon_split_gate_up` were exactly that and have been rem
 
 ---
 
-## Known issues (not fixed)
+## Fixed issues
 
-1. **`PulsarConfig.from_dict` silently drops unknown keys.** `{"per_pulse_biass": True}`
-   returns `per_pulse_bias=False` with no warning, so a typo'd config key is discarded
-   without a trace. This matters more now that config carries runtime knobs. Either log or
-   raise on unknown keys.
-2. **`forward(early_exit_threshold=...)` is never passed by any caller.** That branch is
-   unreachable from `train.py`, the scripts and `generate()`. It is an unused feature
-   rather than a user-facing lie, but the code is dead — wire it to a flag or remove it.
+1. **`PulsarConfig.from_dict` silently dropped unknown keys.** A typo'd or stale key
+   carried an intention that never took effect — the same failure mode as a flag accepted
+   and ignored. Unknown keys now raise a `RuntimeWarning` (or `ValueError` with
+   `strict=True`); the default stays non-fatal so older checkpoints still load.
+2. **`forward(early_exit_threshold=...)` was dead.** No caller passed it, so the branch
+   was unreachable from `train.py`, the scripts and `generate()`. Parameter and branch
+   removed rather than wired to a new flag.
 
 ## Not done (optional)
 

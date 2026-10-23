@@ -214,3 +214,47 @@ Action, scheduled with WI-06: after `--eval-full-pulses` lands, load the baselin
 checkpoint and recompute `val_ce_final`, `val_ce_p1`, `val_ce_p2`, `val_ce_p3` at 100%
 of tokens, and record them here as the comparable "before". **Training loss is directly
 comparable across the change** and is recorded as-is from the baseline run.
+
+---
+
+## Accepted-but-ignored options (audit of the branch)
+
+**Context.** `muon_split_qkv` and `muon_split_gate_up` existed as Muon constructor
+arguments with no implementation: setting them changed nothing at all. That is worse
+than not having the flag, because it looks like an ablation was run. They have been
+removed, and `tests/test_no_dead_options.py` now guards against the whole class:
+
+* every non-conventional function parameter must be referenced in its body,
+* every argparse option must be read as `args.<dest>`,
+* every `PulsarConfig` field must be read outside the dataclass body,
+* the specific removed flag names must not reappear without an implementation.
+
+The check was validated by reintroducing `split_qkv` and confirming it fails.
+
+**Branch-wide result:** after stripping the split flags, a sweep of all
+`PulsarConfig` fields, every function/constructor parameter, and every CLI option in
+`src/`, `scripts/`, `data/` and `monitor/` found no other accepted-but-ignored options.
+
+Two adjacent issues *were* found, both real but different in kind:
+
+1. **`PulsarConfig.from_dict` silently drops unknown keys.** A typo'd or stale config
+   key is discarded without a word, so a checkpoint or config file can carry an
+   intention that never takes effect:
+   `PulsarConfig.from_dict({"per_pulse_biass": True})` returns `per_pulse_bias=False`
+   with no warning. This matters more now that config has grown runtime knobs
+   (`per_pulse_bias`, `moe_capacity_factor`, `moe_capacity_align`). Not fixed here;
+   recorded as a follow-up. Suggested fix: log or raise on unknown keys.
+2. **`PulsarModel.forward(early_exit_threshold=...)` is never passed by any caller.**
+   The early-exit branch (`model.py:1029`) is unreachable from `train.py`, the scripts
+   or `generate()`. It is an unused feature rather than a lie, because the parameter is
+   part of the forward signature rather than a user-facing flag — but the branch is
+   effectively dead and should either be wired to a flag or removed.
+
+**Not done (optional): WI-18 Muon update splits.** The optional ablations
+`muon_split_qkv` / `muon_split_gate_up` are deliberately skipped. The fused `W_qkv`
+and `gate_up` matrices are orthogonalized as one matrix, so Q/K/V (and gate/up) share a
+single update scale; splitting them into logical sub-matrices before Newton-Schulz
+would decouple that. It changes training dynamics, no A/B runs are planned, and the
+part of WI-18 that matters — the layout-aware scale convention — is landed and tested.
+If re-added, implement and test the split in the same change; the regression test will
+fail otherwise.

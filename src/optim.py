@@ -103,16 +103,12 @@ class Muon(_SRMixin, Optimizer):
         stochastic_rounding: bool = True,
         seed: int = 42,
         momentum_fp32: bool = False,
-        split_qkv: bool = False,
-        split_gate_up: bool = False,
     ):
         defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay)
         super().__init__(params, defaults)
         self.stochastic_rounding = stochastic_rounding
         self.seed = seed
         self.momentum_fp32 = momentum_fp32
-        self.split_qkv = split_qkv
-        self.split_gate_up = split_gate_up
         self._step_count = 0
         self._generator = None
 

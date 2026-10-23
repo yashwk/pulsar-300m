@@ -143,7 +143,14 @@ drops were frequent and entirely invisible. **Options:** keep 1.25 and accept âˆ
 WI-06 (eval metric), WI-07 wiring, WI-08 (logging), WI-09 (flex_attention), WI-10
 (activation checkpointing, doc loader), WI-11 (curriculum), WI-12 (prefix-invariant
 q-scaling), WI-14 (FP32 router), WI-15 (kernel hygiene â€” partially done),
-WI-16 (dead code), WI-17 (perf), WI-18 (Muon conventions), WI-19 (per-pulse bias).
+WI-16 (dead code), WI-17 (perf).
+
+WI-18 is **complete for the part that matters**: the layout-aware Muon scale convention
+is landed and tested. Its optional `muon_split_qkv` / `muon_split_gate_up` ablations
+were removed rather than left as accepted-but-ignored flags - see
+`docs/AUDIT.md` -> "Accepted-but-ignored options".
+
+WI-19 (per-pulse bias) is implemented behind `--per-pulse-bias`, default off.
 
 Also outstanding: the baseline's val loss is the pulse-weighted sum plus z-loss, not
 `val_ce_final`; the step-150 checkpoint is retained to re-score once WI-06 lands.

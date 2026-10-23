@@ -563,6 +563,73 @@ class PulsarBlock(nn.Module):
 
 
 class PulsarForCausalLM(nn.Module):
+    # Parameters that must stay FP32 even when the model is cast to bf16 for training.
+    #
+    # These are small, non-matrix tensors whose optimizer steps are tiny compared with
+    # bf16 spacing. Near 1.0 the bf16 spacing is 0.0078 and half-spacing 0.0039; an
+    # AdamW step at peak LR is 6e-4, and a Muon step on a decayed LR is smaller still.
+    # A bf16 copy therefore cannot move at all, silently freezing what the docs describe
+    # as learnable. Matrix weights are deliberately NOT in this table: they are updated
+    # through stochastic rounding (WI-02) rather than kept in FP32, to bound VRAM.
+    FP32_PARAM_SUBSTRINGS = (
+        "norm",
+        "bias",
+        "router",
+        "mix_logit",
+        "res_scale",
+        "routed_scale",
+        "attn_gate",
+        "pulse_step_emb",
+        "v_resid_lambda",
+        "q_norm_weight",
+        "k_norm_weight",
+    )
+
+    # Buffers that must stay FP32 regardless of the model dtype.
+    FP32_BUFFER_SUBSTRINGS = (
+        "expert_bias",
+        "expert_counts_accum",
+        "expert_pulse_counts",
+        "inv_freq",
+        "cos_cached",
+        "sin_cached",
+    )
+
+    def to_training_precision(self, dtype: torch.dtype = torch.bfloat16) -> "PulsarForCausalLM":
+        """Cast the model to training precision - the single source of truth.
+
+        Replaces the ad-hoc cast-then-re-cast block in ``train.py``, which matched on
+        ``p.ndim == 1 or "norm" ...`` and therefore missed every small tensor whose name
+        does not contain those substrings (``pulse_res_scale``, ``routed_scale``,
+        ``attn_gate``, ``pulse_step_emb.weight``), leaving them bf16 and frozen. It also
+        cast *buffers* to bf16, including the MoE expert counters (which accumulate
+        counts in the hundreds and saturate) and the RoPE caches.
+
+        After the cast the RoPE caches are rebuilt in FP32, because a bf16 cos/sin table
+        quantises the rotation angles.
+        """
+        self.to(dtype=dtype)
+
+        for name, param in self.named_parameters():
+            if self._param_stays_fp32(name, param):
+                param.data = param.data.float()
+
+        for name, buf in self.named_buffers():
+            if any(s in name for s in self.FP32_BUFFER_SUBSTRINGS):
+                buf.data = buf.data.float()
+
+        # RoPE frequency tables must be FP32 and correctly sized for the configured
+        # context length after a device/dtype move.
+        for rope in (getattr(self, "rope_local", None), getattr(self, "rope_global", None)):
+            if rope is not None:
+                rope.inv_freq.data = rope.inv_freq.data.float()
+                rope._set_cos_sin_cache(rope.max_seq_len, device=rope.inv_freq.device, dtype=torch.float32)
+
+        return self
+
+    def _param_stays_fp32(self, name: str, param: torch.Tensor) -> bool:
+        return param.ndim == 1 or any(s in name for s in self.FP32_PARAM_SUBSTRINGS)
+
     def __init__(self, cfg: PulsarConfig):
         super().__init__()
         self.cfg = cfg
@@ -644,7 +711,11 @@ class PulsarForCausalLM(nn.Module):
 
         for k in range(K):
             # 1. Unit-Normalized Prompt Anchor Mixing (h_0_norm cached across pulses)
-            step_emb = self.pulse_step_emb.weight[k].view(1, 1, -1)
+            # step_emb is a FP32 parameter (kept FP32 by to_training_precision because a
+            # bf16 copy would be frozen by rounding). Cast it to the activation dtype
+            # here, or the addition would silently promote the entire residual stream
+            # and every downstream matmul to FP32.
+            step_emb = self.pulse_step_emb.weight[k].to(h_0_norm.dtype).view(1, 1, -1)
             if k == 0:
                 h_in = h_0_norm + step_emb
             else:
@@ -879,8 +950,14 @@ class PulsarForCausalLM(nn.Module):
         if not os.path.exists(config_path):
             raise FileNotFoundError(f"Config not found at: {config_path}")
         cfg = PulsarConfig.from_json(config_path)
-        model = cls(cfg).to(device=device, dtype=dtype)
+        model = cls(cfg).to(device=device)
+        model.to_training_precision(dtype)
         if os.path.exists(weights_path):
             state = torch.load(weights_path, map_location=device, weights_only=True)
-            model.load_state_dict(state, strict=False)
+            missing, unexpected = model.load_state_dict(state, strict=False)
+            if missing or unexpected:
+                print(
+                    f"[Pulsar] from_pretrained: {len(missing)} missing, "
+                    f"{len(unexpected)} unexpected keys"
+                )
         return model

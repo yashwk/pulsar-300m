@@ -361,12 +361,12 @@ def train():
         base_seq_len=1024,
         default_pulses=args.num_pulses,
     )
-    model = PulsarForCausalLM(cfg).to(device=device, dtype=torch.bfloat16)
-
-    # Invariant Rule: Ensure all 1D/norm parameters are in float32
-    for name, p in model.named_parameters():
-        if p.ndim == 1 or "norm" in name or "bias" in name or "router" in name or "mix_logit" in name:
-            p.data = p.data.float()
+    model = PulsarForCausalLM(cfg).to(device=device)
+    # Single source of truth for mixed precision (WI-01). The previous implementation
+    # cast the whole model to bf16 and then re-cast a name-based subset to FP32, which
+    # missed pulse_res_scale / routed_scale / attn_gate / pulse_step_emb (left frozen in
+    # bf16) and cast every buffer, including the MoE expert counters and RoPE caches.
+    model.to_training_precision(torch.bfloat16)
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"[Pulsar] Pulsar-MoE Model Initialized: {total_params:,} parameters ({total_params/1e6:.2f}M)")

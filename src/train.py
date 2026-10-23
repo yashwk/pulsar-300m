@@ -246,6 +246,7 @@ def save_checkpoint(
         "optimizer": optimizer.state_dict() if hasattr(optimizer, "state_dict") else None,
         "opt_muon": optimizer.opt_muon.state_dict(),
         "opt_adam": optimizer.opt_adam.state_dict(),
+        "opt_adam_sr": optimizer.opt_adam_sr.state_dict(),
     }
     tmp_path = filepath + ".tmp"
     torch.save(ckpt, tmp_path)
@@ -283,6 +284,11 @@ def train():
     parser.add_argument("--adam-lr", type=float, default=6e-4, help="AdamW base LR for 1D norms and embeddings")
     parser.add_argument("--weight-decay", type=float, default=0.1, help="Muon weight decay")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Max gradient norm clip value")
+    parser.add_argument("--no-stochastic-rounding", action="store_true",
+                        help="Disable stochastic rounding for bf16 weights (default: on). "
+                             "Without SR, sub-ulp updates and weight decay round away.")
+    parser.add_argument("--muon-momentum-fp32", action="store_true",
+                        help="Keep Muon momentum in FP32 (default: bf16, matching the weight)")
     parser.add_argument("--compile", action="store_true", default=False, help="Enable torch.compile")
     parser.add_argument("--thermal-cooldown-every", type=int, default=0, help="Cooldown pause frequency in steps")
     parser.add_argument("--thermal-cooldown-seconds", type=int, default=100, help="Duration of thermal cooldown pause")
@@ -377,7 +383,12 @@ def train():
         muon_lr=args.muon_lr,
         adam_lr=args.adam_lr,
         weight_decay=args.weight_decay,
+        stochastic_rounding=not args.no_stochastic_rounding,
+        seed=args.seed,
+        momentum_fp32=args.muon_momentum_fp32,
     )
+    print(f"[Pulsar] Stochastic rounding: {'ON' if not args.no_stochastic_rounding else 'OFF'}"
+          f" | Muon momentum: {'FP32' if args.muon_momentum_fp32 else 'bf16'}")
 
     # Setup Checkpointing and Resumption
     start_step = 0
@@ -402,6 +413,8 @@ def train():
                 optimizer.opt_muon.load_state_dict(ckpt["opt_muon"])
             if "opt_adam" in ckpt and ckpt["opt_adam"] is not None:
                 optimizer.opt_adam.load_state_dict(ckpt["opt_adam"])
+            if "opt_adam_sr" in ckpt and ckpt["opt_adam_sr"] is not None:
+                optimizer.opt_adam_sr.load_state_dict(ckpt["opt_adam_sr"])
 
             start_step = ckpt.get("global_step", 0)
             tokens_seen = ckpt.get("tokens_seen", 0)

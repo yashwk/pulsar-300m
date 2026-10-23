@@ -350,43 +350,51 @@ def compute_token_slots(
 
     The kernel used to assign slots with ``atomicAdd``, so which assignments overflowed
     depended on block scheduling: nondeterministic run to run, and biased toward tokens
-    scheduled later. Slots are assigned here instead: assignments are grouped by expert
-    and ordered by descending routing weight, and the first ``capacity`` in each group
-    keep their slot. Overflow therefore always drops the **lowest-weight** assignments,
-    identically on every run.
+    scheduled later. Slots are assigned here instead, deterministically:
+
+    * Fast path (no overflow - the normal case with capacity factor 1.25): slots are
+      assigned in token order per expert via a cumulative offset. No sorting.
+    * Slow path (an expert overflows capacity): assignments are ordered by descending
+      routing weight, so only the **lowest-weight** ones are dropped, identically on
+      every run.
+
+    This runs once per MoE layer per pulse (24x per forward), so the hot path avoids a
+    sort entirely.
 
     Returns int32 ``[N, K]`` with the slot index, or -1 for a dropped assignment.
     """
     N, K = topk_idx.shape
     device = topk_idx.device
-    flat_e = topk_idx.reshape(-1).long()                  # [M]
-    flat_w = topk_weights.reshape(-1).float()             # [M]
+    flat_e = topk_idx.reshape(-1).long()
     M = flat_e.numel()
-
     if M == 0:
         return torch.empty((N, K), dtype=torch.int32, device=device)
 
-    # Global order: expert ascending, then weight descending, then position (stable).
-    # Two stable sorts compose into the lexicographic order we want.
-    by_expert = torch.argsort(flat_e, stable=True)
-    by_weight_desc = torch.argsort(flat_w[by_expert], descending=True, stable=True)
-    order = by_expert[by_weight_desc]                     # [M] indices into flat arrays
+    with torch.no_grad():
+        counts = torch.zeros(num_experts, device=device, dtype=torch.long)
+        counts.index_add_(0, flat_e, torch.ones(M, device=device, dtype=torch.long))
+        start_off = counts.cumsum(0) - counts            # [E] group start per expert
 
-    e_sorted = flat_e[order]
+        # Fast path: everything fits. Rank within expert is the token-ordered position.
+        if int(counts.max()) <= capacity:
+            rank = torch.arange(M, device=device) - start_off[flat_e]
+            return rank.to(torch.int32).view(N, K)
 
-    # Rank within each expert = position in the sorted order minus the expert's
-    # group start. Since sorting groups experts contiguously, a cumulative count of
-    # each expert's occurrences minus one gives that rank directly.
-    one_hot = F.one_hot(e_sorted, num_classes=num_experts).to(torch.int32)  # [M, E]
-    rank = (one_hot.cumsum(0) - 1).gather(1, e_sorted.unsqueeze(1)).squeeze(1)  # [M]
-
-    slot_sorted = torch.where(
-        rank < capacity, rank, torch.full_like(rank, -1)
-    ).to(torch.int32)
-
-    slots = torch.empty(M, dtype=torch.int32, device=device)
-    slots[order] = slot_sorted
-    return slots.view(N, K)
+        # Slow path: order by (expert asc, weight desc) so low-weight assignments drop.
+        # start_off is indexed by EXPERT, so the per-expert group start must be taken
+        # from the expert id of the sorted element, not from its position.
+        flat_w = topk_weights.reshape(-1).float()
+        order = torch.argsort(flat_w, descending=True, stable=True)
+        order = order[torch.argsort(flat_e[order], stable=True)]
+        e_sorted = flat_e[order]
+        counts_sorted = torch.zeros(num_experts, device=device, dtype=torch.long)
+        counts_sorted.index_add_(0, e_sorted, torch.ones(M, device=device, dtype=torch.long))
+        start_sorted = counts_sorted.cumsum(0) - counts_sorted
+        rank_sorted = torch.arange(M, device=device) - start_sorted[e_sorted]
+        slot_sorted = torch.where(rank_sorted < capacity, rank_sorted, torch.full_like(rank_sorted, -1))
+        slots = torch.empty(M, dtype=torch.int32, device=device)
+        slots[order] = slot_sorted.to(torch.int32)
+        return slots.view(N, K)
 
 
 class _FusedMoEDispatchFunction(torch.autograd.Function):
@@ -568,12 +576,16 @@ class PulsarMoEMLP(nn.Module):
 
         # Pre-drop counts, per expert. Computed from topk_idx (not from surviving slots)
         # so that drop statistics reflect demand rather than capacity.
-        # topk_idx carries no gradient, but the bincount must not enter the autograd
-        # graph at all - keep it inside no_grad with the accumulators it feeds.
+        # Pre-drop counts per expert, kept fully asynchronous. torch.bincount must
+        # size its output from the data, which forces a device sync; index_add_ on a
+        # known-size buffer does not. This runs 24x per micro-batch (8 blocks x 3
+        # pulses), so the sync was measurable.
         with torch.no_grad():
-            bincounts = torch.bincount(
-                topk_idx.reshape(-1), minlength=self.cfg.n_routed_experts
-            ).to(torch.float32)
+            bincounts = torch.zeros(self.cfg.n_routed_experts, device=x.device, dtype=torch.float32)
+            bincounts.index_add_(
+                0, topk_idx.reshape(-1),
+                torch.ones(topk_idx.numel(), device=x.device, dtype=torch.float32),
+            )
             self.expert_counts_accum.add_(bincounts)
             self.expert_pulse_counts[pulse_idx].add_(bincounts)
             # drop accounting stays on the GPU; drained by pop_moe_stats()

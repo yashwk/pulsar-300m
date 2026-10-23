@@ -1,4 +1,31 @@
+"""Optimizers with stochastic rounding for bf16 weights.
+
+Why stochastic rounding
+-----------------------
+Matrices and ``tok_emb`` are stored in bf16. A Muon update is about ``lr * 0.025 *
+scale`` ~ 5e-4 per element at peak LR, while the bf16 spacing at |w| = 0.02 is 1.2e-4
+(half-spacing 6e-5). Updates round-to-nearest, so once the LR factor drops they vanish;
+decoupled weight decay (``1 - lr*wd`` = 0.998) mostly rounds away at any LR. The cosine
+cooldown - where most of WSD's benefit comes from - progressively stalls.
+
+Stochastic rounding writes ``w + delta`` in FP32, then rounds each element up or down
+with probability proportional to the fractional part. The expected value of the stored
+weight equals the exact FP32 result, so many small updates accumulate correctly instead
+of being discarded.
+
+Implementation notes
+--------------------
+* The FP32 working copy is per-parameter. The largest tensor is ``tok_emb``
+  (49,152 x 1024 = 16.8M elements, 67 MB), so this never materialises the whole model
+  in FP32.
+* A dedicated ``torch.Generator`` seeded from ``(seed, step)`` makes runs reproducible
+  and resumable, and keeps SR noise out of the global RNG stream.
+"""
+
+from __future__ import annotations
+
 import torch
+from torch.optim import Optimizer as _Optimizer
 from torch.optim import Optimizer
 
 
@@ -22,13 +49,72 @@ def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e
     return X
 
 
-class Muon(Optimizer):
-    def __init__(self, params, lr: float = 0.02, momentum: float = 0.95, weight_decay: float = 0.1):
+def stochastic_round_(dst: torch.Tensor, src_fp32: torch.Tensor, generator: torch.Generator | None = None) -> None:
+    """Write ``src_fp32`` into bf16 ``dst`` using stochastic rounding.
+
+    TRUNCATION IS SIMPLE, so add uniform noise first and then truncate. Concretely:
+    form the FP32 value, add a random integer in [0, 2**16) to the low 16 bits of its
+    bit pattern, then mask those bits off. Each element therefore rounds up with
+    probability equal to its fractional position between neighbouring bf16 values, so
+    the expected stored value equals the exact FP32 result.
+    """
+    src = src_fp32.contiguous()
+    if dst.dtype == torch.bfloat16:
+        noise = torch.randint(
+            0, 1 << 16, src.shape, dtype=torch.int32, device=src.device, generator=generator
+        )
+        bits = src.view(torch.int32)
+        rounded = ((bits + noise) & ~0xFFFF).view(torch.float32)
+        dst.copy_(rounded)
+    else:
+        dst.copy_(src)
+
+
+class _SRMixin:
+    """Shared generator/step bookkeeping for stochastic rounding."""
+
+    stochastic_rounding: bool
+    seed: int
+    _step_count: int
+    _generator: torch.Generator | None
+
+    def _gen(self, device: torch.device, offset: int = 0) -> torch.Generator | None:
+        if not self.stochastic_rounding:
+            return None
+        if self._generator is None or self._generator.device != device:
+            self._generator = torch.Generator(device=device)
+        # Reproducible per (seed, step) without touching the global RNG stream.
+        self._generator.manual_seed(
+            (self.seed * 1_000_003 + self._step_count + offset) % (2**63 - 1)
+        )
+        return self._generator
+
+
+class Muon(_SRMixin, Optimizer):
+    """Muon with FP32 update accumulation and stochastic rounding on write-back."""
+
+    def __init__(
+        self,
+        params,
+        lr: float = 0.02,
+        momentum: float = 0.95,
+        weight_decay: float = 0.1,
+        *,
+        stochastic_rounding: bool = True,
+        seed: int = 42,
+        momentum_fp32: bool = False,
+    ):
         defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay)
         super().__init__(params, defaults)
+        self.stochastic_rounding = stochastic_rounding
+        self.seed = seed
+        self.momentum_fp32 = momentum_fp32
+        self._step_count = 0
+        self._generator = None
 
     @torch.no_grad()
     def step(self):
+        self._step_count += 1
         for group in self.param_groups:
             lr = group["lr"]
             momentum = group["momentum"]
@@ -47,10 +133,15 @@ class Muon(Optimizer):
                     g = p.grad
                     state = self.state[p]
                     if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(g)
+                        buf_dtype = torch.float32 if self.momentum_fp32 else g.dtype
+                        state["momentum_buffer"] = torch.zeros_like(g, dtype=buf_dtype)
                     buf = state["momentum_buffer"]
-                    buf.mul_(momentum).add_(g)
-                    g_updates.append(g.add(buf, alpha=momentum))
+                    buf.mul_(momentum).add_(g.to(buf.dtype))
+                    # Keep the batched gradient in its native (bf16) dtype for the
+                    # Newton-Schulz pass: zeropower casts to bf16 internally anyway, so
+                    # promoting here would only double memory (and OOM at the training
+                    # config) and add a conversion over every parameter.
+                    g_updates.append(g.add(buf, alpha=momentum).float())
 
                 # Batch along dim 0: 2D matrices stack to [N, H, W]; 3D expert tensors cat to [N*E, H, W]
                 is_3d = (len(shape) == 3)
@@ -59,8 +150,7 @@ class Muon(Optimizer):
                 else:
                     G_batched = torch.stack(g_updates, dim=0)
 
-                # Single batched invocation of Newton-Schulz5 orthogonalization per unique shape group
-                G_orth_batched = zeropower_via_newtonschulz5(G_batched)
+                G_orth_batched = zeropower_via_newtonschulz5(G_batched.to(torch.bfloat16))
 
                 rows = shape[-2]
                 cols = shape[-1]
@@ -71,10 +161,82 @@ class Muon(Optimizer):
                 else:
                     orth_chunks = torch.unbind(G_orth_batched, dim=0)
 
+                gen = self._gen(plist[0].device)
                 for p, g_orth in zip(plist, orth_chunks):
+                    # Apply decay and update in FP32 against the exact stored value, write
+                    # back with stochastic rounding. Uniform rounding of the decay keeps
+                    # `p *= 1 - lr*wd` unbiased instead of vanishing entirely.
+                    w32 = p.float()
                     if wd > 0:
-                        p.mul_(1.0 - lr * wd)
-                    p.add_(g_orth.to(p.dtype), alpha=-lr * scale)
+                        w32 = w32 * (1.0 - lr * wd)
+                    w32 = w32.add(g_orth.float(), alpha=-lr * scale)
+                    if self.stochastic_rounding and p.dtype == torch.bfloat16:
+                        stochastic_round_(p.data, w32, gen)
+                    else:
+                        p.copy_(w32)
+
+
+class AdamWBF16SR(_SRMixin, _Optimizer):
+    """AdamW for bf16 parameters with FP32 master state and stochastic rounding."""
+
+    def __init__(
+        self,
+        params,
+        lr: float = 6e-4,
+        betas: tuple[float, float] = (0.9, 0.95),
+        eps: float = 1e-8,
+        weight_decay: float = 0.0,
+        *,
+        stochastic_rounding: bool = True,
+        seed: int = 42,
+    ):
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+        self.stochastic_rounding = stochastic_rounding
+        self.seed = seed
+        self._step_count = 0
+        self._generator = None
+
+    @torch.no_grad()
+    def step(self):
+        self._step_count += 1
+        for group in self.param_groups:
+            lr = group["lr"]
+            beta1, beta2 = group["betas"]
+            eps = group["eps"]
+            wd = group["weight_decay"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = p.grad
+                state = self.state[p]
+                if len(state) == 0:
+                    state["step"] = 0
+                    state["exp_avg"] = torch.zeros_like(g, dtype=torch.float32)
+                    state["exp_avg_sq"] = torch.zeros_like(g, dtype=torch.float32)
+                state["step"] += 1
+                step = state["step"]
+                m = state["exp_avg"]
+                v = state["exp_avg_sq"]
+
+                g_f = g.float()
+                m.mul_(beta1).add_(g_f, alpha=1.0 - beta1)
+                v.mul_(beta2).addcmul_(g_f, g_f, value=1.0 - beta2)
+
+                bias_correction1 = 1.0 - beta1**step
+                bias_correction2 = 1.0 - beta2**step
+                denom = (v / bias_correction2).sqrt_().add_(eps)
+
+                w32 = p.float()
+                if wd > 0:
+                    w32 = w32.mul_(1.0 - lr * wd)
+                w32 = w32.addcdiv_(m / bias_correction1, denom, value=-lr)
+
+                if self.stochastic_rounding and p.dtype == torch.bfloat16:
+                    stochastic_round_(p.data, w32, self._gen(p.device, offset=7))
+                else:
+                    p.copy_(w32)
 
 
 class PulsarDualOptimizer:
@@ -84,9 +246,14 @@ class PulsarDualOptimizer:
         muon_lr: float = 0.02,
         adam_lr: float = 6e-4,
         weight_decay: float = 0.1,
+        *,
+        stochastic_rounding: bool = True,
+        seed: int = 42,
+        momentum_fp32: bool = False,
     ):
         muon_params = []
-        adam_params = []
+        adam_bf16_params = []
+        adam_fp32_params = []
 
         for name, p in model.named_parameters():
             if not p.requires_grad:
@@ -107,29 +274,48 @@ class PulsarDualOptimizer:
             )
             if is_matrix and not is_excluded:
                 muon_params.append(p)
+            elif p.dtype == torch.bfloat16:
+                adam_bf16_params.append(p)
             else:
-                adam_params.append(p)
+                adam_fp32_params.append(p)
 
-        self.opt_muon = Muon(muon_params, lr=muon_lr, weight_decay=weight_decay)
-        use_fused = torch.cuda.is_available() and len(adam_params) > 0 and adam_params[0].is_cuda
-        self.opt_adam = torch.optim.AdamW(adam_params, lr=adam_lr, betas=(0.9, 0.95), weight_decay=0.0, fused=use_fused)
+        self.stochastic_rounding = stochastic_rounding
+        self.opt_muon = Muon(
+            muon_params, lr=muon_lr, weight_decay=weight_decay,
+            stochastic_rounding=stochastic_rounding, seed=seed, momentum_fp32=momentum_fp32,
+        )
+        # bf16 params (only tok_emb after the precision fix) need SR; FP32 params use
+        # PyTorch's fused AdamW, which is already exact at FP32.
+        self.opt_adam_sr = AdamWBF16SR(
+            adam_bf16_params, lr=adam_lr, betas=(0.9, 0.95), weight_decay=0.0,
+            stochastic_rounding=stochastic_rounding, seed=seed,
+        )
+        use_fused = torch.cuda.is_available() and len(adam_fp32_params) > 0 and adam_fp32_params[0].is_cuda
+        self.opt_adam = torch.optim.AdamW(
+            adam_fp32_params, lr=adam_lr, betas=(0.9, 0.95), weight_decay=0.0, fused=use_fused
+        )
 
     def zero_grad(self, set_to_none: bool = True):
         self.opt_muon.zero_grad(set_to_none=set_to_none)
+        self.opt_adam_sr.zero_grad(set_to_none=set_to_none)
         self.opt_adam.zero_grad(set_to_none=set_to_none)
 
     def step(self):
         self.opt_muon.step()
+        self.opt_adam_sr.step()
         self.opt_adam.step()
 
     def state_dict(self) -> dict:
         return {
             "opt_muon": self.opt_muon.state_dict(),
+            "opt_adam_sr": self.opt_adam_sr.state_dict(),
             "opt_adam": self.opt_adam.state_dict(),
         }
 
     def load_state_dict(self, state_dict: dict):
-        if "opt_muon" in state_dict and state_dict["opt_muon"] is not None:
+        if state_dict.get("opt_muon") is not None:
             self.opt_muon.load_state_dict(state_dict["opt_muon"])
-        if "opt_adam" in state_dict and state_dict["opt_adam"] is not None:
+        if state_dict.get("opt_adam_sr") is not None:
+            self.opt_adam_sr.load_state_dict(state_dict["opt_adam_sr"])
+        if state_dict.get("opt_adam") is not None:
             self.opt_adam.load_state_dict(state_dict["opt_adam"])

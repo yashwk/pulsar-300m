@@ -2122,7 +2122,10 @@
             title: { display: true, text: 'Relative PPL Saved (%)' },
             ticks: { callback: v => v + '%' },
             suggestedMin: 0,
-            suggestedMax: 30
+            // No suggestedMax: the closed-form ratio reaches ~29% by step 26 on this
+            // run and keeps rising, so a fixed 30% ceiling would clip the interesting
+            // part of the curve. Let Chart.js autoscale above.
+            beginAtZero: true
           }
         }
       }
@@ -2808,13 +2811,17 @@
         const p = r.pulse_losses;
         return (p && p.length >= 3) ? Number((p[0] - p[2]).toFixed(4)) : null;
       });
+      // Relative PPL saved = (ppl1 - ppl3) / ppl1 = 1 - exp(p3 - p1) in closed form.
+      // The previous version clamped both losses at exp(15) before dividing; whenever
+      // CE was above 15 BOTH pulses clamped to the same value, so the ratio was
+      // identically 0 - which is exactly what this run showed from step 1 (its losses
+      // start around 17.5). The closed form needs no clamping and stays exact across
+      // the whole loss range, including the early high-CE phase.
       chart3.data.datasets[3].data = slice.map(r => {
         const p = r.pulse_losses;
         if (!p || p.length < 3) return null;
-        const ppl1 = Math.exp(Math.min(p[0], 15));
-        const ppl3 = Math.exp(Math.min(p[2], 15));
-        if (ppl1 <= 0) return 0;
-        const relGainPct = ((ppl1 - ppl3) / ppl1) * 100;
+        const delta = p[2] - p[0];              // negative when looping helps
+        const relGainPct = (1 - Math.exp(delta)) * 100;
         return Number(relGainPct.toFixed(1));
       });
       chart3.update('none');

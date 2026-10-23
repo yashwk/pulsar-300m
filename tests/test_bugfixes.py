@@ -42,7 +42,9 @@ def test_lr_schedule_updates_all_three_sub_optimizers():
                 "warmup and never decayed"
             )
         for g in opt.opt_adam.param_groups:
-            assert g["lr"] == pytest.approx(6e-4 * factor)
+            # The router group runs at a reduced multiplier by design.
+            mult = g.get("lr_mult", 1.0)
+            assert g["lr"] == pytest.approx(6e-4 * mult * factor)
 
 
 def test_warmup_scales_embedding_lr_from_zero():
@@ -1000,3 +1002,105 @@ def test_muon_bf16_state_not_duplicated_in_checkpoint():
     assert "_fp32_state" not in opt.state_dict(), (
         "bf16 momentum was cloned into _fp32_state, duplicating it in every checkpoint"
     )
+
+
+# ---------------------------------------------------------------------------
+# Router drift vs balancing bias: LR split, logit centring, true imbalance
+# ---------------------------------------------------------------------------
+
+def test_router_weight_gets_reduced_lr_group():
+    """A d_model=1024 router step moves logits ~0.6, ~5-15x faster than bias_lr can
+    correct in logit space. The router now runs at 0.1x with weight decay."""
+    from src.model import PulsarForCausalLM
+    from src.optim import PulsarDualOptimizer
+    from src.train import update_optimizer_lrs
+
+    cfg = make_cfg(n_core=2, d_model=128, vocab_size=512, top_k=2)
+    torch.manual_seed(0)
+    model = PulsarForCausalLM(cfg)
+    model.to_training_precision(torch.bfloat16)
+    opt = PulsarDualOptimizer(model, muon_lr=0.02, adam_lr=6e-4, weight_decay=0.1, seed=0)
+
+    groups = opt.opt_adam.param_groups
+    router_groups = [g for g in groups if g.get("lr_mult") == 0.1]
+    assert len(router_groups) == 1, f"expected one router group, got {len(router_groups)}"
+    assert router_groups[0]["weight_decay"] == pytest.approx(0.01)
+
+    update_optimizer_lrs(opt, factor=1.0, base_muon=0.02, base_adam=6e-4)
+    assert router_groups[0]["lr"] == pytest.approx(6e-4 * 0.1)
+    update_optimizer_lrs(opt, factor=0.5, base_muon=0.02, base_adam=6e-4)
+    assert router_groups[0]["lr"] == pytest.approx(6e-4 * 0.1 * 0.5)
+
+    # Non-router Adam params keep the full LR.
+    plain = [g for g in groups if g.get("lr_mult") is None]
+    if plain:
+        assert plain[0]["lr"] == pytest.approx(6e-4 * 0.5)
+
+
+def test_router_logits_are_mean_centred():
+    """Centring is invariant for top-k and the bias add, but stops logit scale drifting
+    with the shared batch-mean component of the hidden state."""
+    from src.model import PulsarConfig, PulsarMoEMLP
+
+    cfg = make_cfg(n_core=2, d_model=128, vocab_size=512, top_k=2)
+    torch.manual_seed(0)
+    m = PulsarMoEMLP(cfg)
+    m.eval()
+
+    captured = {}
+    import torch.nn.functional as F
+    orig_linear = F.linear
+
+    def spy(inp, weight, bias=None):
+        out = orig_linear(inp, weight, bias)
+        if weight is not None and weight.shape == m.router_weight[0].shape:
+            captured["raw"] = out.detach().clone()
+        return out
+
+    F.linear = spy
+    try:
+        with torch.no_grad():
+            m(torch.randn(1, 32, cfg.d_model), pulse_idx=0)
+    finally:
+        F.linear = orig_linear
+
+    assert "raw" in captured, "router logits not captured"
+    # The module centres them; raw should be offset, and the centred version zero-mean.
+    centred = captured["raw"] - captured["raw"].mean(dim=-1, keepdim=True)
+    assert torch.allclose(centred.mean(dim=-1), torch.zeros(centred.shape[0]), atol=1e-5)
+
+
+def test_per_block_imbalance_is_not_diluted():
+    """Summing counts across blocks by expert index hides per-block collapse.
+
+    Expert 0 of block 0 is an unrelated router to Expert 0 of block 1, so two blocks
+    collapsing onto DIFFERENT experts average into something that looks moderate. The
+    new metric reports the true worst single-expert share instead.
+    """
+    from src.model import PulsarConfig, PulsarForCausalLM
+
+    cfg = make_cfg(n_core=2, d_model=128, vocab_size=512, top_k=2)
+    torch.manual_seed(0)
+    model = PulsarForCausalLM(cfg)
+    model.train()
+
+    # Drive block 0 onto expert 0 and block 1 onto expert 4 via the balancing bias.
+    with torch.no_grad():
+        model.core[0].mlp.expert_bias.zero_()
+        model.core[0].mlp.expert_bias[:, 0] = 5.0
+        model.core[1].mlp.expert_bias.zero_()
+        model.core[1].mlp.expert_bias[:, 4] = 5.0
+
+    with torch.no_grad():
+        _, _, metrics = model(
+            torch.randint(0, cfg.vocab_size, (1, 64)), labels=None, num_pulses=2
+        )
+
+    agg_max = float(metrics["expert_pcts"].max())
+    worst = float(metrics["worst_expert_share_pct"])
+
+    assert worst > agg_max + 10, (
+        f"worst_expert_share {worst:.1f}% is not clearly above the block-averaged "
+        f"maximum {agg_max:.1f}% - the imbalance is being diluted"
+    )
+    assert worst > 40, f"worst_expert_share {worst:.1f}% too low for a forced collapse"

@@ -338,6 +338,7 @@ class PulsarDualOptimizer:
         muon_params = []
         adam_bf16_params = []
         adam_fp32_params = []
+        router_params = []
 
         for name, p in model.named_parameters():
             if not p.requires_grad:
@@ -356,7 +357,14 @@ class PulsarDualOptimizer:
                 or "pulse_res_scale" in name
                 or "routed_scale" in name
             )
-            if is_matrix and not is_excluded:
+            # The router lives in its own group with a reduced LR. A single AdamW step
+            # on a d_model=1024 router weight shifts the aligned dot product
+            # x @ w_e by up to d_model * lr = 0.61 logit units, which moves sigmoid
+            # logits ~5-15x faster than bias_lr can move expert_bias in logit space -
+            # the balancing loop can never win that race.
+            if "router_weight" in name:
+                router_params.append(p)
+            elif is_matrix and not is_excluded:
                 muon_params.append(p)
             elif p.dtype == torch.bfloat16:
                 adam_bf16_params.append(p)
@@ -378,6 +386,15 @@ class PulsarDualOptimizer:
         self.opt_adam = torch.optim.AdamW(
             adam_fp32_params, lr=adam_lr, betas=(0.9, 0.95), weight_decay=0.0, fused=use_fused
         )
+        # Separate group so update_optimizer_lrs() can scale it independently.
+        self.router_lr_mult = 0.1
+        if router_params:
+            self.opt_adam.add_param_group({
+                "params": router_params,
+                "lr": adam_lr * self.router_lr_mult,
+                "lr_mult": self.router_lr_mult,
+                "weight_decay": 0.01,   # was 0.0
+            })
 
     def zero_grad(self, set_to_none: bool = True):
         self.opt_muon.zero_grad(set_to_none=set_to_none)

@@ -35,7 +35,10 @@ class PulsarConfig:
     eos_token_id: int = 0
     rms_eps: float = 1e-6
     ce_chunk_size: int = 4096
-    router_z_loss_weight: float = 1e-4
+    # Divided by n_core*K (=24) when applied, so the effective weight is 4.2e-5.
+    # Raised from 1e-4 because centring the logits and slowing the router reduced the
+    # only remaining regulariser on router magnitude.
+    router_z_loss_weight: float = 1e-3
     aux_loss_weight_1: float = 0.15
     aux_loss_weight_2: float = 0.25
     final_loss_weight: float = 0.60
@@ -761,6 +764,12 @@ class PulsarMoEMLP(nn.Module):
         logits = F.linear(
             x_flat.float(), router_w.float() if router_w.dtype != torch.float32 else router_w
         )  # [N, E] fp32
+        # Centre the logits across experts. Top-k selection and the bias addition are
+        # both invariant to a per-token constant, so this changes nothing mathematically
+        # but keeps the absolute scale from drifting with the shared batch-mean component
+        # of the hidden state (strong by pulse 3), which saturated sigmoid and left the
+        # [-0.5, 0.5] bias without leverage.
+        logits = logits - logits.mean(dim=-1, keepdim=True)
 
         # Padded positions must not influence routing statistics or z-loss: a run of
         # identical pad tokens would all choose the same experts, inflating drop counts
@@ -912,12 +921,12 @@ class PulsarMoEMLP(nn.Module):
             counts = self.expert_pulse_counts[:k]
             avg = counts.mean(dim=1, keepdim=True)
             self.expert_bias[:k].add_(bias_lr * torch.sign(avg - counts))
-            self.expert_bias[:k].clamp_(-0.5, 0.5)
+            self.expert_bias[:k].clamp_(-1.0, 1.0)
             self.expert_pulse_counts[:k].zero_()
         else:
             avg_count = self.expert_counts_accum.mean()
             self.expert_bias.add_(bias_lr * torch.sign(avg_count - self.expert_counts_accum))
-            self.expert_bias.clamp_(-0.5, 0.5)
+            self.expert_bias.clamp_(-1.0, 1.0)
             self.expert_counts_accum.zero_()
 
 
@@ -1217,6 +1226,14 @@ class PulsarForCausalLM(nn.Module):
         gate_confidence_accum = torch.zeros((), device=input_ids.device, dtype=torch.float32)
         global_expert_counts = torch.zeros(self.cfg.n_routed_experts, device=input_ids.device, dtype=torch.float32)
         pulse_expert_counts = torch.zeros(K, self.cfg.n_routed_experts, device=input_ids.device, dtype=torch.float32)
+        # Per-(block, pulse) expert counts. Summing across blocks by expert INDEX mixes
+        # unrelated routers: Expert 0 of block 0 has nothing to do with Expert 0 of
+        # block 1, so averaging them cancelled out per-block collapses and reported a
+        # ~7pp spread while the implied true worst expert was ~38%.
+        block_pulse_counts = torch.zeros(
+            self.cfg.n_core, K, self.cfg.n_routed_experts,
+            device=input_ids.device, dtype=torch.float32,
+        )
         logits = None
 
         for k in range(K):
@@ -1260,6 +1277,7 @@ class PulsarForCausalLM(nn.Module):
                 gate_confidence_accum = gate_confidence_accum + gate_weight_mean
                 global_expert_counts = global_expert_counts + bincounts
                 pulse_expert_counts[k] = pulse_expert_counts[k] + bincounts
+                block_pulse_counts[i, k] = block_pulse_counts[i, k] + bincounts
 
             # 3. Residual state update with harmonic contraction factor
             delta_h = (h_curr - h_in) * self.pulse_res_scale[k].to(h_in.dtype)
@@ -1330,6 +1348,17 @@ class PulsarForCausalLM(nn.Module):
         pulse_tot = pulse_stacked.sum(dim=1, keepdim=True).clamp_min(1.0)
         expert_pct_per_pulse = (pulse_stacked.float() / pulse_tot) * 100.0
 
+        # True per-(block, pulse) load. `expert_pcts` averages Expert e across blocks,
+        # but those are separate routers, so a block collapsing onto one expert is
+        # hidden by blocks that prefer another. Report the worst single-expert share and
+        # the mean per-block spread instead.
+        bp_tot = block_pulse_counts.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        bp_pct = (block_pulse_counts.float() / bp_tot) * 100.0     # [n_core, K, E]
+        worst_expert_share = bp_pct.max()                          # scalar percent
+        per_block_spread = (bp_pct.max(dim=-1).values - bp_pct.min(dim=-1).values)  # [n_core, K]
+        mean_block_spread = per_block_spread.mean()
+        max_block_spread = per_block_spread.max()
+
         def as_tensor(value):
             return value if isinstance(value, torch.Tensor) else torch.tensor(float(value), device=input_ids.device)
 
@@ -1347,6 +1376,10 @@ class PulsarForCausalLM(nn.Module):
             "router_max_bias": max_bias,
             "expert_pcts": expert_pct,
             "expert_pcts_per_pulse": expert_pct_per_pulse,
+            # The honest imbalance numbers: these are not diluted across blocks.
+            "worst_expert_share_pct": worst_expert_share,
+            "mean_block_spread_pct": mean_block_spread,
+            "max_block_spread_pct": max_block_spread,
             "input_mix_lambda": torch.sigmoid(self.input_mix_logit[min(1, K - 1)]).detach().mean(),
             # Legacy scalar accessors
             "loss_pulse_1": pulse_loss_t[0] if pulse_loss_t else zero,

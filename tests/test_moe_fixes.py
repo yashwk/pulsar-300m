@@ -103,8 +103,15 @@ def test_zloss_gradient_matches_explicit_formula():
     z_loss.backward()
 
     logits = F.linear(x.view(N, cfg.d_model), mlp.router_weight[0])
+    # The module mean-centres logits across experts before computing z-loss; the
+    # reference must apply the same transform or the analytic gradient is off by the
+    # centring projection.
+    logits = logits - logits.mean(dim=-1, keepdim=True)
     lse = torch.logsumexp(logits, dim=-1, keepdim=True)
     expected_dlogits = cfg.router_z_loss_weight * 2.0 * lse * torch.softmax(logits, dim=-1) / N
+    # Centring is a projection logits -> logits - mean(logits); its gradient must be
+    # projected too, and the centring term vanishes because softmax sums to 1.
+    expected_dlogits = expected_dlogits - expected_dlogits.mean(dim=-1, keepdim=True)
     expected_w = expected_dlogits.t() @ x.view(N, cfg.d_model)
 
     got = mlp.router_weight.grad[0]

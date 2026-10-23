@@ -116,7 +116,10 @@ def update_optimizer_lrs(
     for g in optimizer.opt_adam_sr.param_groups:
         g["lr"] = base_adam * factor
     for g in optimizer.opt_adam.param_groups:
-        g["lr"] = base_adam * factor
+        # The router group carries an explicit reduced multiplier so router drift stays
+        # slower than the balancing bias can correct.
+        mult = g.get("lr_mult", 1.0)
+        g["lr"] = base_adam * mult * factor
 
 
 class StreamingPinnedBatchLoader:
@@ -725,6 +728,9 @@ def train():
                 return v.item()
             return float(v)
 
+        worst_expert_share_pct = to_val(step_metrics.get("worst_expert_share_pct"))
+        mean_block_spread_pct = to_val(step_metrics.get("mean_block_spread_pct"))
+        max_block_spread_pct = to_val(step_metrics.get("max_block_spread_pct"))
         step_pulse_losses = [to_val(x) for x in step_metrics.get("pulse_losses", [])]
         if not step_pulse_losses:
             step_pulse_losses = [to_val(step_metrics.get(f"loss_pulse_{i+1}")) for i in range(args.num_pulses)]
@@ -919,6 +925,9 @@ def train():
             # recurrent pulses help; this is the signal on whether looping pays off.
             "latent_gain": cur_latent_gain,
             # Per-pulse expert load: the aggregate is what hid the imbalance.
+            "worst_expert_share_pct": round(float(worst_expert_share_pct), 2) if worst_expert_share_pct is not None else None,
+            "mean_block_spread_pct": round(float(mean_block_spread_pct), 2) if mean_block_spread_pct is not None else None,
+            "max_block_spread_pct": round(float(max_block_spread_pct), 2) if max_block_spread_pct is not None else None,
             "expert_pcts_per_pulse": (
                 [[round(float(v), 2) for v in row] for row in step_metrics["expert_pcts_per_pulse"].tolist()]
                 if step_metrics.get("expert_pcts_per_pulse") is not None else None

@@ -103,12 +103,16 @@ class Muon(_SRMixin, Optimizer):
         stochastic_rounding: bool = True,
         seed: int = 42,
         momentum_fp32: bool = False,
+        split_qkv: bool = False,
+        split_gate_up: bool = False,
     ):
         defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay)
         super().__init__(params, defaults)
         self.stochastic_rounding = stochastic_rounding
         self.seed = seed
         self.momentum_fp32 = momentum_fp32
+        self.split_qkv = split_qkv
+        self.split_gate_up = split_gate_up
         self._step_count = 0
         self._generator = None
 
@@ -152,9 +156,19 @@ class Muon(_SRMixin, Optimizer):
 
                 G_orth_batched = zeropower_via_newtonschulz5(G_batched.to(torch.bfloat16))
 
-                rows = shape[-2]
-                cols = shape[-1]
-                scale = max(1.0, rows / cols) ** 0.5
+                # Muon's convention is scale = max(1, out_features/in_features) ** 0.5,
+                # which equalises the update size for matrices with unequal aspect ratios.
+                #
+                # nn.Linear stores [out, in], but the MoE expert tensors are stored
+                # [E, in, out] so the fusable 3-D batched GEMM works directly. Reading
+                # shape[-2]/shape[-1] blindly therefore inverts the ratio for the experts:
+                # gate_up [E, 1024, 2048] got 1.0 instead of sqrt(2), making routed
+                # gate/up train ~0.7x as fast as the shared expert's equivalent.
+                if is_3d:
+                    in_features, out_features = shape[-2], shape[-1]
+                else:
+                    out_features, in_features = shape[-2], shape[-1]
+                scale = max(1.0, out_features / in_features) ** 0.5
 
                 if is_3d:
                     orth_chunks = torch.chunk(G_orth_batched, len(plist), dim=0)

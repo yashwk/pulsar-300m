@@ -987,31 +987,40 @@ class PulsarForCausalLM(nn.Module):
             raw_logits = self.lm_head(self.final_norm(h_pulse))
             logits = self.cfg.logit_softcap * torch.tanh(raw_logits / self.cfg.logit_softcap)
 
-        # Max router bias across all layers
-        max_bias = max(b.mlp.expert_bias.abs().max().item() for b in self.core)
-        tot_counts = max(1.0, global_expert_counts.sum().item())
-        expert_pcts = [(global_expert_counts[e].item() / tot_counts) * 100.0 for e in range(self.cfg.n_routed_experts)]
+        # Metrics stay as GPU tensors so that returning them costs no host sync. The
+        # forward runs once per micro-batch (43x per optimizer step), and the previous
+        # implementation called .item() ~20 times per forward - roughly 860 device
+        # syncs per step, each one draining the pipeline. train.py materialises them
+        # once per log window instead.
+        max_bias = torch.stack([b.mlp.expert_bias.float().abs().max() for b in self.core]).max()
+        tot_counts = global_expert_counts.sum().clamp_min(1.0)
+        expert_pct = (global_expert_counts.float() / tot_counts) * 100.0
+
+        def as_tensor(value):
+            return value if isinstance(value, torch.Tensor) else torch.tensor(float(value), device=input_ids.device)
+
+        pulse_loss_t = [as_tensor(pl) for pl in pulse_losses]
+        pulse_delta_t = [as_tensor(pd) for pd in pulse_deltas]
+        zero = torch.zeros((), device=input_ids.device)
 
         metrics = {
             "num_pulses": K,
-            "pulse_losses": [pl.item() if isinstance(pl, torch.Tensor) else float(pl) for pl in pulse_losses],
-            "pulse_deltas": [pd.item() if isinstance(pd, torch.Tensor) else float(pd) for pd in pulse_deltas],
-            "pulse_final_delta": pulse_deltas[-1] if pulse_deltas else torch.tensor(0.0),
+            # GPU tensors; train.py converts once per log window.
+            "pulse_losses": pulse_loss_t,
+            "pulse_deltas": pulse_delta_t,
+            "pulse_final_delta": pulse_delta_t[-1] if pulse_delta_t else zero,
             "router_confidence": gate_confidence_accum / (self.cfg.n_core * max(1, K)),
             "router_max_bias": max_bias,
-            "expert_pcts": expert_pcts,
-            "input_mix_lambda": torch.sigmoid(self.input_mix_logit[min(1, K-1)]).detach().mean(),
+            "expert_pcts": expert_pct,
+            "input_mix_lambda": torch.sigmoid(self.input_mix_logit[min(1, K - 1)]).detach().mean(),
             # Legacy scalar accessors
-            "loss_pulse_1": pulse_losses[0] if len(pulse_losses) >= 1 else torch.tensor(0.0),
-            "loss_pulse_2": pulse_losses[1] if len(pulse_losses) >= 2 else (pulse_losses[0] if len(pulse_losses) >= 1 else torch.tensor(0.0)),
-            "loss_pulse_3": pulse_losses[-1] if len(pulse_losses) >= 1 else torch.tensor(0.0),
-            "delta_pulse_1": pulse_deltas[0] if len(pulse_deltas) >= 1 else torch.tensor(0.0),
-            "delta_pulse_2": pulse_deltas[1] if len(pulse_deltas) >= 2 else (pulse_deltas[0] if len(pulse_deltas) >= 1 else torch.tensor(0.0)),
-            "delta_pulse_3": pulse_deltas[-1] if len(pulse_deltas) >= 1 else torch.tensor(0.0),
+            "loss_pulse_1": pulse_loss_t[0] if pulse_loss_t else zero,
+            "loss_pulse_2": pulse_loss_t[1] if len(pulse_loss_t) >= 2 else (pulse_loss_t[0] if pulse_loss_t else zero),
+            "loss_pulse_3": pulse_loss_t[-1] if pulse_loss_t else zero,
+            "delta_pulse_1": pulse_delta_t[0] if pulse_delta_t else zero,
+            "delta_pulse_2": pulse_delta_t[1] if len(pulse_delta_t) >= 2 else (pulse_delta_t[0] if pulse_delta_t else zero),
+            "delta_pulse_3": pulse_delta_t[-1] if pulse_delta_t else zero,
         }
-        for e_idx, pct in enumerate(expert_pcts):
-            metrics[f"expert_pct_{e_idx}"] = pct
-
         return logits, total_loss, metrics
 
     def get_model_summary(self, num_pulses: int | None = None) -> dict:

@@ -33,6 +33,9 @@ class PulsarConfig:
     aux_loss_weight_2: float = 0.25
     final_loss_weight: float = 0.60
     logit_softcap: float = 30.0
+    # Expert capacity headroom: capacity = ceil(avg_load * factor), rounded up to 64.
+    # 1.25 gives real headroom; the previous hardcoded 1.08 left only 8.3%.
+    moe_capacity_factor: float = 1.25
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -264,8 +267,13 @@ class PulsarAttention(nn.Module):
             lv = torch.sigmoid(self.v_resid_lambda[pulse_idx]).to(v.dtype)
             v = (1.0 - lv) * v + lv * v_first
 
-        # Per-Pulse, Per-Head QK-RMSNorm (Fused single-warp reduction CUDA kernel)
-        if HAS_PULSAR_CUDA and q.is_cuda and hasattr(pulsar_cuda, "qk_rmsnorm_forward"):
+        # Per-Pulse, Per-Head QK-RMSNorm (Fused single-warp reduction CUDA kernel).
+        # The kernel is written for head_dim == 64: each of the 32 lanes handles one
+        # (even, odd) pair, i.e. exactly 64 elements. It does NOT validate head_dim, so
+        # any other value makes the upper lanes read and write past the end of the
+        # vector (intermittent NaNs from garbage entering the warp reduction). Guard
+        # here and fall back to the PyTorch path for other head dims.
+        if HAS_PULSAR_CUDA and self.head_dim == 64 and q.is_cuda and hasattr(pulsar_cuda, "qk_rmsnorm_forward"):
             q = _FusedQK_RMSNormFunction.apply(q, self.q_norm_weight[pulse_idx], T, self.cfg.rms_eps)
             k = _FusedQK_RMSNormFunction.apply(k, self.k_norm_weight[pulse_idx], T, self.cfg.rms_eps)
         else:
@@ -332,24 +340,80 @@ class _FusedSwiGLUFunction(torch.autograd.Function):
         return torch.cat([dgate.to(gu.dtype), dup.to(gu.dtype)], dim=-1), None
 
 
+def compute_token_slots(
+    topk_idx: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_experts: int,
+    capacity: int,
+) -> torch.Tensor:
+    """Assign each (token, k) assignment to a slot, deterministically.
+
+    The kernel used to assign slots with ``atomicAdd``, so which assignments overflowed
+    depended on block scheduling: nondeterministic run to run, and biased toward tokens
+    scheduled later. Slots are assigned here instead: assignments are grouped by expert
+    and ordered by descending routing weight, and the first ``capacity`` in each group
+    keep their slot. Overflow therefore always drops the **lowest-weight** assignments,
+    identically on every run.
+
+    Returns int32 ``[N, K]`` with the slot index, or -1 for a dropped assignment.
+    """
+    N, K = topk_idx.shape
+    device = topk_idx.device
+    flat_e = topk_idx.reshape(-1).long()                  # [M]
+    flat_w = topk_weights.reshape(-1).float()             # [M]
+    M = flat_e.numel()
+
+    if M == 0:
+        return torch.empty((N, K), dtype=torch.int32, device=device)
+
+    # Global order: expert ascending, then weight descending, then position (stable).
+    # Two stable sorts compose into the lexicographic order we want.
+    by_expert = torch.argsort(flat_e, stable=True)
+    by_weight_desc = torch.argsort(flat_w[by_expert], descending=True, stable=True)
+    order = by_expert[by_weight_desc]                     # [M] indices into flat arrays
+
+    e_sorted = flat_e[order]
+
+    # Rank within each expert = position in the sorted order minus the expert's
+    # group start. Since sorting groups experts contiguously, a cumulative count of
+    # each expert's occurrences minus one gives that rank directly.
+    one_hot = F.one_hot(e_sorted, num_classes=num_experts).to(torch.int32)  # [M, E]
+    rank = (one_hot.cumsum(0) - 1).gather(1, e_sorted.unsqueeze(1)).squeeze(1)  # [M]
+
+    slot_sorted = torch.where(
+        rank < capacity, rank, torch.full_like(rank, -1)
+    ).to(torch.int32)
+
+    slots = torch.empty(M, dtype=torch.int32, device=device)
+    slots[order] = slot_sorted
+    return slots.view(N, K)
+
+
 class _FusedMoEDispatchFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x: torch.Tensor, topk_idx: torch.Tensor, num_experts: int, capacity: int):
-        expert_inputs, token_to_slot, expert_counts = pulsar_cuda.moe_dispatch_forward(
-            x.contiguous(), topk_idx.contiguous(), num_experts, capacity
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        topk_idx: torch.Tensor,
+        token_to_slot: torch.Tensor,
+        num_experts: int,
+        capacity: int,
+    ):
+        (expert_inputs,) = pulsar_cuda.moe_dispatch_forward(
+            x.contiguous(), topk_idx.contiguous(), token_to_slot.contiguous(), num_experts, capacity
         )
         ctx.save_for_backward(topk_idx, token_to_slot)
         ctx.N = x.size(0)
         ctx.D = x.size(1)
-        return expert_inputs, token_to_slot, expert_counts
+        return expert_inputs
 
     @staticmethod
-    def backward(ctx, d_expert_inputs: torch.Tensor, _d_token_to_slot, _d_expert_counts):
+    def backward(ctx, d_expert_inputs: torch.Tensor):
         topk_idx, token_to_slot = ctx.saved_tensors
         dx = pulsar_cuda.moe_dispatch_backward(
             d_expert_inputs.contiguous(), topk_idx, token_to_slot, ctx.N, ctx.D
         )
-        return dx, None, None, None
+        return dx, None, None, None, None
 
 
 class _FusedMoECombineFunction(torch.autograd.Function):
@@ -461,6 +525,11 @@ class PulsarMoEMLP(nn.Module):
         self.register_buffer("expert_bias", torch.zeros(cfg.n_routed_experts, dtype=torch.float32), persistent=True)
         self.register_buffer("expert_counts_accum", torch.zeros(cfg.n_routed_experts, dtype=torch.float32), persistent=False)
         self.register_buffer("expert_pulse_counts", torch.zeros(cfg.max_pulses, cfg.n_routed_experts, dtype=torch.float32), persistent=False)
+        # Drop statistics, accumulated on the GPU and drained by pop_moe_stats().
+        # No .item() in the hot path: syncing per micro-batch would serialise the stream.
+        self.register_buffer("drop_counts_accum", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("assigned_counts_accum", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("capacity_last", torch.zeros((), dtype=torch.float32), persistent=False)
 
     def forward(self, x: torch.Tensor, pulse_idx: int = 0) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         B, T, D = x.shape
@@ -490,21 +559,36 @@ class PulsarMoEMLP(nn.Module):
         shared_out = self.shared_expert(x_flat)
 
         # 4. Fused MoE Dispatch & Batched 3D GEMM Execution (with 64-aligned cuBLAS tensor core tiling)
+        # Capacity: ceil(avg_load * factor) rounded up to a multiple of 64. The factor is
+        # configurable (default 1.25); the old hardcoded 1.08 gave only 8.3% headroom at
+        # N=3072, so drops were common but never measured.
+        avg_load = N * self.cfg.top_k / self.cfg.n_routed_experts
+        raw_cap = int(math.ceil(avg_load * self.cfg.moe_capacity_factor))
+        capacity = max(64, ((raw_cap + 63) // 64) * 64)
+
+        # Pre-drop counts, per expert. Computed from topk_idx (not from surviving slots)
+        # so that drop statistics reflect demand rather than capacity.
+        # topk_idx carries no gradient, but the bincount must not enter the autograd
+        # graph at all - keep it inside no_grad with the accumulators it feeds.
+        with torch.no_grad():
+            bincounts = torch.bincount(
+                topk_idx.reshape(-1), minlength=self.cfg.n_routed_experts
+            ).to(torch.float32)
+            self.expert_counts_accum.add_(bincounts)
+            self.expert_pulse_counts[pulse_idx].add_(bincounts)
+            # drop accounting stays on the GPU; drained by pop_moe_stats()
+            dropped_per_expert = (bincounts - capacity).clamp(min=0.0)
+            self.drop_counts_accum.add_(dropped_per_expert.sum())
+            self.assigned_counts_accum.add_(bincounts.sum())
+            self.capacity_last.fill_(float(capacity))
+
         if HAS_PULSAR_CUDA and x_flat.is_cuda and hasattr(pulsar_cuda, "moe_dispatch_forward"):
-            # MoE capacity aligned to 64 elements (optimal balance of 12.5% load headroom & minimal padding)
-            avg_load = N * self.cfg.top_k / self.cfg.n_routed_experts
-            raw_cap = int(math.ceil(avg_load * 1.08))
-            capacity = max(64, ((raw_cap + 63) // 64) * 64)
-
-            expert_inputs, token_to_slot, expert_counts = _FusedMoEDispatchFunction.apply(
-                x_flat, topk_idx, self.cfg.n_routed_experts, capacity
+            token_to_slot = compute_token_slots(
+                topk_idx, topk_weights, self.cfg.n_routed_experts, capacity
             )
-
-            # Global Across-Pulse count accumulation (reusing kernel counts, zero bincount overhead)
-            bincounts = expert_counts.float()
-            with torch.no_grad():
-                self.expert_counts_accum.add_(bincounts)
-                self.expert_pulse_counts[pulse_idx].add_(bincounts)
+            expert_inputs = _FusedMoEDispatchFunction.apply(
+                x_flat, topk_idx, token_to_slot, self.cfg.n_routed_experts, capacity
+            )
 
             # Batched expert projections with ZERO weight stacking
             gu = torch.bmm(expert_inputs, self.routed_gate_up)              # [E, C, 2048]
@@ -518,33 +602,31 @@ class PulsarMoEMLP(nn.Module):
             )
             out = (shared_out + routed_only * r_scale).view(B, T, D)
         else:
-            # Fallback for CPU / environments without custom CUDA extension
-            flat_idx = topk_idx.view(-1)
-            bincounts = torch.bincount(flat_idx, minlength=self.cfg.n_routed_experts).float()
-            with torch.no_grad():
-                self.expert_counts_accum.add_(bincounts)
-                self.expert_pulse_counts[pulse_idx].add_(bincounts)
-
+            # Fallback for CPU / environments without custom CUDA extension.
+            # Applies the SAME capacity and drop rule as the CUDA path, so CPU
+            # evaluation matches training. Without this, CPU evals silently used
+            # unlimited capacity while training dropped assignments.
+            token_to_slot = compute_token_slots(
+                topk_idx, topk_weights, self.cfg.n_routed_experts, capacity
+            )
             flat_token_idx = torch.arange(N, device=x.device).unsqueeze(1).expand(N, self.cfg.top_k).reshape(-1)
             flat_expert_ids = topk_idx.reshape(-1)
-            flat_weights = topk_weights.reshape(-1)
-
-            sort_order = torch.argsort(flat_expert_ids)
-            counts = bincounts.long().tolist()
+            flat_weights = topk_weights.reshape(-1).to(x.dtype)
+            flat_slots = token_to_slot.reshape(-1)
 
             routed_out = torch.zeros_like(x_flat)
-            start = 0
             for e in range(self.cfg.n_routed_experts):
-                c = counts[e]
-                if c > 0:
-                    batch_indices = flat_token_idx[sort_order[start : start + c]]
-                    e_in = x_flat[batch_indices]
-                    gu_e = F.linear(e_in, self.routed_gate_up[e].t())
-                    act_e = _FusedSwiGLUFunction.apply(gu_e, self.cfg.d_expert)
-                    e_out = F.linear(act_e, self.routed_down[e].t())
-                    w = flat_weights[sort_order[start : start + c]].unsqueeze(-1)
-                    routed_out.index_add_(0, batch_indices, (e_out * w).to(x.dtype))
-                    start += c
+                sel = (flat_expert_ids == e) & (flat_slots >= 0)
+                if not bool(sel.any()):
+                    continue
+                rows = sel.nonzero().squeeze(-1)
+                idx_e = flat_token_idx[rows]
+                e_in = x_flat[idx_e]
+                gu_e = F.linear(e_in, self.routed_gate_up[e].t())
+                act_e = _FusedSwiGLUFunction.apply(gu_e, self.cfg.d_expert)
+                e_out = F.linear(act_e, self.routed_down[e].t())
+                w_e = flat_weights[rows].unsqueeze(-1)
+                routed_out.index_add_(0, idx_e, (e_out * w_e).to(x.dtype))
 
             r_scale = self.routed_scale[pulse_idx].to(x.dtype)
             out = (shared_out + routed_out * r_scale).view(B, T, D)
@@ -700,6 +782,36 @@ class PulsarForCausalLM(nn.Module):
         """Update auxiliary-loss-free routing biases globally across all blocks."""
         for block in self.core:
             block.mlp.update_biases(bias_lr=bias_lr)
+
+    @torch.no_grad()
+    def pop_moe_stats(self) -> dict:
+        """Drain accumulated MoE drop statistics. Call once per log window.
+
+        Counters live on the GPU and are only synchronised here, so the training step
+        itself performs no host sync. Returns totals since the last call and resets.
+        """
+        dropped = 0.0
+        assigned = 0.0
+        capacity = 0.0
+        per_block_drop = []
+        for block in self.core:
+            mlp = block.mlp
+            d = float(mlp.drop_counts_accum.item())
+            a = float(mlp.assigned_counts_accum.item())
+            c = float(mlp.capacity_last.item())
+            dropped += d
+            assigned += a
+            capacity = c or capacity
+            per_block_drop.append(d)
+            mlp.drop_counts_accum.zero_()
+            mlp.assigned_counts_accum.zero_()
+        return {
+            "dropped": dropped,
+            "assigned": assigned,
+            "capacity": capacity,
+            "drop_rate": (dropped / assigned) if assigned > 0 else 0.0,
+            "per_block_dropped": per_block_drop,
+        }
 
     def forward(
         self,

@@ -2785,8 +2785,11 @@
       chart2.data.datasets[2].data = slice.map(r => r.grad_norm_adam ?? r.grad_adam ?? null);
       // Clip limit line: use the run's reported value, falling back to the last known
       // one. This used to be a flat 1.0 regardless of --grad-clip.
-      const clipNow = (latestR && latestR.grad_clip != null) ? latestR.grad_clip
-                    : (slice.length ? slice[slice.length - 1].grad_clip : null);
+      // NOTE: latestR is declared further down this function, so it cannot be
+      // referenced here - doing so threw a TDZ ReferenceError that aborted the whole
+      // render and left every chart after #1 blank.
+      const lastRec = slice.length ? slice[slice.length - 1] : null;
+      const clipNow = (lastRec && lastRec.grad_clip != null) ? lastRec.grad_clip : null;
       chart2.data.datasets[3].label = clipNow != null ? `Clip Limit (${clipNow})` : 'Clip Limit';
       chart2.data.datasets[3].data = slice.map(r => (r.grad_clip != null ? r.grad_clip : clipNow));
       chart2.update('none');

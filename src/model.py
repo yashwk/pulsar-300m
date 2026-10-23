@@ -385,22 +385,33 @@ class _FusedMoECombineFunction(torch.autograd.Function):
 
 
 class _FusedMoERouterFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, logits: torch.Tensor, expert_bias: torch.Tensor, z_loss_weight: float = 1e-4):
-        topk_idx, topk_weights, z_loss = pulsar_cuda.moe_router_topk_forward(
-            logits.contiguous(), expert_bias.float().contiguous(), z_loss_weight
-        )
-        ctx.save_for_backward(logits, topk_idx)
-        ctx.z_loss_weight = z_loss_weight
-        return topk_idx, topk_weights, z_loss
+    """Fused router top-2 selection and weight normalisation.
+
+    Z-loss is deliberately NOT computed here. The kernel's z-term assumed an upstream
+    gradient of 1, but the real scale is 1/24 (averaging over 8 blocks x 3 pulses) times
+    1/grad_accum, which made the effective z-loss weight ~1000x its configured value.
+    The backward also ignored the incoming _d_z_loss entirely. Z-loss is now computed
+    in PyTorch from the router logits so autograd applies the correct chain rule.
+
+    The kernel is called with z_loss_weight=0, so it only produces the top-2 weight
+    normalisation gradient.
+    """
 
     @staticmethod
-    def backward(ctx, _d_topk_idx, d_topk_weights: torch.Tensor, _d_z_loss):
+    def forward(ctx, logits: torch.Tensor, expert_bias: torch.Tensor):
+        topk_idx, topk_weights, _z_loss_unused = pulsar_cuda.moe_router_topk_forward(
+            logits.contiguous(), expert_bias.float().contiguous(), 0.0
+        )
+        ctx.save_for_backward(logits, topk_idx)
+        return topk_idx, topk_weights
+
+    @staticmethod
+    def backward(ctx, _d_topk_idx, d_topk_weights: torch.Tensor):
         logits, topk_idx = ctx.saved_tensors
         d_logits = pulsar_cuda.moe_router_topk_backward(
-            d_topk_weights.contiguous(), logits.contiguous(), topk_idx, ctx.z_loss_weight
+            d_topk_weights.contiguous(), logits.contiguous(), topk_idx, 0.0
         )
-        return d_logits, None, None
+        return d_logits, None
 
 
 class SwiGLUMLP(nn.Module):
@@ -425,10 +436,19 @@ class PulsarMoEMLP(nn.Module):
 
         # 3D Contiguous Expert Parameters: [n_routed_experts, d_in, d_out]
         # Eliminates torch.stack overhead entirely (saving ~36 ms per micro-batch)
+        #
+        # Init must match the shared expert, which follows the residual-output rule
+        # std = 0.02 / sqrt(2 * n_core * default_pulses) for its down projection and
+        # 0.02 for upstream weights (see _init_weights). The old values
+        # (1/sqrt(d_model) ~ 0.031 for gate_up and 1/sqrt(d_expert) ~ 0.031 for down)
+        # made the routed path ~10x the shared expert's contribution at init, which
+        # dominates the MLP update and is the likely cause of the |dh| >> |h_in|
+        # blow-up that harmonic damping was added to mask.
+        residual_std = 0.02 / math.sqrt(2 * cfg.n_core * cfg.default_pulses)
         self.routed_gate_up = nn.Parameter(torch.empty(cfg.n_routed_experts, cfg.d_model, 2 * cfg.d_expert))
         self.routed_down = nn.Parameter(torch.empty(cfg.n_routed_experts, cfg.d_expert, cfg.d_model))
-        nn.init.normal_(self.routed_gate_up, std=1.0 / math.sqrt(cfg.d_model))
-        nn.init.normal_(self.routed_down, std=1.0 / math.sqrt(cfg.d_expert))
+        nn.init.normal_(self.routed_gate_up, std=0.02)
+        nn.init.normal_(self.routed_down, std=residual_std)
 
         # Pulse-Indexed Router [max_pulses, n_routed_experts, d_model]
         self.router_weight = nn.Parameter(torch.empty(cfg.max_pulses, cfg.n_routed_experts, cfg.d_model, dtype=torch.float32))
@@ -451,18 +471,20 @@ class PulsarMoEMLP(nn.Module):
         router_w = self.router_weight[pulse_idx].to(x.dtype)
         logits = F.linear(x_flat, router_w)  # [N, n_routed_experts]
 
-        # 2. Fused Router Top-2 + Sigmoid + Z-loss Selection (single fused CUDA launch)
+        # 2. Router selection: fused top-2 + sigmoid + weight normalisation (CUDA),
+        #    with z-loss computed in PyTorch so autograd scales it correctly. The z
+        #    tensor is [N, E] (a few hundred KB), negligible next to the router matmul.
+        z_loss = self.cfg.router_z_loss_weight * torch.logsumexp(
+            logits.float(), dim=-1
+        ).pow(2).mean()
         if HAS_PULSAR_CUDA and logits.is_cuda and hasattr(pulsar_cuda, "moe_router_topk_forward"):
-            topk_idx, topk_weights, z_loss = _FusedMoERouterFunction.apply(
-                logits, self.expert_bias, self.cfg.router_z_loss_weight
-            )
+            topk_idx, topk_weights = _FusedMoERouterFunction.apply(logits, self.expert_bias)
         else:
             scores = torch.sigmoid(logits.float())
             biased_scores = scores + self.expert_bias
             _, topk_idx = torch.topk(biased_scores, k=self.cfg.top_k, dim=-1)  # [N, 2]
             topk_raw = torch.gather(scores, -1, topk_idx)
             topk_weights = (topk_raw / (topk_raw.sum(dim=-1, keepdim=True) + 1e-6)).to(x.dtype)
-            z_loss = self.cfg.router_z_loss_weight * torch.logsumexp(logits.float(), dim=-1).pow(2).mean()
 
         # 3. Shared expert projection
         shared_out = self.shared_expert(x_flat)

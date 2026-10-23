@@ -119,14 +119,21 @@ class _SROptimizerMixin(_SRMixin):
     def state_dict(self):
         sd = super().state_dict()
         sd["_sr"] = self._sr_state()
-        # Preserve FP32 master state exactly; see load_state_dict.
+        # Preserve FP32 master state exactly; see load_state_dict. Only FP32 tensors
+        # over a non-FP32 parameter need this: Muon's momentum buffer is bf16 and the
+        # parameter is bf16, so torch's cast is lossless and cloning it here would
+        # duplicate every expert momentum buffer into the checkpoint.
         live = [p for g in self.param_groups for p in g["params"]]
         fp32_block = {}
         for idx, param in enumerate(live):
             pstate = self.state.get(param)
-            if not pstate:
+            if not pstate or param.dtype == torch.float32:
                 continue
-            keep = {k: v.detach().clone() for k, v in pstate.items() if torch.is_tensor(v)}
+            keep = {
+                k: v.detach().clone()
+                for k, v in pstate.items()
+                if torch.is_tensor(v) and v.dtype == torch.float32
+            }
             if keep:
                 fp32_block[idx] = keep
         if fp32_block:
@@ -151,7 +158,9 @@ class _SROptimizerMixin(_SRMixin):
                 if not saved or pstate is None:
                     continue
                 for key, val in saved.items():
-                    pstate[key] = val.clone()
+                    # A checkpoint is often mapped to CPU before load; place the state
+                    # back on the parameter's device and in FP32.
+                    pstate[key] = val.to(device=param.device, dtype=torch.float32).clone()
 
 
 class Muon(_SROptimizerMixin, Optimizer):

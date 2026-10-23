@@ -889,3 +889,114 @@ def test_training_counters_survive_checkpoint():
         "expert_counts_accum is not persistent; a mid-run checkpoint loses the counts "
         "that update_biases() depends on"
     )
+
+
+# ---------------------------------------------------------------------------
+# Fixes for ca71e80: deterministic eval windows, SR checkpoint placement
+# ---------------------------------------------------------------------------
+
+def test_evaluate_loss_uses_identical_windows_on_consecutive_calls():
+    """PackedBatchLoader walks a cursor and ignores the seed.
+
+    Without a reset, every eval step scored a different slice of validation windows,
+    so val_ce_final was not comparable across steps or with the value stored in best.pt.
+    """
+    import numpy as np
+
+    from src.model import PulsarForCausalLM
+    from src.packing import PackedBatchLoader, build_doc_index, plan_epoch
+    from src.train import evaluate_loss
+
+    rng = np.random.default_rng(3)
+    lengths = rng.integers(80, 400, size=40).astype(np.int64)
+    parts = [np.concatenate([rng.integers(1, 500, n - 1), [0]]).astype(np.uint16) for n in lengths]
+    shard = np.concatenate(parts)
+    index = build_doc_index([shard])
+    plan = plan_epoch(lengths, 64, seed=0, epoch=0)
+    loader = PackedBatchLoader([shard], index, plan, micro_batch_size=2, device="cpu")
+
+    cfg = make_cfg(n_core=2, d_model=128, vocab_size=512, top_k=2)
+    torch.manual_seed(0)
+    model = PulsarForCausalLM(cfg).eval()
+
+    first = evaluate_loss(model, loader, eval_iters=2, num_pulses=2)
+    cursor_after_first = loader._cursor
+    second = evaluate_loss(model, loader, eval_iters=2, num_pulses=2)
+
+    assert first["val_ce_final"] == pytest.approx(second["val_ce_final"], rel=1e-6), (
+        f"eval loss drifted between calls ({first['val_ce_final']} vs "
+        f"{second['val_ce_final']}); the loader was not reset"
+    )
+    assert loader._cursor == cursor_after_first, "cursor advanced across a reset eval"
+
+
+@pytest.mark.skipif(not HAS_CUDA, reason="needs CUDA for the fused MoE path")
+def test_moe_counters_untouched_by_eval_forward():
+    """evaluate_loss/generate_canary run under model.eval(); they must not feed the
+    counters that drive update_expert_biases()."""
+    from src.model import PulsarConfig, PulsarForCausalLM
+
+    cfg = make_cfg(n_core=2, d_model=128, vocab_size=512, top_k=2)
+    torch.manual_seed(0)
+    model = PulsarForCausalLM(cfg)
+    model.to_training_precision(torch.bfloat16)
+    x = torch.randint(0, cfg.vocab_size, (1, 32))
+
+    counters = ("expert_counts_accum", "expert_pulse_counts", "drop_counts_accum",
+                "assigned_counts_accum", "pulse_drop_accum", "pulse_assigned_accum")
+
+    def snapshot():
+        return {k: sum(float(getattr(b.mlp, k).sum()) for b in model.core) for k in counters}
+
+    model.eval()
+    before = snapshot()
+    with torch.no_grad():
+        for _ in range(3):
+            model(x, labels=None, num_pulses=2)
+    after = snapshot()
+
+    for k in counters:
+        assert before[k] == after[k], f"eval forward mutated {k} by {after[k] - before[k]}"
+
+
+def test_sr_state_restored_to_param_device_and_fp32():
+    """A CPU-mapped checkpoint must place FP32 master moments back on the param device."""
+    import copy
+
+    import torch.nn as nn
+
+    from src.optim import AdamWBF16SR
+
+    dev = "cuda" if HAS_CUDA else "cpu"
+    p = nn.Parameter(torch.zeros(16, 16, dtype=torch.bfloat16, device=dev))
+    opt = AdamWBF16SR([p], lr=6e-4, stochastic_rounding=True, seed=1)
+    p.grad = torch.randn(16, 16, device=dev).to(torch.bfloat16)
+    opt.step()
+
+    sd = copy.deepcopy(opt.state_dict())
+    sd["_fp32_state"] = {
+        i: {k: v.cpu() for k, v in d.items()} for i, d in sd["_fp32_state"].items()
+    }
+
+    p2 = nn.Parameter(torch.zeros(16, 16, dtype=torch.bfloat16, device=dev))
+    opt2 = AdamWBF16SR([p2], lr=6e-4, stochastic_rounding=True, seed=1)
+    opt2.load_state_dict(sd)
+
+    state = opt2.state[p2]["exp_avg"]
+    assert state.dtype == torch.float32, f"master state in {state.dtype}, expected float32"
+    assert state.device.type == torch.device(dev).type, f"state on {state.device}, expected {dev}"
+
+
+def test_muon_bf16_state_not_duplicated_in_checkpoint():
+    """_fp32_state must not clone bf16 momentum: torch's cast is already lossless."""
+    import torch.nn as nn
+
+    from src.optim import Muon
+
+    p = nn.Parameter(torch.zeros(32, 32, dtype=torch.bfloat16))
+    opt = Muon([p], lr=0.02, stochastic_rounding=True, seed=1)
+    p.grad = torch.randn_like(p)
+    opt.step()
+    assert "_fp32_state" not in opt.state_dict(), (
+        "bf16 momentum was cloned into _fp32_state, duplicating it in every checkpoint"
+    )

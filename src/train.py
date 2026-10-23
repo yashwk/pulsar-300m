@@ -218,15 +218,22 @@ def evaluate_loss(
     """
     was_training = model.training
     model.eval()
+    # PackedBatchLoader walks a sequential cursor and ignores the seed, so without a
+    # reset every eval scored a DIFFERENT slice of windows and val_ce_final was not
+    # comparable across steps (or with best.pt's stored value).
+    if hasattr(val_loader, "reset"):
+        val_loader.reset()
     totals = []
     pulse_accum = [[] for _ in range(num_pulses)]
     with torch.no_grad():
         for i in range(eval_iters):
             seed_val = 999983 + i * 17
             x, y = val_loader.get_batch(seed_val)
+            # Padded positions must not enter routing statistics, same as in training.
+            rmask = val_loader.routing_mask(x) if hasattr(val_loader, "routing_mask") else None
             _, _, metrics = model(
                 x, labels=y, num_pulses=num_pulses,
-                subsample_offset=0, eval_full_pulses=True,
+                subsample_offset=0, eval_full_pulses=True, routing_mask=rmask,
             )
             # Per-pulse CEs are the mean CE over all tokens for each pulse.
             step_pulses = metrics.get("pulse_losses", [])
@@ -265,6 +272,7 @@ def save_checkpoint(
     os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
     raw_model = getattr(model, "_orig_mod", model)
     model_summary = raw_model.get_model_summary(num_pulses) if hasattr(raw_model, "get_model_summary") else {}
+    opt_state = optimizer.state_dict() if hasattr(optimizer, "state_dict") else {}
     ckpt = {
         "global_step": global_step,
         "tokens_seen": tokens_seen,
@@ -272,10 +280,13 @@ def save_checkpoint(
         "config": cfg.to_dict() if hasattr(cfg, "to_dict") else cfg,
         "model_summary": model_summary,
         "model": raw_model.state_dict(),
-        "optimizer": optimizer.state_dict() if hasattr(optimizer, "state_dict") else None,
-        "opt_muon": optimizer.opt_muon.state_dict(),
-        "opt_adam": optimizer.opt_adam.state_dict(),
-        "opt_adam_sr": optimizer.opt_adam_sr.state_dict(),
+        # Computed once: the three sub-optimizer dicts below are taken FROM it rather
+        # than re-derived, which previously cloned every _fp32_state block a second
+        # time and doubled that part of the checkpoint.
+        "optimizer": opt_state,
+        "opt_muon": opt_state.get("opt_muon"),
+        "opt_adam": opt_state.get("opt_adam"),
+        "opt_adam_sr": opt_state.get("opt_adam_sr"),
     }
     tmp_path = filepath + ".tmp"
     torch.save(ckpt, tmp_path)

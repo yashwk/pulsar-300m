@@ -100,8 +100,10 @@ def test_qk_rmsnorm(n_heads):
     eps = 1e-6
 
     y_kernel, _ = pulsar_cuda.qk_rmsnorm_forward(x, w, T, eps)
-    y_ref = ref_rmsnorm(x.permute(0, 2, 1, 3).reshape(B, T, H * D), w.view(-1), eps)
-    y_ref = y_ref.view(B, T, H, D).permute(0, 2, 1, 3)
+    # Normalisation is per (head, head_dim) slice, NOT across concatenated heads:
+    # x is [B, H, T, D] and each row of D is normalised independently.
+    xf = x.float()
+    y_ref = (w.view(1, H, 1, D) * xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)).to(x.dtype)
 
     assert_close(y_kernel, y_ref, atol=2e-2, msg=f"qk_rmsnorm heads={n_heads}")
 
@@ -118,16 +120,16 @@ def test_qk_rmsnorm_backward():
 
     x_ref = x.detach().float().requires_grad_(True)
     w_ref = w.detach().requires_grad_(True)
-    y = ref_rmsnorm(x_ref.permute(0, 2, 1, 3).reshape(B, T, H * D), w_ref.view(-1), eps)
-    dy = _bf16(B, T, H * D, seed=6).float()
+    xf = x_ref
+    y = (w_ref.view(1, H, 1, D) * xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps))
+    dy = _bf16(B, H, T, D, seed=6).float()
     (y * dy).sum().backward()
 
     _, rsqrt = pulsar_cuda.qk_rmsnorm_forward(x, w, T, eps)
-    dy_heads = dy.view(B, T, H, D).permute(0, 2, 1, 3).bfloat16()
-    dx, dw = pulsar_cuda.qk_rmsnorm_backward(dy_heads, x, w, rsqrt, T)
+    dx, dw = pulsar_cuda.qk_rmsnorm_backward(dy.bfloat16(), x, w, rsqrt, T)
 
-    assert_close(x_ref.grad.view(B, T, H, D).permute(0, 2, 1, 3), dx, atol=5e-2, msg="qk dx")
-    assert_close(w_ref.grad.view(H, D), dw, atol=5e-2, msg="qk dw")
+    assert_close(x_ref.grad, dx, atol=5e-2, msg="qk dx")
+    assert_close(w_ref.grad, dw, atol=5e-2, msg="qk dw")
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +284,7 @@ def test_router_topk_forward():
     idx_ref, weights_ref, z_ref = ref_router_topk(logits, bias, 1e-4)
 
     assert_close(weights, weights_ref, atol=2e-3, msg="router weights")
-    assert_close(z, z_ref.reshape(1), atol=2e-3, msg="router z-loss")
+    assert_close(z.reshape(()), z_ref.reshape(()), atol=2e-3, msg="router z-loss")
     # selection may differ only on exact ties
     assert (idx == idx_ref).float().mean() > 0.99
 

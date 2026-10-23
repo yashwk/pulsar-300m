@@ -253,6 +253,48 @@ def check_log_thermal_cooling():
     return None
 
 
+_RUN_CONFIG_CACHE = {"key": None, "value": {}}
+# Set from the CLI for runs whose trainer predates the metrics.jsonl fields.
+_OVERRIDES: dict[str, int] = {}
+
+
+def _run_config_value(name, default):
+    """Read a run-level parameter from the newest metrics.jsonl record.
+
+    The live status file only contains per-step values, so run-level parameters are
+    taken from the JSONL the trainer writes every step. Cached by file mtime+size to
+    keep the 10 s poll cheap.
+    """
+    if name in _OVERRIDES:
+        return _OVERRIDES[name]
+
+    path = os.path.join(CHECKPOINT_DIR, "metrics.jsonl")
+    try:
+        st = os.stat(path)
+        key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return default
+
+    if _RUN_CONFIG_CACHE["key"] != key:
+        value = {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            for line in reversed(lines[-50:]):
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                if rec.get(name) is not None:
+                    value = {name: rec[name]}
+                    break
+        except (OSError, json.JSONDecodeError):
+            value = {}
+        _RUN_CONFIG_CACHE["key"] = key
+        _RUN_CONFIG_CACHE["value"] = value
+    return _RUN_CONFIG_CACHE["value"].get(name, default)
+
+
 def enrich_status_payload(data):
     cooling_info = check_log_thermal_cooling()
     if cooling_info:
@@ -304,14 +346,22 @@ def enrich_status_payload(data):
     eh, em = divmod(em, 60)
     data["elapsed_str"] = f"{eh}h {em:02d}m" if eh > 0 else f"{em:02d}m {es:02d}s"
 
-    warmup_steps = data.get("warmup_steps", 100)
-    cooldown_steps = data.get("cooldown_steps", 0)
+    # Prefer the value the trainer reports. The old hardcoded 100 silently mislabelled
+    # the phase for any run with a different warmup (e.g. 150: the dashboard announced
+    # "Stable Phase" at step 100 while the LR was still ramping).
+    warmup_steps = data.get("warmup_steps")
+    if warmup_steps is None:
+        warmup_steps = _run_config_value("warmup_steps", 0)
+    cooldown_steps = data.get("cooldown_steps")
+    if cooldown_steps is None:
+        cooldown_steps = _run_config_value("cooldown_steps", 0)
     data["max_steps"] = max_steps
     data["active_target"] = active_target
     data["warmup_steps"] = warmup_steps
+    data["cooldown_steps"] = cooldown_steps
     if step >= active_target:
         data["phase"] = "Target Completed"
-    elif step < warmup_steps:
+    elif step <= warmup_steps:
         data["phase"] = f"Warmup ({step}/{warmup_steps})"
     elif cooldown_steps > 0 and step >= (max_steps - cooldown_steps):
         data["phase"] = "Cooldown / Decay"
@@ -559,6 +609,15 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=7860, help="Server port (default: 7860)")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Bind host (default: 127.0.0.1; use 0.0.0.0 to expose on the LAN)")
     parser.add_argument(
+        "--warmup-steps", type=int, default=None,
+        help="Override the warmup length. Normally read from the run's metrics.jsonl; "
+             "needed only for a run started before the trainer began emitting it.",
+    )
+    parser.add_argument(
+        "--cooldown-steps", type=int, default=None,
+        help="Override the WSD cooldown length (see --warmup-steps).",
+    )
+    parser.add_argument(
         "--checkpoint-dir", type=str, default=None,
         help="Run directory to monitor (default: checkpoints). Point this at the trainer's "
              "--checkpoint-dir, e.g. checkpoints/baseline.",
@@ -568,6 +627,13 @@ if __name__ == "__main__":
     if args.checkpoint_dir:
         CHECKPOINT_DIR = args.checkpoint_dir
         LIVE_STATUS_FILE = os.path.join(CHECKPOINT_DIR, "live_status.json")
-        METRICS_JSONL_FILE = os.path.join(CHECKPOINT_DIR, "metrics.jsonl")
+
+    _OVERRIDES.clear()
+    if args.warmup_steps is not None:
+        _OVERRIDES["warmup_steps"] = args.warmup_steps
+    if args.cooldown_steps is not None:
+        _OVERRIDES["cooldown_steps"] = args.cooldown_steps
+
+    METRICS_JSONL_FILE = os.path.join(CHECKPOINT_DIR, "metrics.jsonl")
 
     run_server(port=args.port, host=args.host)

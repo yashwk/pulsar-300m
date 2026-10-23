@@ -825,6 +825,12 @@ def train():
             "micro_batch_size": args.micro_batch_size,
             "seq_len": args.seq_len,
             "num_pulses": args.num_pulses,
+            # Schedule shape for the dashboard's phase label. Without these it falls
+            # back to hardcoded guesses (a 100-step warmup), which mislabels the phase
+            # for any run whose warmup is not 100.
+            "warmup_steps": args.warmup_steps,
+            "cooldown_steps": args.cooldown_steps,
+            "lr_schedule": args.lr_schedule,
             "device_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU",
             "model_config": model_summary,
             "train_loss": round(accum_loss, 4),

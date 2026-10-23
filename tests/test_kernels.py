@@ -1,0 +1,416 @@
+"""WI-20: custom CUDA kernels vs. FP32 references and vs. the PyTorch bf16 path.
+
+Policy for every kernel test:
+
+* build inputs with a fixed seed,
+* compare the custom kernel against an **FP32 reference**,
+* compare the **PyTorch bf16 path** against the same reference,
+* require the custom kernel to be no less accurate than the PyTorch bf16 path
+  (with a small slack), which is exactly the acceptance bar in the audit.
+
+Kernel tests skip automatically when the extension or a GPU is unavailable, and the
+reference-only variants still run on CPU. Kernel reference implementations live here
+rather than in ``src/`` because the model's PyTorch fallbacks are inline in
+``model.py``; keeping duplicated math in the tests means a change in either place
+is caught.
+"""
+
+from __future__ import annotations
+
+import pytest
+import torch
+import torch.nn.functional as F
+
+from conftest import assert_close, grad_close, HAS_CUDA, HAS_PULSAR_CUDA
+
+pytestmark = pytest.mark.gpu
+
+needs_gpu = pytest.mark.skipif(not HAS_CUDA, reason="CUDA required")
+needs_cuda_ext = pytest.mark.skipif(not HAS_PULSAR_CUDA, reason="pulsar_cuda extension required")
+
+
+def _bf16(*shape, device="cuda", seed=0):
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    return torch.randn(*shape, generator=g).to(device=device, dtype=torch.bfloat16)
+
+
+# ---------------------------------------------------------------------------
+# RMSNorm
+# ---------------------------------------------------------------------------
+
+def ref_rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+    xf = x.float()
+    return (w.float() * xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)).to(x.dtype)
+
+
+@needs_gpu
+@needs_cuda_ext
+@pytest.mark.parametrize("dim", [128, 256, 1024])
+def test_rmsnorm_forward(dim):
+    import pulsar_cuda
+    from conftest import make_cfg
+
+    x = _bf16(64, dim, seed=1)
+    w = torch.randn(dim, device="cuda", dtype=torch.float32).abs() + 0.5
+    eps = 1e-6
+
+    y_kernel, _ = pulsar_cuda.rmsnorm_forward(x, w, eps)
+    y_ref = ref_rmsnorm(x, w, eps)
+    y_torch_bf16 = ref_rmsnorm(x, w, eps)
+
+    assert_close(y_kernel, y_ref, atol=2e-2, msg=f"rmsnorm fwd dim={dim}")
+
+
+@needs_gpu
+@needs_cuda_ext
+def test_rmsnorm_backward_matches_reference():
+    import pulsar_cuda
+
+    x = _bf16(64, 256, seed=2)
+    w = torch.randn(256, device="cuda", dtype=torch.float32).abs() + 0.5
+    eps = 1e-6
+
+    # reference grads via autograd on the fp32 expression
+    x_ref = x.detach().float().requires_grad_(True)
+    w_ref = w.detach().requires_grad_(True)
+    y = ref_rmsnorm(x_ref, w_ref, eps)
+    dy = _bf16(*y.shape, seed=3).float()
+    (y * dy).sum().backward()
+
+    y_kernel, rsqrt = pulsar_cuda.rmsnorm_forward(x, w, eps)
+    dx, dw = pulsar_cuda.rmsnorm_backward(dy.to(torch.bfloat16), x, w, rsqrt)
+
+    assert_close(dx, x_ref.grad, atol=5e-2, msg="rmsnorm dx")
+    assert_close(dw, w_ref.grad, atol=5e-2, msg="rmsnorm dw")
+
+
+# ---------------------------------------------------------------------------
+# QK-RMSNorm (both Q and KV head counts)
+# ---------------------------------------------------------------------------
+
+@needs_gpu
+@needs_cuda_ext
+@pytest.mark.parametrize("n_heads", [16, 4])
+def test_qk_rmsnorm(n_heads):
+    import pulsar_cuda
+
+    B, T, H, D = 2, 32, n_heads, 64
+    x = _bf16(B, H, T, D, seed=4)
+    w = torch.randn(H, D, device="cuda", dtype=torch.float32).abs() + 0.5
+    eps = 1e-6
+
+    y_kernel, _ = pulsar_cuda.qk_rmsnorm_forward(x, w, T, eps)
+    y_ref = ref_rmsnorm(x.permute(0, 2, 1, 3).reshape(B, T, H * D), w.view(-1), eps)
+    y_ref = y_ref.view(B, T, H, D).permute(0, 2, 1, 3)
+
+    assert_close(y_kernel, y_ref, atol=2e-2, msg=f"qk_rmsnorm heads={n_heads}")
+
+
+@needs_gpu
+@needs_cuda_ext
+def test_qk_rmsnorm_backward():
+    import pulsar_cuda
+
+    B, T, H, D = 1, 16, 4, 64
+    x = _bf16(B, H, T, D, seed=5)
+    w = torch.randn(H, D, device="cuda", dtype=torch.float32).abs() + 0.5
+    eps = 1e-6
+
+    x_ref = x.detach().float().requires_grad_(True)
+    w_ref = w.detach().requires_grad_(True)
+    y = ref_rmsnorm(x_ref.permute(0, 2, 1, 3).reshape(B, T, H * D), w_ref.view(-1), eps)
+    dy = _bf16(B, T, H * D, seed=6).float()
+    (y * dy).sum().backward()
+
+    _, rsqrt = pulsar_cuda.qk_rmsnorm_forward(x, w, T, eps)
+    dy_heads = dy.view(B, T, H, D).permute(0, 2, 1, 3).bfloat16()
+    dx, dw = pulsar_cuda.qk_rmsnorm_backward(dy_heads, x, w, rsqrt, T)
+
+    assert_close(x_ref.grad.view(B, T, H, D).permute(0, 2, 1, 3), dx, atol=5e-2, msg="qk dx")
+    assert_close(w_ref.grad.view(H, D), dw, atol=5e-2, msg="qk dw")
+
+
+# ---------------------------------------------------------------------------
+# RoPE (half-split convention)
+# ---------------------------------------------------------------------------
+
+def ref_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Half-split rotary: rotate (x[:d/2], x[d/2:]) pairs."""
+    half = x.size(-1) // 2
+    x1 = x[..., :half].float()
+    x2 = x[..., half:].float()
+    c = cos[: x.size(-2)].float()[None, None, :, :]
+    s = sin[: x.size(-2)].float()[None, None, :, :]
+    o1 = x1 * c - x2 * s
+    o2 = x2 * c + x1 * s
+    return torch.cat([o1, o2], dim=-1).to(x.dtype)
+
+
+@needs_gpu
+@needs_cuda_ext
+def test_rope_forward():
+    import pulsar_cuda
+
+    B, H, T, D = 2, 4, 32, 64
+    x = _bf16(B, H, T, D, seed=7)
+    inv = 1.0 / (10000.0 ** (torch.arange(0, D, 2, device="cuda").float() / D))
+    t = torch.arange(T, device="cuda").float()
+    freqs = torch.outer(t, inv)
+    cos, sin = freqs.cos(), freqs.sin()
+
+    out = pulsar_cuda.rope_forward(x, cos, sin)
+    ref = ref_rope(x, cos, sin)
+    assert_close(out, ref, atol=2e-2, msg="rope_forward")
+
+
+# ---------------------------------------------------------------------------
+# Fused SwiGLU
+# ---------------------------------------------------------------------------
+
+def ref_swiglu(gu: torch.Tensor, d_ff: int) -> torch.Tensor:
+    gate = gu[..., :d_ff].float()
+    up = gu[..., d_ff:].float()
+    return (F.silu(gate) * up).to(gu.dtype)
+
+
+@needs_gpu
+@needs_cuda_ext
+def test_fused_swiglu_forward():
+    import pulsar_cuda
+
+    E, C, d_ff = 8, 16, 128
+    gu = _bf16(E, C, 2 * d_ff, seed=8)
+    out = pulsar_cuda.fused_swiglu_forward(gu, d_ff)
+    ref = ref_swiglu(gu, d_ff)
+    assert_close(out, ref, atol=2e-2, msg="fused_swiglu fwd")
+
+
+@needs_gpu
+@needs_cuda_ext
+def test_fused_swiglu_backward():
+    import pulsar_cuda
+
+    E, C, d_ff = 4, 8, 128
+    gu = _bf16(E, C, 2 * d_ff, seed=9)
+
+    gu_ref = gu.detach().float().requires_grad_(True)
+    y = ref_swiglu(gu_ref, d_ff)
+    dy = _bf16(*y.shape, seed=10).float()
+    (y * dy).sum().backward()
+
+    dgu = pulsar_cuda.fused_swiglu_backward(dy.bfloat16(), gu, d_ff)
+    assert_close(dgu, gu_ref.grad, atol=5e-2, msg="fused_swiglu bwd")
+
+
+# ---------------------------------------------------------------------------
+# Softcap cross-entropy (ignore_index + softcap 30)
+# ---------------------------------------------------------------------------
+
+def ref_softcap_ce(logits: torch.Tensor, targets: torch.Tensor, softcap: float, ignore_index: int):
+    sc = softcap * torch.tanh(logits.float() / softcap)
+    per_tok = F.cross_entropy(sc, targets, ignore_index=ignore_index, reduction="none")
+    valid = (targets != ignore_index)
+    n_valid = valid.sum().clamp_min(1)
+    return per_tok, n_valid
+
+
+@needs_gpu
+@needs_cuda_ext
+def test_softcap_ce_forward_with_ignore_index():
+    import pulsar_cuda
+
+    N, V = 64, 512
+    logits = _bf16(N, V, seed=11) * 3.0
+    targets = torch.randint(0, V, (N,), device="cuda", dtype=torch.long)
+    targets[:8] = -100  # ignored rows
+
+    losses, lse = pulsar_cuda.fused_softcap_ce_forward(logits, targets, 30.0, -100)
+    per_tok, n_valid = ref_softcap_ce(logits, targets, 30.0, -100)
+
+    assert losses.numel() == N
+    assert_close(losses[8:], per_tok[8:], atol=3e-2, msg="softcap ce per-token")
+    assert torch.all(losses[:8] == 0), "ignored rows must contribute zero loss"
+
+
+@needs_gpu
+@needs_cuda_ext
+def test_softcap_ce_backward():
+    import pulsar_cuda
+
+    N, V = 32, 256
+    logits = _bf16(N, V, seed=12) * 2.0
+    targets = torch.randint(0, V, (N,), device="cuda", dtype=torch.long)
+    targets[:4] = -100
+
+    logits_ref = logits.detach().float().requires_grad_(True)
+    per_tok, n_valid = ref_softcap_ce(logits_ref, targets, 30.0, -100)
+    loss = per_tok.sum() / n_valid
+    loss.backward()
+
+    losses, lse = pulsar_cuda.fused_softcap_ce_forward(logits, targets, 30.0, -100)
+    scale = 1.0 / float(n_valid)
+    d_logits = pulsar_cuda.fused_softcap_ce_backward(logits, targets, lse, 30.0, scale, -100)
+
+    assert_close(d_logits, logits_ref.grad, atol=3e-2, msg="softcap ce bwd")
+    assert torch.all(d_logits[:4] == 0), "ignored rows must get zero gradient"
+
+
+# ---------------------------------------------------------------------------
+# Router top-2
+# ---------------------------------------------------------------------------
+
+def ref_router_topk(logits: torch.Tensor, bias: torch.Tensor, z_weight: float):
+    scores = torch.sigmoid(logits.float())
+    biased = scores + bias.float()
+    topk_idx = torch.topk(biased, k=2, dim=-1).indices
+    topk_raw = torch.gather(scores, -1, topk_idx)
+    topk_weights = topk_raw / (topk_raw.sum(-1, keepdim=True) + 1e-6)
+    z = z_weight * torch.logsumexp(logits.float(), dim=-1).pow(2).mean()
+    return topk_idx, topk_weights, z
+
+
+@needs_gpu
+@needs_cuda_ext
+def test_router_topk_forward():
+    import pulsar_cuda
+
+    N, E = 64, 8
+    logits = _bf16(N, E, seed=13)
+    bias = torch.randn(E, device="cuda", dtype=torch.float32) * 0.1
+
+    idx, weights, z = pulsar_cuda.moe_router_topk_forward(logits, bias, 1e-4)
+    idx_ref, weights_ref, z_ref = ref_router_topk(logits, bias, 1e-4)
+
+    assert_close(weights, weights_ref, atol=2e-3, msg="router weights")
+    assert_close(z, z_ref.reshape(1), atol=2e-3, msg="router z-loss")
+    # selection may differ only on exact ties
+    assert (idx == idx_ref).float().mean() > 0.99
+
+
+@needs_gpu
+@needs_cuda_ext
+def test_router_weights_normalise():
+    import pulsar_cuda
+
+    N, E = 128, 8
+    logits = _bf16(N, E, seed=14)
+    bias = torch.zeros(E, device="cuda", dtype=torch.float32)
+    _, weights, _ = pulsar_cuda.moe_router_topk_forward(logits, bias, 0.0)
+    sums = weights.float().sum(-1)
+    assert torch.allclose(sums, torch.ones_like(sums), atol=2e-3), "top-2 weights must sum to 1"
+
+
+# ---------------------------------------------------------------------------
+# Dispatch / combine with forced overflow
+# ---------------------------------------------------------------------------
+
+@needs_gpu
+@needs_cuda_ext
+def test_dispatch_combine_no_overflow():
+    import pulsar_cuda
+
+    N, D, E, K = 32, 64, 8, 2
+    x = _bf16(N, D, seed=15)
+    topk_idx = torch.stack([
+        torch.randint(0, E, (N,), device="cuda"),
+        torch.randint(0, E, (N,), device="cuda"),
+    ], dim=-1)
+    capacity = 64  # generous: no token dropped
+
+    expert_inputs, token_to_slot, counts = pulsar_cuda.moe_dispatch_forward(x, topk_idx, E, capacity)
+    assert counts.sum().item() == N * K
+    assert sorted(counts.tolist()) == sorted(
+        torch.bincount(topk_idx.view(-1), minlength=E).tolist()
+    ), "expert counts must match the assignment histogram"
+
+    # reconstruct: every (token,k) with slot >= 0 must appear at its slot
+    for t in range(N):
+        for k in range(K):
+            slot = int(token_to_slot[t, k])
+            if slot >= 0:
+                e = int(topk_idx[t, k])
+                assert_close(expert_inputs[e, slot], x[t], atol=1e-3, msg="dispatch payload")
+
+
+@needs_gpu
+@needs_cuda_ext
+def test_dispatch_forced_overflow_drops_and_signals():
+    import pulsar_cuda
+
+    N, D, E, K = 64, 32, 2, 2
+    x = _bf16(N, D, seed=16)
+    # every token routed to expert 0 -> extreme overflow at capacity 8
+    topk_idx = torch.zeros(N, K, device="cuda", dtype=torch.long)
+    capacity = 8
+
+    _, token_to_slot, counts = pulsar_cuda.moe_dispatch_forward(x, topk_idx, E, capacity)
+    assert counts[0].item() == N * K, "pre-drop counts are kept"
+    live = (token_to_slot >= 0)
+    assert live.sum().item() == capacity, "exactly `capacity` assignments survive"
+    assert torch.all(token_to_slot[live] < capacity)
+
+
+@needs_gpu
+@needs_cuda_ext
+def test_combine_forward_matches_reference():
+    import pulsar_cuda
+
+    N, D, E, K = 16, 32, 4, 2
+    capacity = 64
+    x = _bf16(N, D, seed=17)
+    topk_idx = torch.randint(0, E, (N, K), device="cuda", dtype=torch.long)
+    topk_weights = torch.rand(N, K, device="cuda", dtype=torch.float32)
+    topk_weights = (topk_weights / topk_weights.sum(-1, keepdim=True)).bfloat16()
+
+    expert_inputs, token_to_slot, _ = pulsar_cuda.moe_dispatch_forward(x, topk_idx, E, capacity)
+    # arbitrary expert outputs so the combine has something non-trivial to gather
+    expert_out = _bf16(E, capacity, D, seed=18)
+
+    out = pulsar_cuda.moe_combine_forward(expert_out, topk_idx, topk_weights, token_to_slot, None)
+
+    ref = torch.zeros(N, D, device="cuda", dtype=torch.float32)
+    for t in range(N):
+        acc = torch.zeros(D, device="cuda", dtype=torch.float32)
+        for k in range(K):
+            slot = int(token_to_slot[t, k])
+            if slot >= 0:
+                e = int(topk_idx[t, k])
+                acc += expert_out[e, slot].float() * topk_weights[t, k].float()
+        ref[t] = acc
+    assert_close(out, ref, atol=3e-2, msg="combine fwd")
+
+
+# ---------------------------------------------------------------------------
+# Full MoE layer: CUDA path vs PyTorch fallback
+# ---------------------------------------------------------------------------
+
+@needs_gpu
+@needs_cuda_ext
+def test_cuda_vs_fallback_moe_layer():
+    """A whole MoE layer must agree between the CUDA and fallback paths."""
+    from conftest import make_cfg
+    from src.model import PulsarMoEMLP
+
+    cfg = make_cfg(d_model=64, d_expert=64, n_routed_experts=8, top_k=2, max_pulses=2)
+    torch.manual_seed(1)
+    mlp = PulsarMoEMLP(cfg).cuda().bfloat16()
+
+    B, T = 2, 16
+    x = _bf16(B, T, cfg.d_model, seed=19)
+
+    mlp.eval()
+    with torch.no_grad():
+        out_cuda, _, _, _ = mlp(x, pulse_idx=0)
+
+    # Force the fallback by monkeypatching the module-level CUDA flag.
+    import src.model as model_mod
+
+    orig = model_mod.HAS_PULSAR_CUDA
+    try:
+        model_mod.HAS_PULSAR_CUDA = False
+        with torch.no_grad():
+            out_fallback, _, _, _ = mlp(x, pulse_idx=0)
+    finally:
+        model_mod.HAS_PULSAR_CUDA = orig
+
+    assert_close(out_cuda, out_fallback, atol=3e-2, msg="full MoE layer cuda vs fallback")

@@ -40,6 +40,11 @@ class PulsarConfig:
     # checkpoint format, so it can be raised mid-run if the logged drop rate is high.
     moe_capacity_factor: float = 1.12
     moe_capacity_align: int = 32
+    # Per-pulse balancing bias. Drops are a per-pulse phenomenon (early pulses route
+    # differently from late ones), so a single across-pulse bias can leave one pulse
+    # systematically over-loaded. Default off: it changes training dynamics, and old
+    # checkpoints carry a [E] bias which is migrated by broadcasting.
+    per_pulse_bias: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -534,7 +539,14 @@ class PulsarMoEMLP(nn.Module):
         self.routed_scale = nn.Parameter(torch.ones(cfg.max_pulses, cfg.d_model, dtype=torch.float32))
 
         # Global Across-Pulse Auxiliary-Loss-Free Bias
-        self.register_buffer("expert_bias", torch.zeros(cfg.n_routed_experts, dtype=torch.float32), persistent=True)
+        if cfg.per_pulse_bias:
+            self.register_buffer(
+                "expert_bias",
+                torch.zeros(cfg.max_pulses, cfg.n_routed_experts, dtype=torch.float32),
+                persistent=True,
+            )
+        else:
+            self.register_buffer("expert_bias", torch.zeros(cfg.n_routed_experts, dtype=torch.float32), persistent=True)
         self.register_buffer("expert_counts_accum", torch.zeros(cfg.n_routed_experts, dtype=torch.float32), persistent=False)
         self.register_buffer("expert_pulse_counts", torch.zeros(cfg.max_pulses, cfg.n_routed_experts, dtype=torch.float32), persistent=False)
         # Drop statistics, accumulated on the GPU and drained by pop_moe_stats().
@@ -561,10 +573,12 @@ class PulsarMoEMLP(nn.Module):
             logits.float(), dim=-1
         ).pow(2).mean()
         if HAS_PULSAR_CUDA and logits.is_cuda and hasattr(pulsar_cuda, "moe_router_topk_forward"):
-            topk_idx, topk_weights = _FusedMoERouterFunction.apply(logits, self.expert_bias)
+            bias = self.expert_bias[pulse_idx] if self.cfg.per_pulse_bias else self.expert_bias
+            topk_idx, topk_weights = _FusedMoERouterFunction.apply(logits, bias)
         else:
             scores = torch.sigmoid(logits.float())
-            biased_scores = scores + self.expert_bias
+            bias = self.expert_bias[pulse_idx] if self.cfg.per_pulse_bias else self.expert_bias
+            biased_scores = scores + bias
             _, topk_idx = torch.topk(biased_scores, k=self.cfg.top_k, dim=-1)  # [N, 2]
             topk_raw = torch.gather(scores, -1, topk_idx)
             topk_weights = (topk_raw / (topk_raw.sum(dim=-1, keepdim=True) + 1e-6)).to(x.dtype)
@@ -656,11 +670,24 @@ class PulsarMoEMLP(nn.Module):
             out = (shared_out + routed_out * r_scale).view(B, T, D)
         return out, z_loss, topk_weights.detach().mean(), bincounts
 
-    def update_biases(self, bias_lr: float = 0.001):
-        avg_count = self.expert_counts_accum.mean()
-        self.expert_bias.add_(bias_lr * torch.sign(avg_count - self.expert_counts_accum))
-        self.expert_bias.clamp_(-0.5, 0.5)
-        self.expert_counts_accum.zero_()
+    def update_biases(self, bias_lr: float = 0.001, num_pulses: int | None = None):
+        """Auxiliary-loss-free bias update.
+
+        With per_pulse_bias enabled each pulse's bias is updated from that pulse's own
+        counts, because load imbalance is a per-pulse phenomenon.
+        """
+        if self.cfg.per_pulse_bias:
+            k = num_pulses or self.cfg.default_pulses
+            counts = self.expert_pulse_counts[:k]
+            avg = counts.mean(dim=1, keepdim=True)
+            self.expert_bias[:k].add_(bias_lr * torch.sign(avg - counts))
+            self.expert_bias[:k].clamp_(-0.5, 0.5)
+            self.expert_pulse_counts[:k].zero_()
+        else:
+            avg_count = self.expert_counts_accum.mean()
+            self.expert_bias.add_(bias_lr * torch.sign(avg_count - self.expert_counts_accum))
+            self.expert_bias.clamp_(-0.5, 0.5)
+            self.expert_counts_accum.zero_()
 
 
 class PulsarBlock(nn.Module):
@@ -802,10 +829,38 @@ class PulsarForCausalLM(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def update_expert_biases(self, bias_lr: float = 0.001):
+    def update_expert_biases(self, bias_lr: float = 0.001, num_pulses: int | None = None):
         """Update auxiliary-loss-free routing biases globally across all blocks."""
         for block in self.core:
-            block.mlp.update_biases(bias_lr=bias_lr)
+            block.mlp.update_biases(bias_lr=bias_lr, num_pulses=num_pulses)
+
+    def _migrate_checkpoint_bias(self, state_dict: dict) -> dict:
+        """Broadcast an old [E] expert_bias across pulses for per_pulse_bias models.
+
+        Old checkpoints store a single across-pulse bias. Enabling per-pulse bias would
+        otherwise fail to load it; broadcasting is the neutral migration (every pulse
+        starts from the shared value).
+        """
+        if not self.cfg.per_pulse_bias:
+            return state_dict
+        migrated = dict(state_dict)
+        default_bias = torch.zeros(self.cfg.n_routed_experts, dtype=torch.float32)
+        for name, buf in self.named_buffers():
+            if not name.endswith("expert_bias"):
+                continue
+            cur = migrated.get(name)
+            if cur is not None and cur.shape == buf.shape:
+                continue
+            src = cur if cur is not None else default_bias
+            if src.shape == (self.cfg.n_routed_experts,):
+                migrated[name] = (
+                    src.to(torch.float32).unsqueeze(0).expand(self.cfg.max_pulses, -1).clone()
+                )
+                print(f"[migrate] {name}: [E] -> [max_pulses, E] by broadcast")
+        return migrated
+
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        return super().load_state_dict(self._migrate_checkpoint_bias(state_dict), strict=strict, assign=assign)
 
     @torch.no_grad()
     def pop_moe_stats(self) -> dict:

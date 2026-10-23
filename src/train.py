@@ -305,6 +305,9 @@ def train():
     parser.add_argument("--adam-lr", type=float, default=6e-4, help="AdamW base LR for 1D norms and embeddings")
     parser.add_argument("--weight-decay", type=float, default=0.1, help="Muon weight decay")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Max gradient norm clip value")
+    parser.add_argument("--per-pulse-bias", action="store_true",
+                        help="Per-pulse MoE balancing bias (default off). Changes training dynamics; "
+                             "old [E] checkpoints migrate by broadcasting.")
     parser.add_argument("--moe-capacity-factor", type=float, default=None,
                         help="Override MoE capacity headroom (default 1.12). Raising it mid-run is "
                              "safe: capacity changes no checkpoint format.")
@@ -395,6 +398,9 @@ def train():
     )
     if args.moe_capacity_factor is not None:
         cfg.moe_capacity_factor = args.moe_capacity_factor
+    cfg.per_pulse_bias = args.per_pulse_bias
+    if args.per_pulse_bias:
+        print("[Pulsar] Per-pulse balancing bias: ON")
     print(f"[Pulsar] MoE capacity factor: {cfg.moe_capacity_factor} "
           f"(align {cfg.moe_capacity_align}) | drop warning above {args.drop_warn_pct}%")
     model = PulsarForCausalLM(cfg).to(device=device)
@@ -574,7 +580,7 @@ def train():
         t_opt_start = time.time()
         optimizer.step()
         raw_model = getattr(model, "_orig_mod", model)
-        raw_model.update_expert_biases(bias_lr=0.001)
+        raw_model.update_expert_biases(bias_lr=0.001, num_pulses=args.num_pulses)
         t_opt_total = time.time() - t_opt_start
 
         # Step timing, speed and hardware utilization

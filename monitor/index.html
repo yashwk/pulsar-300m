@@ -1757,6 +1757,59 @@
       </div>
     </div>
 
+    <!-- Training Health: the diagnostics added in the audit fixes -->
+    <div class="subsystem-grid">
+      <div class="subsystem-card">
+        <div class="subsystem-title">Training Health</div>
+        <table class="pulse-breakdown-table">
+          <thead>
+            <tr>
+              <th>Signal</th>
+              <th>Value</th>
+              <th>Meaning</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Val CE (final pulse)</strong></td>
+              <td id="healthValCe" style="color: var(--white);">--</td>
+              <td style="color: var(--text-dim);">Metric <code>best.pt</code> keys on</td>
+            </tr>
+            <tr>
+              <td><strong>Latent gain (p1 &minus; pK)</strong></td>
+              <td id="healthLatentGain" style="color: var(--emerald);">--</td>
+              <td style="color: var(--text-dim);">Positive = recurrent pulses help</td>
+            </tr>
+            <tr>
+              <td><strong>MoE capacity</strong></td>
+              <td id="healthCapacity">--</td>
+              <td style="color: var(--text-dim);">Slots per expert per pulse</td>
+            </tr>
+            <tr>
+              <td><strong>MoE drop rate</strong></td>
+              <td id="healthDropRate">--</td>
+              <td style="color: var(--text-dim);">Tokens rejected by capacity</td>
+            </tr>
+            <tr>
+              <td><strong>Drops per pulse</strong></td>
+              <td id="healthDropPerPulse">--</td>
+              <td style="color: var(--text-dim);">P3 is usually worst</td>
+            </tr>
+            <tr>
+              <td><strong>Pulse residual scale</strong></td>
+              <td id="healthPulseScale">--</td>
+              <td style="color: var(--text-dim);">Should stay near 1, 0.5, 0.33</td>
+            </tr>
+            <tr>
+              <td><strong>Routed scale</strong></td>
+              <td id="healthRoutedScale">--</td>
+              <td style="color: var(--text-dim);">Learned expert weighting</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
     <!-- Architecture & Information Theory Diagnostic Cards -->
     <div class="subsystem-grid">
       <!-- Card 1: Pulsar Recurrent Core Engine -->
@@ -3255,6 +3308,60 @@
         const lrBadge = document.getElementById('badgeLRSchedule');
         if (lrBadge) {
           lrBadge.innerText = `Muon: ${(data.lr_muon || 0).toFixed(3)} | Adam: ${(data.lr_adam || 0).toExponential(1)}`;
+        }
+
+        // Training Health card: the diagnostics added during the audit fixes.
+        const setText = (id, txt, color) => {
+          const el = document.getElementById(id);
+          if (!el) return;
+          el.innerText = txt;
+          if (color) el.style.color = color;
+        };
+
+        setText('healthValCe', (data.val_ce_final != null) ? data.val_ce_final.toFixed(4) : '--');
+
+        if (data.latent_gain != null) {
+          const lg = data.latent_gain;
+          setText('healthLatentGain', `${lg > 0 ? '+' : ''}${lg.toFixed(4)}`,
+                  lg > 0 ? 'var(--emerald)' : 'var(--rose)');
+        } else {
+          setText('healthLatentGain', '--');
+        }
+
+        setText('healthCapacity', (data.moe_capacity != null) ? String(data.moe_capacity) : '--');
+
+        // Drop rate: amber past 2%, red past 5%. High drops mean capacity is too tight
+        // and tokens are being silently discarded.
+        if (data.moe_drop_rate != null) {
+          const pct = data.moe_drop_rate * 100;
+          const col = pct > 5 ? 'var(--rose)' : (pct > 2 ? 'var(--amber)' : 'var(--emerald)');
+          setText('healthDropRate', `${pct.toFixed(2)}%`, col);
+        } else {
+          setText('healthDropRate', '--');
+        }
+
+        if (Array.isArray(data.moe_drop_per_pulse) && data.moe_drop_per_pulse.length) {
+          const parts = data.moe_drop_per_pulse.map(d =>
+            `P${d.pulse} ${(d.drop_rate * 100).toFixed(2)}%`);
+          const worst = Math.max(...data.moe_drop_per_pulse.map(d => d.drop_rate));
+          setText('healthDropPerPulse', parts.join('  '),
+                  worst > 0.05 ? 'var(--rose)' : (worst > 0.02 ? 'var(--amber)' : 'var(--white)'));
+        } else {
+          setText('healthDropPerPulse', '--');
+        }
+
+        // These were provably frozen before the precision fix, so a flat line here is
+        // a regression signal, not a steady state.
+        if (Array.isArray(data.pulse_res_scale_mean) && data.pulse_res_scale_mean.length) {
+          setText('healthPulseScale', data.pulse_res_scale_mean.map(v => v.toFixed(3)).join('  /  '));
+        } else {
+          setText('healthPulseScale', '--');
+        }
+
+        if (Array.isArray(data.routed_scale_mean) && data.routed_scale_mean.length) {
+          setText('healthRoutedScale', data.routed_scale_mean.map(v => v.toFixed(3)).join('  /  '));
+        } else {
+          setText('healthRoutedScale', '--');
         }
 
         // Subsystem Diagnostics Card 1 (Dynamic Recurrent Core Table)

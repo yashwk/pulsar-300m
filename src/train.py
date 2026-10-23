@@ -316,9 +316,13 @@ def train():
     parser.add_argument("--adam-lr", type=float, default=6e-4, help="AdamW base LR for 1D norms and embeddings")
     parser.add_argument("--weight-decay", type=float, default=0.1, help="Muon weight decay")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Max gradient norm clip value")
-    parser.add_argument("--per-pulse-bias", action="store_true",
-                        help="Per-pulse MoE balancing bias (default off). Changes training dynamics; "
-                             "old [E] checkpoints migrate by broadcasting.")
+    parser.add_argument("--bias-lr", type=float, default=0.01,
+                        help="MoE balancing-bias step. 0.001 was 10x too slow to track the "
+                             "routing drift seen at step 55+.")
+    parser.add_argument("--per-pulse-bias", action=argparse.BooleanOptionalAction, default=None,
+                        help="Per-pulse MoE balancing bias (default ON). One global bias is diluted "
+                             "by whichever pulse needs no correction. Use --no-per-pulse-bias to "
+                             "disable. Old [E] checkpoints migrate by broadcasting.")
     parser.add_argument("--grad-checkpoint", action="store_true",
                         help="Recompute core blocks in backward instead of retaining activations. "
                              "Needed for long context (T >= 8k); trades ~30% speed for large savings.")
@@ -444,9 +448,10 @@ def train():
     )
     if args.moe_capacity_factor is not None:
         cfg.moe_capacity_factor = args.moe_capacity_factor
-    cfg.per_pulse_bias = args.per_pulse_bias
-    if args.per_pulse_bias:
-        print("[Pulsar] Per-pulse balancing bias: ON")
+    # None means "use the config default" (True); the flag only overrides when given.
+    if args.per_pulse_bias is not None:
+        cfg.per_pulse_bias = args.per_pulse_bias
+    print(f"[Pulsar] Per-pulse balancing bias: {'ON' if cfg.per_pulse_bias else 'OFF'}")
     if args.no_save:
         print("[Pulsar] Checkpoint saving: DISABLED (--no-save)")
     print(f"[Pulsar] MoE capacity factor: {cfg.moe_capacity_factor} "
@@ -677,7 +682,7 @@ def train():
         t_opt_start = time.time()
         optimizer.step()
         raw_model = getattr(model, "_orig_mod", model)
-        raw_model.update_expert_biases(bias_lr=0.001, num_pulses=args.num_pulses)
+        raw_model.update_expert_biases(bias_lr=args.bias_lr, num_pulses=args.num_pulses)
         t_opt_total = time.time() - t_opt_start
 
         # Step timing, speed and hardware utilization
@@ -898,6 +903,11 @@ def train():
             # Latent gain: p1 - pK over the whole validation set. Positive means the
             # recurrent pulses help; this is the signal on whether looping pays off.
             "latent_gain": cur_latent_gain,
+            # Per-pulse expert load: the aggregate is what hid the imbalance.
+            "expert_pcts_per_pulse": (
+                [[round(float(v), 2) for v in row] for row in step_metrics["expert_pcts_per_pulse"].tolist()]
+                if step_metrics.get("expert_pcts_per_pulse") is not None else None
+            ),
             # Learned scales - these were provably frozen before the precision fix, so
             # logging them makes a regression immediately visible.
             "pulse_res_scale_mean": [round(float(v), 5) for v in pulse_res_scale_mean],

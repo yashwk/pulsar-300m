@@ -51,7 +51,11 @@ class PulsarConfig:
     # differently from late ones), so a single across-pulse bias can leave one pulse
     # systematically over-loaded. Default off: it changes training dynamics, and old
     # checkpoints carry a [E] bias which is migrated by broadcasting.
-    per_pulse_bias: bool = False
+    # Per-pulse balancing bias. The three pulses route differently (measured at
+    # step 80: P1 dropped 5.4% of assignments while P2/P3 dropped 23.6%/23.7%), so a
+    # single global bias vector is diluted by whichever pulse needs no correction.
+    # Migration for old [E] checkpoints is handled in _migrate_checkpoint_bias().
+    per_pulse_bias: bool = True
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -1319,6 +1323,13 @@ class PulsarForCausalLM(nn.Module):
         tot_counts = global_expert_counts.sum().clamp_min(1.0)
         expert_pct = (global_expert_counts.float() / tot_counts) * 100.0
 
+        # Per-pulse load. The aggregate above is what hid the imbalance: P1 routing
+        # nearly uniformly while P2/P3 skewed looked balanced once averaged, and a
+        # single global bias cannot correct for pulses that need different nudges.
+        pulse_stacked = pulse_expert_counts                      # [K, E]
+        pulse_tot = pulse_stacked.sum(dim=1, keepdim=True).clamp_min(1.0)
+        expert_pct_per_pulse = (pulse_stacked.float() / pulse_tot) * 100.0
+
         def as_tensor(value):
             return value if isinstance(value, torch.Tensor) else torch.tensor(float(value), device=input_ids.device)
 
@@ -1335,6 +1346,7 @@ class PulsarForCausalLM(nn.Module):
             "router_confidence": gate_confidence_accum / (self.cfg.n_core * max(1, K)),
             "router_max_bias": max_bias,
             "expert_pcts": expert_pct,
+            "expert_pcts_per_pulse": expert_pct_per_pulse,
             "input_mix_lambda": torch.sigmoid(self.input_mix_logit[min(1, K - 1)]).detach().mean(),
             # Legacy scalar accessors
             "loss_pulse_1": pulse_loss_t[0] if pulse_loss_t else zero,

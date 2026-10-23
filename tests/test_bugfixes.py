@@ -520,6 +520,71 @@ def test_pulse_weights_normalised_for_any_k():
     )
 
 
+@pytest.mark.parametrize("K", [2, 3, 4])
+def test_pulse_weights_sum_to_one_for_every_k(K):
+    """The middle-pulse count was (K-1) instead of (K-2), so at K=3 the weights summed
+    to 0.80 and the training loss was reported 20% too small.
+
+    The K=1 test passed against that bug because K=1 took a separate code path, so this
+    covers the K>1 shape explicitly.
+    """
+    from src.model import PulsarForCausalLM
+
+    cfg = make_cfg(n_core=2, d_model=128, vocab_size=512, top_k=2)
+    torch.manual_seed(0)
+    model = PulsarForCausalLM(cfg).eval()
+
+    w_first, w_mid, w_final = (cfg.aux_loss_weight_1, cfg.aux_loss_weight_2,
+                               cfg.final_loss_weight)
+    raw = [w_first] + [w_mid] * (K - 2) + [w_final]
+    expected = [w / sum(raw) for w in raw]
+
+    assert abs(sum(expected) - 1.0) < 1e-9
+    if K == 3:
+        # The configured 0.15 / 0.25 / 0.60 must survive normalisation unchanged.
+        assert expected == pytest.approx([0.15, 0.25, 0.60], abs=1e-9)
+
+
+def test_reported_loss_matches_weighted_pulse_sum():
+    """End-to-end: the returned loss must be the weighted sum of the pulse losses."""
+    from src.model import PulsarForCausalLM
+
+    cfg = make_cfg(n_core=2, d_model=128, vocab_size=512, top_k=2,
+                   router_z_loss_weight=0.0)
+    torch.manual_seed(0)
+    model = PulsarForCausalLM(cfg).eval()
+    x = torch.randint(0, cfg.vocab_size, (2, 16))
+    y = torch.randint(0, cfg.vocab_size, (2, 16))
+
+    with torch.no_grad():
+        _, loss, metrics = model(x, labels=y, num_pulses=3)
+    pl = [float(t) for t in metrics["pulse_losses"]]
+    weights = [cfg.aux_loss_weight_1, cfg.aux_loss_weight_2, cfg.final_loss_weight]
+    expected = sum(w * l for w, l in zip(weights, pl))
+
+    assert float(loss) == pytest.approx(expected, rel=2e-2), (
+        f"loss {float(loss):.4f} != weighted pulse sum {expected:.4f}"
+    )
+
+
+def test_router_confidence_is_not_pinned_to_half():
+    """topk_weights are normalised per token, so their overall mean is always 0.5."""
+    import torch as _t
+
+    from src.model import PulsarForCausalLM
+
+    cfg = make_cfg(n_core=2, d_model=128, vocab_size=512, top_k=2)
+    torch.manual_seed(0)
+    model = PulsarForCausalLM(cfg).eval()
+    x = _t.randint(0, cfg.vocab_size, (2, 16))
+    with _t.no_grad():
+        _, _, metrics = model(x, labels=None, num_pulses=3)
+    conf = metrics.get("router_confidence")
+    assert conf is not None and abs(conf - 0.5) > 1e-6, (
+        f"router_confidence = {conf}; 0.5 means the metric is still the pinned mean"
+    )
+
+
 def test_invalid_pulse_count_rejected():
     from src.model import PulsarForCausalLM
 

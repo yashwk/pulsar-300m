@@ -875,7 +875,12 @@ class PulsarMoEMLP(nn.Module):
 
             r_scale = self.routed_scale[pulse_idx].to(x.dtype)
             out = (shared_out + routed_out * r_scale).view(B, T, D)
-        return out, z_loss, topk_weights.detach().mean(), bincounts
+        # Router confidence = mean max gating weight. topk_weights are normalised to sum
+        # to 1 per token, so their mean over all (token, k) entries is exactly 0.5 no
+        # matter what the router does - the old value was pinned at 0.5 by construction.
+        # The per-token max is the quantity that actually moves as routing sharpens.
+        mean_max_weight = topk_weights.detach().max(dim=-1).values.mean() if topk_weights.ndim == 2 else topk_weights.detach().mean()
+        return out, z_loss, mean_max_weight, bincounts
 
     def update_biases(self, bias_lr: float = 0.001, num_pulses: int | None = None):
         """Auxiliary-loss-free bias update.
@@ -1175,17 +1180,18 @@ class PulsarForCausalLM(nn.Module):
         # sum to 1.0. The configured 0.15/0.25/0.60 already sum to 1 at K=3, but at
         # K=1 the single pulse would have carried 0.60 and the reported loss would be
         # 60% of the true CE; at K=2 the pair would sum to 0.75.
+        # Weights are (w_first, w_mid x (K-2), w_final): K-2 middle pulses, not K-1.
+        # Using (K-1) counted a middle pulse that does not exist, so at K=3 the sum was
+        # 0.80 and the loss was reported 20% too small.
+        w_first = self.cfg.aux_loss_weight_1
         w_mid = self.cfg.aux_loss_weight_2
         w_final = self.cfg.final_loss_weight
-        w_sum = (self.cfg.aux_loss_weight_2 if K >= 2 else 0.0) * (K - 1) + w_final
-        w_first = self.cfg.aux_loss_weight_1 if K >= 2 else 0.0
-        w_sum += w_first
-        last_only = (K == 1)
-        pulse_weights = (
-            [w_final / w_sum] if last_only
-            else [(w_final if k == K - 1 else (w_first if k == 0 else w_mid)) / w_sum
-                  for k in range(K)]
-        )
+        if K == 1:
+            raw = [w_final]
+        else:
+            raw = [w_first] + [w_mid] * (K - 2) + [w_final]
+        w_sum = sum(raw)
+        pulse_weights = [w / w_sum for w in raw]
 
         pulse_losses: list[torch.Tensor] = []
         pulse_deltas: list[torch.Tensor] = []

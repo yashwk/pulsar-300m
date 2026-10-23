@@ -580,6 +580,7 @@ def train():
     last_val_ppl = math.exp(min(last_val_loss, 20.0)) if last_val_loss is not None else None
     last_val_pulse_losses = None
     last_live_canaries = []
+    last_latent_gain = None
     last_val_pulse_ppls = None
     latest_canaries = []
 
@@ -747,6 +748,7 @@ def train():
         val_ppl = None
         val_pulse_losses = None
         val_pulse_ppls = None
+        latent_gain = None   # computed only on eval steps; must be reset every step
         # Periodic Evaluation and Canary Generation
         if step % args.eval_every == 0 or step == args.max_steps or interrupted:
             eval_metrics = evaluate_loss(
@@ -809,6 +811,9 @@ def train():
 
         # On non-eval steps these are None; fall back to the last eval so the JSONL
         # record keeps the most recent validation numbers instead of nulls.
+        if latent_gain is not None:
+            last_latent_gain = round(latent_gain, 4)
+        cur_latent_gain = last_latent_gain
         cur_vpl = val_pulse_losses if val_pulse_losses is not None else last_val_pulse_losses
         cur_vppl = val_pulse_ppls if val_pulse_ppls is not None else last_val_pulse_ppls
 
@@ -869,7 +874,7 @@ def train():
             ] if moe_stats else None,
             # Latent gain: p1 - pK over the whole validation set. Positive means the
             # recurrent pulses help; this is the signal on whether looping pays off.
-            "latent_gain": round(latent_gain, 4) if val_loss is not None else None,
+            "latent_gain": cur_latent_gain,
             # Learned scales - these were provably frozen before the precision fix, so
             # logging them makes a regression immediately visible.
             "pulse_res_scale_mean": [round(float(v), 5) for v in pulse_res_scale_mean],

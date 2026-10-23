@@ -1615,7 +1615,7 @@
         <div class="kpi-sub-row">
           <span id="kpiStepTime">--s/step</span>
           <span style="color: var(--text-dim);">•</span>
-          <span id="kpiVramHeadroom">-- GB / 8.0 GB</span>
+          <span id="kpiVramHeadroom">-- GB / -- GB</span>
         </div>
       </div>
 
@@ -1680,8 +1680,8 @@
         <div class="chart-header">
           <div class="chart-title-wrap">
             <span class="chart-heading">Gradient Norms & Optimizer Health (#1)</span>
-            <span class="chart-status-pill" id="badgeGradStatus">Clip Limit: 1.0</span>
-            <span class="chart-status-pill" id="badgeLRSchedule">Muon: 0.020 | Adam: 6.0e-04</span>
+            <span class="chart-status-pill" id="badgeGradStatus">Clip Limit: --</span>
+            <span class="chart-status-pill" id="badgeLRSchedule">Muon: -- | Adam: --</span>
           </div>
           <div class="chart-actions">
             <button class="chart-mini-btn" onclick="resetSingleZoom(chart2)">Reset Zoom</button>
@@ -1697,7 +1697,7 @@
         <div class="chart-header">
           <div class="chart-title-wrap">
             <span class="chart-heading">Recurrent Pulse Intelligence Gain (#4)</span>
-            <span class="chart-status-pill" id="badgePPLGain">+0.78 PPL Saved</span>
+            <span class="chart-status-pill" id="badgePPLGain">-- PPL Saved</span>
           </div>
           <div class="chart-actions">
             <button class="chart-mini-btn" onclick="resetSingleZoom(chart3)">Reset Zoom</button>
@@ -1713,7 +1713,7 @@
         <div class="chart-header">
           <div class="chart-title-wrap">
             <span class="chart-heading">Sparse MoE Expert Routing & Load Distribution</span>
-            <span class="chart-status-pill" id="badgeMoEBalance">Uniform Baseline: 12.5%</span>
+            <span class="chart-status-pill" id="badgeMoEBalance">Uniform: --</span>
           </div>
           <div class="chart-actions">
             <button class="chart-mini-btn" onclick="resetSingleZoom(chart4)">Reset Zoom</button>
@@ -1745,7 +1745,7 @@
         <div class="chart-header">
           <div class="chart-title-wrap">
             <span class="chart-heading">Hardware Saturation & Performance Health</span>
-            <span class="chart-status-pill" id="badgeHardwarePerf">11.5k tok/s • 37% MFU</span>
+            <span class="chart-status-pill" id="badgeHardwarePerf">-- tok/s • -- MFU</span>
           </div>
           <div class="chart-actions">
             <button class="chart-mini-btn" onclick="resetSingleZoom(chart6)">Reset Zoom</button>
@@ -2077,7 +2077,7 @@
           { label: 'Total Grad Norm', borderColor: '#ffffff', borderWidth: 1.8, data: [], pointRadius: 0 },
           { label: 'Muon Norm', borderColor: '#10b981', borderWidth: 1.4, data: [], pointRadius: 0 },
           { label: 'Adam Norm', borderColor: '#cbd5e1', borderWidth: 1.4, data: [], pointRadius: 0 },
-          { label: 'Clip Limit (1.0)', borderColor: '#ef4444', borderWidth: 1, borderDash: [4, 4], data: [], pointRadius: 0 }
+          { label: 'Clip Limit', borderColor: '#ef4444', borderWidth: 1, borderDash: [4, 4], data: [], pointRadius: 0 }
         ]
       },
       options: {
@@ -2169,7 +2169,7 @@
           { label: 'Expert 5', borderColor: '#06b6d4', borderWidth: 1.5, data: [], pointRadius: 0, yAxisID: 'y' },
           { label: 'Expert 6', borderColor: '#f97316', borderWidth: 1.5, data: [], pointRadius: 0, yAxisID: 'y' },
           { label: 'Expert 7', borderColor: '#f43f5e', borderWidth: 1.5, data: [], pointRadius: 0, yAxisID: 'y' },
-          { label: 'Ideal (12.5%)', borderColor: '#64748b', borderWidth: 1.4, borderDash: [4, 4], data: [], pointRadius: 0, yAxisID: 'y' },
+          { label: 'Ideal', borderColor: '#64748b', borderWidth: 1.4, borderDash: [4, 4], data: [], pointRadius: 0, yAxisID: 'y' },
           { label: 'Router Bias |b_i|', borderColor: '#94a3b8', borderWidth: 1.2, borderDash: [2, 2], data: [], pointRadius: 0, yAxisID: 'y1' }
         ]
       },
@@ -2783,7 +2783,12 @@
       chart2.data.datasets[0].data = slice.map(r => r.grad_norm_total ?? r.grad_total ?? null);
       chart2.data.datasets[1].data = slice.map(r => r.grad_norm_muon ?? r.grad_muon ?? null);
       chart2.data.datasets[2].data = slice.map(r => r.grad_norm_adam ?? r.grad_adam ?? null);
-      chart2.data.datasets[3].data = slice.map(() => 1.0);
+      // Clip limit line: use the run's reported value, falling back to the last known
+      // one. This used to be a flat 1.0 regardless of --grad-clip.
+      const clipNow = (latestR && latestR.grad_clip != null) ? latestR.grad_clip
+                    : (slice.length ? slice[slice.length - 1].grad_clip : null);
+      chart2.data.datasets[3].label = clipNow != null ? `Clip Limit (${clipNow})` : 'Clip Limit';
+      chart2.data.datasets[3].data = slice.map(r => (r.grad_clip != null ? r.grad_clip : clipNow));
       chart2.update('none');
 
       // 3. Chart 3: Recurrent Pulse Intelligence Gain (#4)
@@ -3223,8 +3228,12 @@
         document.getElementById('kpiGradTotal').innerText = grad > 0 ? grad.toFixed(3) : '--';
         const gradBadge = document.getElementById('kpiGradBadge');
         if (gradBadge) {
-          gradBadge.innerText = grad <= 1.0 ? 'Norm < 1.0 (Stable)' : 'Clipped 1.0';
-          gradBadge.className = `kpi-pill ${grad <= 1.0 ? 'kpi-pill-emerald' : 'kpi-pill-amber'}`;
+          const cl = (data.grad_clip != null) ? data.grad_clip : null;
+          const stable = cl == null ? true : grad <= cl;
+          gradBadge.innerText = stable
+            ? (cl == null ? 'Norm (Stable)' : `Norm < ${cl} (Stable)`)
+            : `Clipped @ ${cl}`;
+          gradBadge.className = `kpi-pill ${stable ? 'kpi-pill-emerald' : 'kpi-pill-amber'}`;
         }
         const gMuon = data.grad_norm_muon ?? data.grad_muon ?? 0;
         const gAdam = data.grad_norm_adam ?? data.grad_adam ?? 0;
@@ -3302,7 +3311,14 @@
         // Badges in Charts
         const gradStatusBadge = document.getElementById('badgeGradStatus');
         if (gradStatusBadge) {
-          gradStatusBadge.innerText = `Total: ${grad > 0 ? grad.toFixed(3) : '--'} ${grad <= 1.0 ? '(Stable)' : '(Clipped)'}`;
+          // Compare against the run's own clip value; 1.0 was assumed and is wrong for
+          // any run that changes --grad-clip.
+          const clipLimit = (data.grad_clip != null) ? data.grad_clip : null;
+          const state = (clipLimit == null || grad <= 0) ? ''
+                      : (grad <= clipLimit ? '(Stable)' : '(Clipped)');
+          gradStatusBadge.innerText =
+            `Total: ${grad > 0 ? grad.toFixed(3) : '--'}${state ? ' ' + state : ''}` +
+            (clipLimit != null ? ` | Clip ${clipLimit}` : '');
         }
 
         const lrBadge = document.getElementById('badgeLRSchedule');

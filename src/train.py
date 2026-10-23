@@ -833,6 +833,7 @@ def train():
             # Schedule shape for the dashboard's phase label. Without these it falls
             # back to hardcoded guesses (a 100-step warmup), which mislabels the phase
             # for any run whose warmup is not 100.
+            "grad_clip": args.grad_clip,
             "warmup_steps": args.warmup_steps,
             "cooldown_steps": args.cooldown_steps,
             "lr_schedule": args.lr_schedule,

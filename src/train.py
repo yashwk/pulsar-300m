@@ -284,6 +284,11 @@ def train():
     parser.add_argument("--adam-lr", type=float, default=6e-4, help="AdamW base LR for 1D norms and embeddings")
     parser.add_argument("--weight-decay", type=float, default=0.1, help="Muon weight decay")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Max gradient norm clip value")
+    parser.add_argument("--moe-capacity-factor", type=float, default=None,
+                        help="Override MoE capacity headroom (default 1.12). Raising it mid-run is "
+                             "safe: capacity changes no checkpoint format.")
+    parser.add_argument("--drop-warn-pct", type=float, default=2.0,
+                        help="Warn when overall MoE drop rate exceeds this percentage")
     parser.add_argument("--no-stochastic-rounding", action="store_true",
                         help="Disable stochastic rounding for bf16 weights (default: on). "
                              "Without SR, sub-ulp updates and weight decay round away.")
@@ -367,6 +372,10 @@ def train():
         base_seq_len=1024,
         default_pulses=args.num_pulses,
     )
+    if args.moe_capacity_factor is not None:
+        cfg.moe_capacity_factor = args.moe_capacity_factor
+    print(f"[Pulsar] MoE capacity factor: {cfg.moe_capacity_factor} "
+          f"(align {cfg.moe_capacity_align}) | drop warning above {args.drop_warn_pct}%")
     model = PulsarForCausalLM(cfg).to(device=device)
     # Single source of truth for mixed precision (WI-01). The previous implementation
     # cast the whole model to bf16 and then re-cast a name-based subset to FP32, which
@@ -598,7 +607,18 @@ def train():
             f"L{i+1}: {step_pulse_losses[i]:.4f} (d{i+1}: {step_pulse_deltas[i]:.2f})"
             for i in range(min(len(step_pulse_losses), len(step_pulse_deltas)))
         )
-        print(f"  ↳ MoE Experts: [{moe_str}] | Conf: {conf:4.2f} | MaxBias: {max_bias:5.3f}")
+        # Drop statistics are per-pulse on purpose: drops concentrate on whichever pulse
+        # routes most unevenly, so a single global rate would hide the case that matters.
+        moe_stats = raw_model.pop_moe_stats() if hasattr(raw_model, "pop_moe_stats") else {}
+        drop_str = ""
+        if moe_stats.get("per_pulse"):
+            rates = [f"P{d['pulse']}:{d['drop_rate']*100:.2f}%" for d in moe_stats["per_pulse"] if d["assigned"] > 0]
+            if rates:
+                drop_str = f" | Drops: [{' '.join(rates)}] cap {int(moe_stats['capacity'])}"
+                overall = moe_stats["drop_rate"] * 100.0
+                if overall > args.drop_warn_pct:
+                    drop_str += f" ⚠ overall {overall:.2f}% > {args.drop_warn_pct}% -> consider --moe-capacity-factor 1.25"
+        print(f"  ↳ MoE Experts: [{moe_str}] | Conf: {conf:4.2f} | MaxBias: {max_bias:5.3f}{drop_str}")
         print(f"  ↳ Pulses: {pulses_str} | λ: {mix_lambda:.3f}")
         print(
             f"  ↳ Gradients: Total: {total_grad_norm:5.2f} (Muon: {muon_grad_norm:4.2f}, Adam: {adam_grad_norm:4.2f})\n"

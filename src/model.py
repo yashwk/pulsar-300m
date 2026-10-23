@@ -33,9 +33,13 @@ class PulsarConfig:
     aux_loss_weight_2: float = 0.25
     final_loss_weight: float = 0.60
     logit_softcap: float = 30.0
-    # Expert capacity headroom: capacity = ceil(avg_load * factor), rounded up to 64.
-    # 1.25 gives real headroom; the previous hardcoded 1.08 left only 8.3%.
-    moe_capacity_factor: float = 1.25
+    # Expert capacity headroom: capacity = ceil(avg_load * factor), rounded up to
+    # moe_capacity_align. 1.08 (the old hardcoded value) left only 8.3% headroom, so
+    # drops were common and invisible. 1.12 with 32-alignment gives 864 slots at
+    # N=3072 (vs 832 at 1.08/64). Capacity is a runtime setting: it changes no
+    # checkpoint format, so it can be raised mid-run if the logged drop rate is high.
+    moe_capacity_factor: float = 1.12
+    moe_capacity_align: int = 32
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -538,6 +542,8 @@ class PulsarMoEMLP(nn.Module):
         self.register_buffer("drop_counts_accum", torch.zeros((), dtype=torch.float32), persistent=False)
         self.register_buffer("assigned_counts_accum", torch.zeros((), dtype=torch.float32), persistent=False)
         self.register_buffer("capacity_last", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("pulse_drop_accum", torch.zeros(cfg.max_pulses, dtype=torch.float32), persistent=False)
+        self.register_buffer("pulse_assigned_accum", torch.zeros(cfg.max_pulses, dtype=torch.float32), persistent=False)
 
     def forward(self, x: torch.Tensor, pulse_idx: int = 0) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         B, T, D = x.shape
@@ -572,7 +578,8 @@ class PulsarMoEMLP(nn.Module):
         # N=3072, so drops were common but never measured.
         avg_load = N * self.cfg.top_k / self.cfg.n_routed_experts
         raw_cap = int(math.ceil(avg_load * self.cfg.moe_capacity_factor))
-        capacity = max(64, ((raw_cap + 63) // 64) * 64)
+        align = max(1, int(self.cfg.moe_capacity_align))
+        capacity = max(align, ((raw_cap + align - 1) // align) * align)
 
         # Pre-drop counts, per expert. Computed from topk_idx (not from surviving slots)
         # so that drop statistics reflect demand rather than capacity.
@@ -588,10 +595,15 @@ class PulsarMoEMLP(nn.Module):
             )
             self.expert_counts_accum.add_(bincounts)
             self.expert_pulse_counts[pulse_idx].add_(bincounts)
-            # drop accounting stays on the GPU; drained by pop_moe_stats()
+            # Drop accounting stays on the GPU; drained by pop_moe_stats().
+            # Tracked per pulse as well as in total: drops are a per-pulse phenomenon
+            # (early pulses route differently from late ones), so a single global rate
+            # would hide the case that matters.
             dropped_per_expert = (bincounts - capacity).clamp(min=0.0)
             self.drop_counts_accum.add_(dropped_per_expert.sum())
             self.assigned_counts_accum.add_(bincounts.sum())
+            self.pulse_drop_accum[pulse_idx].add_(dropped_per_expert.sum())
+            self.pulse_assigned_accum[pulse_idx].add_(bincounts.sum())
             self.capacity_last.fill_(float(capacity))
 
         if HAS_PULSAR_CUDA and x_flat.is_cuda and hasattr(pulsar_cuda, "moe_dispatch_forward"):
@@ -806,6 +818,8 @@ class PulsarForCausalLM(nn.Module):
         assigned = 0.0
         capacity = 0.0
         per_block_drop = []
+        pulse_drop = torch.zeros(self.cfg.max_pulses, device=self.core[0].mlp.drop_counts_accum.device)
+        pulse_assigned = torch.zeros_like(pulse_drop)
         for block in self.core:
             mlp = block.mlp
             d = float(mlp.drop_counts_accum.item())
@@ -815,14 +829,29 @@ class PulsarForCausalLM(nn.Module):
             assigned += a
             capacity = c or capacity
             per_block_drop.append(d)
+            pulse_drop += mlp.pulse_drop_accum.float()
+            pulse_assigned += mlp.pulse_assigned_accum.float()
             mlp.drop_counts_accum.zero_()
             mlp.assigned_counts_accum.zero_()
+            mlp.pulse_drop_accum.zero_()
+            mlp.pulse_assigned_accum.zero_()
+        per_pulse = [
+            {
+                "pulse": k + 1,
+                "dropped": float(pulse_drop[k].item()),
+                "assigned": float(pulse_assigned[k].item()),
+                "drop_rate": float((pulse_drop[k] / pulse_assigned[k]).item())
+                if float(pulse_assigned[k].item()) > 0 else 0.0,
+            }
+            for k in range(self.cfg.max_pulses)
+        ]
         return {
             "dropped": dropped,
             "assigned": assigned,
             "capacity": capacity,
             "drop_rate": (dropped / assigned) if assigned > 0 else 0.0,
             "per_block_dropped": per_block_drop,
+            "per_pulse": per_pulse,
         }
 
     def forward(

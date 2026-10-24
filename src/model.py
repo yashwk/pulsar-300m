@@ -1515,7 +1515,7 @@ class PulsarForCausalLM(nn.Module):
             # GPU tensors; train.py converts once per log window.
             "pulse_losses": pulse_loss_t,
             "pulse_deltas": pulse_delta_t,
-            "pulse_final_delta": pulse_delta_t[-1] if pulse_delta_t else zero,
+            "pulse_final_delta": (self.pulse_state_norm(h_pulse) - h_0_norm).detach().norm(dim=-1).mean() if h_pulse is not None else zero,
             "router_confidence": gate_confidence_accum / (self.cfg.n_core * max(1, K)),
             "router_max_bias": max_bias,
             "expert_pcts": expert_pct,

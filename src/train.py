@@ -295,6 +295,18 @@ def save_checkpoint(
     torch.save(ckpt, tmp_path)
     os.replace(tmp_path, filepath)
 
+    # Persist config.json in checkpoint directory for web monitor and external tools
+    cfg_dir = os.path.dirname(filepath) or "."
+    cfg_file = os.path.join(cfg_dir, "config.json")
+    if not os.path.exists(cfg_file):
+        try:
+            cfg_dict = cfg.to_dict() if hasattr(cfg, "to_dict") else cfg
+            with open(cfg_file + ".tmp", "w", encoding="utf-8") as f:
+                json.dump(cfg_dict, f, indent=2)
+            os.replace(cfg_file + ".tmp", cfg_file)
+        except Exception:
+            pass
+
 
 def train():
     found_train = sorted(glob.glob("data/train_shard*.bin"))
@@ -487,6 +499,15 @@ def train():
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"[Pulsar] Pulsar-MoE Model Initialized: {total_params:,} parameters ({total_params/1e6:.2f}M)")
+
+    # Atomically write config.json so the web server and tools have authoritative config from step 0
+    init_cfg_file = os.path.join(args.checkpoint_dir, "config.json")
+    try:
+        with open(init_cfg_file + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(cfg.to_dict(), f, indent=2)
+        os.replace(init_cfg_file + ".tmp", init_cfg_file)
+    except Exception:
+        pass
 
     # Initialize Optimizer
     optimizer = PulsarDualOptimizer(
@@ -768,8 +789,9 @@ def train():
 
         # Telemetry stdout printout
         pct_sign = "+" if loss_delta > 0 else ""
+        step_target_label = f"{step:4d}/{args.max_steps}" if args.target_step is None else f"{step:4d}/{stop_step} (Horizon: {args.max_steps})"
         print(
-            f"\n[Step {step:4d}/{args.max_steps}] Loss: {accum_loss:.4f} ({pct_sign}{loss_delta:.4f}) | "
+            f"\n[Step {step_target_label}] Loss: {accum_loss:.4f} ({pct_sign}{loss_delta:.4f}) | "
             f"Train PPL: {train_ppl:5.2f} | Tokens: {tokens_seen:,}"
         )
         moe_str = " | ".join(f"E{i}: {pct:4.1f}%" for i, pct in enumerate(e_pcts)) if e_pcts else "Dense FFN"

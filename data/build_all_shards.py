@@ -59,7 +59,7 @@ def load_manifest():
 
     # Initialize with Shard 0 if data/train.bin exists
     manifest = {
-        "curriculum_version": "1.0",
+        "curriculum_version": "2.0-NVIDIA-Nemotron-Refined",
         "total_target_tokens": 6_000_000_000,
         "num_shards": 12,
         "shards": []

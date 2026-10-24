@@ -28,7 +28,8 @@ def run_canaries():
         base_seq_len=1024,
         default_pulses=3,
     )
-    model = PulsarForCausalLM(cfg).to(device=device, dtype=torch.bfloat16)
+    model = PulsarForCausalLM(cfg).to(device=device)
+    model.to_training_precision(torch.bfloat16)
     model.load_state_dict(ckpt["model"], strict=False)
     model.eval()
 

@@ -275,7 +275,10 @@ def _run_config_value(name, default):
     if _RUN_CONFIG_CACHE["key"] != key:
         value = {}
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                if st.st_size > 65536:
+                    f.seek(st.st_size - 65536)
+                    f.readline()  # discard partial line
                 lines = f.readlines()
             for line in reversed(lines[-50:]):
                 line = line.strip()

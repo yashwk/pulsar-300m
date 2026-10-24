@@ -97,10 +97,12 @@ def audit_shard(shard_path: str, tokenizer_path: str = "data/pulsar_tokenizer", 
 
 
 if __name__ == "__main__":
+    import sys
     parser = argparse.ArgumentParser()
     parser.add_argument("--shard-path", type=str, default="data/test_preflight_10m.bin")
     parser.add_argument("--tokenizer", type=str, default="data/pulsar_tokenizer")
     parser.add_argument("--min-count", type=int, default=1000)
     args = parser.parse_args()
 
-    audit_shard(args.shard_path, args.tokenizer, args.min_count)
+    passed = audit_shard(args.shard_path, args.tokenizer, args.min_count)
+    sys.exit(0 if passed else 1)

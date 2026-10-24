@@ -665,6 +665,9 @@ def update_manifest(
     if not updated:
         manifest.setdefault("shards", []).append(shard_entry)
 
+    manifest_dir = os.path.dirname(MANIFEST_PATH)
+    if manifest_dir:
+        os.makedirs(manifest_dir, exist_ok=True)
     tmp_path = MANIFEST_PATH + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
@@ -759,24 +762,36 @@ def build_shard(
         while any(substream_tokens[s] < target_quota[s] for s in substream_keys):
             progress_in_cycle = False
 
+            # Collect a multi-stream batch of candidate documents for parallel tokenization
+            batch_candidates = []
             for s in substream_keys:
                 if substream_tokens[s] >= target_quota[s]:
                     continue
+                # Fetch up to 2 documents per active substream for exact quota budgeting
+                for _ in range(2):
+                    if substream_tokens[s] >= target_quota[s]:
+                        break
+                    try:
+                        txt = next(generators[s])
+                    except StopIteration:
+                        break
+                    if txt and len(txt.strip()) >= 15:
+                        batch_candidates.append((s, txt))
 
-                try:
-                    txt = next(generators[s])
-                except StopIteration:
-                    continue
+            if not batch_candidates:
+                break
 
-                if not txt or len(txt.strip()) < 15:
-                    continue
+            progress_in_cycle = True
 
-                enc = tok.encode(txt, add_special_tokens=False)
+            # Parallel Rust BPE tokenization across all CPU cores via Rayon
+            texts = [c[1] for c in batch_candidates]
+            enc_batch = [e.ids for e in tok._tokenizer.encode_batch(texts, add_special_tokens=False)]
+
+            for (s, txt), enc in zip(batch_candidates, enc_batch):
                 if not enc:
                     continue
 
                 seq_len = len(enc) + 1  # includes eos_id
-                progress_in_cycle = True
                 doc_idx += 1
 
                 is_val = (target_val > 0) and (doc_idx % 20 == 0) and (val_tokens < target_val)

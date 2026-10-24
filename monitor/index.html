@@ -2898,6 +2898,8 @@
       }
     }
 
+    let lastCanaryEvalStep = -1;
+
     async function fetchCanaryMilestones() {
       try {
         const res = await fetch('/api/canaries');
@@ -3494,8 +3496,9 @@
           }
         }
 
-        // Refresh milestones when a new evaluation step occurs
-        if (data.val_loss !== null && data.val_loss !== undefined) {
+        // Refresh milestones only when a new evaluation step occurs
+        if (data.val_loss !== null && data.val_loss !== undefined && data.step !== lastCanaryEvalStep) {
+          lastCanaryEvalStep = data.step;
           fetchCanaryMilestones();
         }
       } catch (err) {

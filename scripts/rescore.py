@@ -28,6 +28,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from src.model import PulsarForCausalLM  # noqa: E402
+from src.packing import PackedBatchLoader, build_doc_index, plan_epoch  # noqa: E402
 from src.train import StreamingPinnedBatchLoader, evaluate_loss  # noqa: E402
 
 
@@ -35,6 +36,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--checkpoint", default="checkpoints/baseline/best.pt")
     ap.add_argument("--val-bin", default="data/val_shard1.bin")
+    ap.add_argument("--sampler", choices=["flat", "bestfit"], default="flat", help="Sampling strategy (flat or bestfit packing)")
     ap.add_argument("--eval-iters", type=int, default=50)
     ap.add_argument("--seq-len", type=int, default=1024)
     ap.add_argument("--micro-batch-size", type=int, default=3)
@@ -64,9 +66,20 @@ def main() -> int:
     print(f"[load] {len(missing)} missing, {len(unexpected)} unexpected keys")
 
     val = np.memmap(args.val_bin, dtype=np.uint16, mode="r")
-    loader = StreamingPinnedBatchLoader(
-        [val], micro_batch_size=args.micro_batch_size, seq_len=args.seq_len, device="cuda"
-    )
+    if args.sampler == "bestfit":
+        val_index = build_doc_index([val])
+        val_plan = plan_epoch(
+            val_index.length.astype(np.int64), args.seq_len,
+            seed=42, epoch=0, strategy="bestfit",
+        )
+        loader = PackedBatchLoader(
+            [val], val_index, val_plan,
+            micro_batch_size=args.micro_batch_size, device="cuda",
+        )
+    else:
+        loader = StreamingPinnedBatchLoader(
+            [val], micro_batch_size=args.micro_batch_size, seq_len=args.seq_len, device="cuda"
+        )
     res = evaluate_loss(model, loader, args.eval_iters, args.num_pulses)
 
     print(f"\n=== Re-scored with corrected metric (100% of tokens) ===")

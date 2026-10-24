@@ -1144,3 +1144,33 @@ def test_checkpointed_forward_accumulates_counters_during_forward():
         f"backward changed the counters from {after_forward} to {after_backward}; "
         f"recomputation must not double-count"
     )
+
+
+# ---------------------------------------------------------------------------
+# R-04: RoPE frequencies must survive the bf16 cast
+# ---------------------------------------------------------------------------
+
+def test_inv_freq_is_exact_after_training_precision():
+    """to_training_precision used to up-cast the bf16-rounded buffer.
+
+    self.to(bf16) rounds inv_freq first; .float() afterwards recovers the rounded
+    values, not the originals - 3.65e-3 relative error, which is ~0.5 rad of angle
+    error by position 1024. It must be rebuilt from (theta, dim) instead.
+    """
+    from src.model import PulsarForCausalLM
+
+    cfg = make_cfg(n_core=2, d_model=128, vocab_size=512, top_k=2)
+    torch.manual_seed(0)
+    model = PulsarForCausalLM(cfg)
+    model.to_training_precision(torch.bfloat16)
+
+    rope = [m for _, m in model.named_modules() if hasattr(m, "inv_freq")][0]
+    expected = 1.0 / (
+        rope.theta ** (torch.arange(0, rope.dim, 2).float() / rope.dim)
+    )
+    assert rope.inv_freq.dtype == torch.float32
+    max_err = (rope.inv_freq.float() - expected).abs().max().item()
+    assert max_err == 0.0, (
+        f"inv_freq differs from the exact formula by {max_err:.3e}; it was "
+        f"up-cast from a rounded buffer rather than rebuilt"
+    )

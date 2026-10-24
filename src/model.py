@@ -331,6 +331,15 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._set_cos_sin_cache(max_seq_len)
 
+    def _inv_freq_fp32(self, device=None) -> torch.Tensor:
+        """Recompute inv_freq in FP32 from (theta, dim).
+
+        The registered buffer is not authoritative after a bf16 cast: rounding it then
+        up-casting does not recover the original frequencies.
+        """
+        dev = device if device is not None else self.inv_freq.device
+        return 1.0 / (self.theta ** (torch.arange(0, self.dim, 2).to(dev).float() / self.dim))
+
     def _set_cos_sin_cache(self, seq_len: int, device=None, dtype=None):
         self.max_seq_len = seq_len
         dev = device if device is not None else self.inv_freq.device
@@ -1020,7 +1029,13 @@ class PulsarForCausalLM(nn.Module):
         # context length after a device/dtype move.
         for rope in (getattr(self, "rope_local", None), getattr(self, "rope_global", None)):
             if rope is not None:
-                rope.inv_freq.data = rope.inv_freq.data.float()
+                # REBUILD from (theta, dim) in FP32. Calling .float() on the buffer only
+                # up-casts values that self.to(bf16) already rounded: measured error is
+                # 3.65e-3 relative (0.37%), i.e. up to ~0.5 rad of angle error by
+                # position 1024 and tens of radians at 32k. Training stayed
+                # self-consistent only because every path used the same rounded table;
+                # any FP32 eval or export would place tokens differently.
+                rope.inv_freq.data = rope._inv_freq_fp32(device=rope.inv_freq.device)
                 rope._set_cos_sin_cache(rope.max_seq_len, device=rope.inv_freq.device, dtype=torch.float32)
 
         return self

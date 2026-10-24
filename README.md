@@ -108,6 +108,7 @@ Open [http://localhost:7860](http://localhost:7860) to view real-time loss, per-
 ---
 
 ## 📚 Technical Documentation
+- [500-Step Pretraining Milestone Report (CE: 2.6761, Latent Gain: +0.1465)](docs/TRAINING_RUN_500.md)
 - [Architecture & Implementation Specification](docs/ARCHITECTURE.md)
 - [Curriculum & Shard Specification](docs/CURRICULUM.md)
 - [Engineering Audit & Telemetry Notes](docs/AUDIT.md)

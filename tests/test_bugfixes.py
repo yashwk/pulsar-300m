@@ -1313,3 +1313,63 @@ def test_global_mode_still_accumulates_global_counter():
 
     total = sum(float(b.mlp.expert_counts_accum.sum()) for b in model.core)
     assert total > 0, "global mode must still accumulate expert_counts_accum"
+
+
+# ---------------------------------------------------------------------------
+# R-01 step 1: router diagnostics (measurement only, no behaviour change)
+# ---------------------------------------------------------------------------
+
+def test_shared_mean_frac_detects_a_dominant_batch_mean():
+    """The diagnostic must separate "driven by a shared token-independent term" from
+    "driven by per-token content", otherwise the number is unfalsifiable."""
+    import torch as _t
+
+    from src.model import PulsarMoEMLP
+
+    cfg = make_cfg(n_core=2, d_model=128, vocab_size=512, top_k=2)
+    _t.manual_seed(0)
+    mlp = PulsarMoEMLP(cfg)
+    N, D = 256, cfg.d_model
+
+    def measure(x):
+        logits = x @ mlp.router_weight[0].float().t()
+        idx = _t.topk(logits, cfg.top_k, dim=-1).indices
+        return float(mlp.router_diagnostics(x, logits, idx, 0)["shared_mean_frac"])
+
+    noise_only = _t.randn(N, D)
+    with_shared = _t.randn(N, D) * 0.1 + _t.randn(1, D) * 5.0
+
+    frac_pure = measure(noise_only)
+    frac_shared = measure(with_shared)
+
+    assert frac_pure < 0.2, f"pure noise scored {frac_pure:.3f}, expected near 0"
+    assert frac_shared > 0.8, f"shared-mean input scored {frac_shared:.3f}, expected near 1"
+
+
+def test_router_diag_absent_unless_requested():
+    """Diagnostics are sampled, not continuous: a normal forward must not pay for them."""
+    from src.model import PulsarForCausalLM
+
+    cfg = make_cfg(n_core=2, d_model=128, vocab_size=512, top_k=2)
+    torch.manual_seed(0)
+    model = PulsarForCausalLM(cfg)
+    model.train()
+    x = torch.randint(0, cfg.vocab_size, (2, 32))
+
+    _, _, plain = model(x, labels=x, num_pulses=2)
+    assert not any(k.startswith("router_diag_") for k in plain)
+
+    _, _, with_diag = model(x, labels=x, num_pulses=2, router_diag=True)
+    keys = [k for k in with_diag if k.startswith("router_diag_")]
+    assert keys, "router_diag=True produced no diagnostic fields"
+    for k in keys:
+        val = float(with_diag[k])
+        assert val == val, f"{k} is NaN"
+        assert abs(val) < 1e3, f"{k} is implausible ({val})"
+
+    # max_top1_share is a fraction bounded below by uniform (1/E) and above by 1.
+    share = float(with_diag["router_diag_max_top1_share"])
+    assert 1.0 / cfg.n_routed_experts - 1e-6 <= share <= 1.0, (
+        f"max_top1_share {share} outside [1/E, 1]; the value was probably divided by "
+        f"the gradient-accumulation factor"
+    )

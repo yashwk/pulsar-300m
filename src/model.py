@@ -767,10 +767,12 @@ class PulsarMoEMLP(nn.Module):
 
     def forward(
         self, x: torch.Tensor, pulse_idx: int = 0, routing_mask: torch.Tensor | None = None,
+        router_diag: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         B, T, D = x.shape
         N = B * T
         x_flat = x.view(N, D)
+        router_diag = getattr(self, "_diag_capture", None) is not None
 
         # 1. Pulse-indexed router logits
         # Router logits in FP32. bf16 spacing near |logit|=1 is ~0.008, comparable to
@@ -934,7 +936,68 @@ class PulsarMoEMLP(nn.Module):
         # matter what the router does - the old value was pinned at 0.5 by construction.
         # The per-token max is the quantity that actually moves as routing sharpens.
         mean_max_weight = topk_weights.detach().max(dim=-1).values.mean() if topk_weights.ndim == 2 else topk_weights.detach().mean()
+        if router_diag:
+            self._diag_capture.append(
+                (pulse_idx, x_flat.detach(), logits.detach(), topk_idx.detach())
+            )
         return out, z_loss, mean_max_weight, bincounts
+
+    def router_diagnostics(self, x_flat: torch.Tensor, logits: torch.Tensor,
+                           topk_idx: torch.Tensor, pulse_idx: int) -> dict:
+        """Measure whether the router is being driven by a token-independent term.
+
+        The hypothesis under test is that by pulse 3 the hidden state carries a strong
+        batch-mean component, so a router update along +/-x_bar moves the logits of all
+        tokens together and saturates sigmoid. shared_mean_frac is the share of
+        logit variance explained by that shared term:
+
+            Var_e(w_e . mu) / (Var_e(w_e . mu) + mean_tokens Var_e(w_e . (x - mu)))
+
+        Also reports how often the balancing bias overrides the content-based top-2.
+        Runs under no_grad on the caller's sample; no host syncs here.
+        """
+        with torch.no_grad():
+            xf = x_flat.float()
+            mu = xf.mean(dim=0, keepdim=True)                       # [1, D]
+            centred = xf - mu
+            w = self.router_weight[pulse_idx].float()
+
+            shared = mu @ w.t()                                     # [1, E]
+            diff = centred @ w.t()                                  # [N, E]
+            var_shared = shared.var(dim=-1, unbiased=False).mean()
+            var_diff = diff.var(dim=-1, unbiased=False).mean()
+            denom = (var_shared + var_diff).clamp_min(1e-12)
+            shared_mean_frac = (var_shared / denom).reshape(())
+
+            # bias_override_rate: top-2 with bias differs from top-2 without it.
+            bias = (self.expert_bias[pulse_idx] if self.cfg.per_pulse_bias
+                    else self.expert_bias).float()
+            k = self.cfg.top_k
+            scores = torch.sigmoid(logits.float())
+            with_bias = torch.topk(scores + bias, k=k, dim=-1).indices
+            without = torch.topk(scores, k=k, dim=-1).indices
+            # Compare as sets: the same two experts in a different order is not an override.
+            same = (with_bias.unsqueeze(-1) == without.unsqueeze(1)).any(-1).sum(-1) == k
+            bias_override_rate = (~same).float().mean()
+
+            # Top-1 share per expert and router entropy (bits of the top-1 histogram).
+            counts = torch.bincount(topk_idx[:, 0].reshape(-1),
+                                    minlength=self.cfg.n_routed_experts).float()
+            shares = counts / counts.sum().clamp_min(1.0)
+            ent = -(shares * (shares + 1e-9).log()).sum()
+
+            abs_bias = bias.abs()
+
+        return {
+            "shared_mean_frac": shared_mean_frac.detach(),
+            "bias_override_rate": bias_override_rate.detach(),
+            "top1_entropy": ent.detach(),
+            "max_top1_share": shares.max().detach(),
+            "bias_abs_p50": abs_bias.median().detach() if abs_bias.numel() else torch.zeros(()),
+            "bias_abs_p99": (
+                torch.quantile(abs_bias.float(), 0.99) if abs_bias.numel() else torch.zeros(())
+            ),
+        }
 
     def update_biases(self, bias_lr: float = 0.001, num_pulses: int | None = None):
         """Auxiliary-loss-free bias update.
@@ -1257,6 +1320,7 @@ class PulsarForCausalLM(nn.Module):
         subsample_offset: int = 0,
         eval_full_pulses: bool = False,
         routing_mask: torch.Tensor | None = None,
+        router_diag: bool = False,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, dict[str, float]]:
         B, T = input_ids.shape
         K = num_pulses if num_pulses is not None else self.cfg.default_pulses
@@ -1267,6 +1331,13 @@ class PulsarForCausalLM(nn.Module):
         h_0 = self.tok_emb(input_ids)
         cos_local, sin_local = self.rope_local(h_0, T)
         cos_global, sin_global = self.rope_global(h_0, T)
+
+        # Router diagnostics are sampled, not continuous: capture is enabled for this
+        # forward only, and the trainer calls it on at most one micro-batch per log
+        # window. Cost is a no-grad matmul per (block, pulse) on that one batch.
+        if router_diag:
+            for block in self.core:
+                block.mlp._diag_capture = []
 
         h_0_norm = self.anchor_norm(h_0)
         h_pulse = h_0
@@ -1450,7 +1521,6 @@ class PulsarForCausalLM(nn.Module):
             "router_max_bias": max_bias,
             "expert_pcts": expert_pct,
             "expert_pcts_per_pulse": expert_pct_per_pulse,
-            # The honest imbalance numbers: these are not diluted across blocks.
             "worst_expert_share_pct": worst_expert_share,
             "mean_block_spread_pct": mean_block_spread,
             "max_block_spread_pct": max_block_spread,
@@ -1463,6 +1533,31 @@ class PulsarForCausalLM(nn.Module):
             "delta_pulse_2": pulse_delta_t[1] if len(pulse_delta_t) >= 2 else (pulse_delta_t[0] if pulse_delta_t else zero),
             "delta_pulse_3": pulse_delta_t[-1] if pulse_delta_t else zero,
         }
+        # Router diagnostics (R-01 step 1): aggregated over (block, pulse) for this
+        # forward only. Empty unless router_diag was requested.
+        router_diag_metrics = {}
+        if router_diag:
+            captured = [
+                entry
+                for block in self.core
+                for entry in (getattr(block.mlp, "_diag_capture", None) or [])
+            ]
+            for block in self.core:
+                block.mlp._diag_capture = None
+            if captured:
+                modules = [b.mlp for b in self.core for _ in range(K)]
+                per = [
+                    mod.router_diagnostics(xf, lg, ti, pi)
+                    for (pi, xf, lg, ti), mod in zip(captured, modules)
+                ]
+                router_diag_metrics = {
+                    f"router_diag_{key}": torch.stack(
+                        [d[key].reshape(()) for d in per]
+                    ).mean()
+                    for key in per[0]
+                }
+                metrics.update(router_diag_metrics)
+
         return logits, total_loss, metrics
 
     def get_model_summary(self, num_pulses: int | None = None) -> dict:

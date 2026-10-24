@@ -239,3 +239,54 @@ the `[1/E, 1]` bound.
   unsourced. Replaced by `docs/THROUGHPUT_BASELINE.md`, measured on current code:
   MBS 3 / cap 1.12 = **7,916 tok/s**; MBS 2 / cap 1.375 = **7,400**; MBS 2 / cap 1.12 =
   **7,000**. Note MBS 2 at capacity 1.12 is *slower* than at 1.375 despite less memory.
+
+### Smoke run results (300 steps, current code)
+
+Config: MBS 2 x 1024, capacity 1.375 (704 slots), warmup 150, bias_lr 0.01, seed 42.
+Completed 300/300, exit 0, 91.5 min.
+
+| step | val CE |
+|---|---|
+| 50 | 8.468 |
+| 100 | 5.683 |
+| 150 | 4.666 |
+| 200 | 4.105 |
+| 250 | 3.786 |
+| 300 | 3.428 |
+
+Final train loss 3.521, no NaN, peak VRAM 6.22 GB, mean 7,348 tok/s.
+
+Muon gradient norm reproduced the earlier run's trajectory **exactly** at every matched
+checkpoint (0.40 / 0.42 / 0.64 / 0.85 / 1.12 at steps 1/10/19/25/28), peaked at **4.56 on
+step 47**, and fell back to **0.25** (clip factor 1.00) — below its step-1 value. The spike
+is reproducible, self-correcting, and unaffected by anything in round 2, which is expected:
+R-02/R-03/R-06/R-07/R-01 change no gradients.
+
+### R-01 step 1 result: `shared_mean_frac` is a transient, not a steady state
+
+Threshold agreed with the owner: "above about 0.3 in some (block, pulse)".
+
+| step | shared_mean_frac |
+|---|---|
+| 1 | 0.007 |
+| 30 | 0.030 |
+| 40 | 0.104 |
+| **50** | **0.446** |
+| **60** | **0.643** |
+| **70** | **0.453** |
+| 80 | 0.267 |
+| 100 | 0.109 |
+| 200 | 0.072 |
+| 300 | ~0.09 |
+
+It crosses 0.3 for exactly one window (steps 50-70) and then decays ~6x; steps 100+ average
+**0.083**. Read literally the step-3 trigger fires, but the condition it was written to
+detect (a persistent token-independent component dominating later pulses) is not what the
+data shows. Router-input centering would target a transient that self-resolves inside ~20
+steps, in the same window as the Muon spike and the routing divergence.
+
+Other diagnostics over the run: `bias_override_rate` rises to 0.61 at step 50 and decays
+to 0.19 by step 240; `bias_abs_p99` peaks at 0.177, far below the +-1.0 clamp;
+`max_top1_share` stays 0.17-0.24 against a uniform 0.125.
+
+**Recommendation: do not implement step 3.** Decision is the owner's.

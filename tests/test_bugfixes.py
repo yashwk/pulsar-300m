@@ -1222,3 +1222,43 @@ def test_drops_measured_from_slots_not_bincounts():
 
     assert bad["dropped"] > 0, "slot-derived drops missed a deliberately broken slot fn"
     assert bad["demand_over_capacity"] == 0, "test premise: bincount heuristic sees nothing"
+
+
+# ---------------------------------------------------------------------------
+# R-03: no host synchronisation in the training hot path
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not HAS_CUDA, reason="needs CUDA to detect syncs")
+def test_training_step_has_no_host_sync():
+    """Hot-path .item()/bool(tensor) forced a device sync 24x per forward.
+
+    torch.cuda.set_sync_debug_mode("error") turns any host sync into an exception, so
+    this catches regressions structurally rather than by timing.
+    """
+    from src.model import PulsarConfig, PulsarForCausalLM
+
+    cfg = make_cfg(n_core=2, d_model=128, vocab_size=512, top_k=2)
+    torch.manual_seed(0)
+    model = PulsarForCausalLM(cfg).cuda()
+    model.to_training_precision(torch.bfloat16)
+    model.train()
+
+    x = torch.randint(0, cfg.vocab_size, (2, 32), device="cuda")
+    y = torch.randint(0, cfg.vocab_size, (2, 32), device="cuda")
+
+    # Warm up so lazy CUDA init is not mistaken for a sync.
+    try:
+        _, loss, _ = model(x, labels=y, num_pulses=2)
+        loss.backward()
+    finally:
+        model.zero_grad(set_to_none=True)
+    torch.cuda.synchronize()
+
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        _, loss, _ = model(x, labels=y, num_pulses=2)
+        loss.backward()
+    except RuntimeError as exc:                      # pragma: no cover - regression path
+        pytest.fail(f"host sync in the training hot path: {exc}")
+    finally:
+        torch.cuda.set_sync_debug_mode("default")

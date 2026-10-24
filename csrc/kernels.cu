@@ -1568,10 +1568,14 @@ __global__ void fused_softcap_ce_backward_vec8_kernel(
     const int64_t* __restrict__ targets,     // [N]
     const float* __restrict__ lse,           // [N]
     __nv_bfloat16* __restrict__ d_logits,    // [N, V]
-    int N, int V, float softcap, float grad_scale, int64_t ignore_index
+    int N, int V, float softcap, const float* __restrict__ grad_scale_dev,
+    float grad_scale_host, int64_t ignore_index
 ) {
     int token_idx = blockIdx.x;
     if (token_idx >= N) return;
+    // Read the scale on-device when given a pointer: the Python caller would otherwise
+    // need .item() to pass it as a scalar, forcing a device sync every backward.
+    const float grad_scale = grad_scale_dev ? *grad_scale_dev : grad_scale_host;
 
     int64_t target = targets[token_idx];
     const __nv_bfloat16* x = logits + token_idx * V;
@@ -1652,7 +1656,31 @@ torch::Tensor fused_softcap_ce_backward_cuda(
         targets.data_ptr<int64_t>(),
         lse.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(d_logits.data_ptr<c10::BFloat16>()),
-        N, V, softcap, grad_scale, ignore_index
+        N, V, softcap, nullptr, grad_scale, ignore_index
+    );
+    return d_logits;
+}
+
+torch::Tensor fused_softcap_ce_backward_dev_cuda(
+    torch::Tensor logits,
+    torch::Tensor targets,
+    torch::Tensor lse,
+    float softcap,
+    torch::Tensor grad_scale_dev,
+    int64_t ignore_index
+) {
+    int N = logits.size(0);
+    int V = logits.size(1);
+    auto d_logits = torch::empty_like(logits);
+
+    int threads = 512;
+    int blocks = N;
+    fused_softcap_ce_backward_vec8_kernel<<<blocks, threads>>>(
+        reinterpret_cast<const __nv_bfloat16*>(logits.data_ptr<c10::BFloat16>()),
+        targets.data_ptr<int64_t>(),
+        lse.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(d_logits.data_ptr<c10::BFloat16>()),
+        N, V, softcap, grad_scale_dev.data_ptr<float>(), 1.0f, ignore_index
     );
     return d_logits;
 }

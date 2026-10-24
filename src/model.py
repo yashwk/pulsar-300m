@@ -154,28 +154,36 @@ class _FusedSoftcapCrossEntropyFunction(torch.autograd.Function):
         ctx.N = N
 
         if reduction == "mean":
-            valid_mask = (targets != ignore_index)
-            n_valid = max(1, valid_mask.sum().item())
+            # Keep n_valid on the device. .item() here forced a host sync on every
+            # micro-batch (43 per optimizer step).
+            n_valid = (targets != ignore_index).sum().clamp_min(1).to(torch.float32)
             ctx.n_valid = n_valid
             return losses.sum() / n_valid
         elif reduction == "sum":
-            ctx.n_valid = 1
+            ctx.n_valid = None
             return losses.sum()
-        ctx.n_valid = 1
+        ctx.n_valid = None
         return losses
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         logits, targets, lse = ctx.saved_tensors
-        if ctx.reduction == "mean":
-            scale = grad_output.item() / ctx.n_valid
-        elif ctx.reduction == "sum":
-            scale = grad_output.item()
+        # grad_output / n_valid stays a device tensor so the kernel reads the scale
+        # without a host round-trip; the scalar variant is kept for the sum path.
+        if ctx.n_valid is not None:
+            scale_dev = (grad_output.reshape(()) / ctx.n_valid).to(torch.float32).contiguous()
+            d_logits = pulsar_cuda.fused_softcap_ce_backward_dev(
+                logits.contiguous(), targets.contiguous(), lse.contiguous(),
+                ctx.softcap, scale_dev, ctx.ignore_index,
+            )
         else:
-            scale = 1.0
-        d_logits = pulsar_cuda.fused_softcap_ce_backward(
-            logits.contiguous(), targets.contiguous(), lse.contiguous(), ctx.softcap, scale, ctx.ignore_index
-        )
+            # "sum" reduction: a grad_output of 1.0 is the norm, but pass it as a device
+            # tensor anyway so a non-trivial upstream gradient cannot force a sync.
+            scale_dev = grad_output.reshape(()).to(torch.float32).contiguous()
+            d_logits = pulsar_cuda.fused_softcap_ce_backward_dev(
+                logits.contiguous(), targets.contiguous(), lse.contiguous(),
+                ctx.softcap, scale_dev, ctx.ignore_index,
+            )
         return d_logits, None, None, None, None
 
 
@@ -573,23 +581,17 @@ def compute_token_slots(
         counts.index_add_(0, flat_e, torch.ones(M, device=device, dtype=torch.long))
         start_off = counts.cumsum(0) - counts            # [E] group start per expert
 
-        # Fast path: everything fits.
+        # Single path, no branch and no host sync.
         #
         # The rank must be the assignment's ORDINAL WITHIN ITS EXPERT, not its position
-        # in the flattened token order. `arange(M) - start_off[flat_e]` is only correct
-        # when assignments are already grouped by expert; the router emits them in token
-        # order, so with interleaved experts (e.g. [[0,1],[0,1]]) it produced
-        # [0, -1, 2, 1]: slot 0 and 1 land in expert 0, and 2/1 collide or overflow.
-        # The stable sort by expert id establishes that grouping.
-        if int(counts.max()) <= capacity:
-            order = torch.argsort(flat_e, stable=True)
-            rank = torch.empty(M, device=device, dtype=torch.long)
-            rank[order] = torch.arange(M, device=device) - start_off[flat_e[order]]
-            return rank.to(torch.int32).view(N, K)
-
-        # Slow path: order by (expert asc, weight desc) so low-weight assignments drop.
-        # start_off is indexed by EXPERT, so the per-expert group start must be taken
-        # from the expert id of the sorted element, not from its position.
+        # in the flattened token order, so assignments are ordered by (expert asc,
+        # weight desc). That one ordering does both jobs: it establishes the expert
+        # grouping the rank needs, and it puts the highest-weight assignments first so
+        # only the lowest-weight ones fall past capacity.
+        #
+        # The previous version branched on `int(counts.max()) <= capacity` to skip the
+        # sort, but that .item() forced a device sync 24x per forward. Measured cost of
+        # the branch itself was 0.10 ms/call, so the sync was the only reason to have it.
         flat_w = topk_weights.reshape(-1).float()
         order = torch.argsort(flat_w, descending=True, stable=True)
         order = order[torch.argsort(flat_e[order], stable=True)]
@@ -844,19 +846,16 @@ class PulsarMoEMLP(nn.Module):
         with torch.no_grad():
             bincounts = torch.zeros(self.cfg.n_routed_experts, device=x.device, dtype=torch.float32)
             count_idx = topk_idx.reshape(-1)
-            if valid is not None and not bool(valid.all()):
-                # Map padded assignments onto a valid expert and weight them by 0, so
-                # index_add_ cannot add entries from padding.
-                weights = torch.ones(topk_idx.numel(), device=x.device, dtype=torch.float32)
-                weights = weights * valid.repeat_interleave(self.cfg.top_k).float()
-                count_idx = torch.where(valid.repeat_interleave(self.cfg.top_k), count_idx,
-                                        torch.zeros_like(count_idx))
-                bincounts.index_add_(0, count_idx, weights)
+            # Branch-free, so no host sync on `valid.all()`. Padded assignments are
+            # remapped onto expert 0 and weighted 0, which index_add_ discards; the
+            # unmasked case is simply the same expression with an all-ones weight.
+            if valid is not None:
+                assign_valid = valid.repeat_interleave(self.cfg.top_k)
+                weights = assign_valid.to(torch.float32)
+                count_idx = torch.where(assign_valid, count_idx, torch.zeros_like(count_idx))
             else:
-                bincounts.index_add_(
-                    0, count_idx,
-                    torch.ones(topk_idx.numel(), device=x.device, dtype=torch.float32),
-                )
+                weights = torch.ones(topk_idx.numel(), device=x.device, dtype=torch.float32)
+            bincounts.index_add_(0, count_idx, weights)
             # Counters feed the auxiliary-loss-free bias update, so only TRAINING
             # forwards may move them. Validation and generation were accumulating too:
             # one eval forward added 768 assignments and shifted the routing bias before

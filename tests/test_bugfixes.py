@@ -1104,3 +1104,43 @@ def test_per_block_imbalance_is_not_diluted():
         f"maximum {agg_max:.1f}% - the imbalance is being diluted"
     )
     assert worst > 40, f"worst_expert_share {worst:.1f}% too low for a forced collapse"
+
+
+# ---------------------------------------------------------------------------
+# R-06: activation-checkpoint context order
+# ---------------------------------------------------------------------------
+
+def test_checkpointed_forward_accumulates_counters_during_forward():
+    """context_fn is (forward_ctx, recompute_ctx).
+
+    It was inverted, so the original forward skipped the MoE counters and the
+    recomputation applied them. Counts still landed once, but only in backward - a
+    forward never followed by backward counted nothing at all.
+    """
+    from src.model import PulsarConfig, PulsarForCausalLM
+
+    cfg = make_cfg(n_core=2, d_model=128, vocab_size=512, top_k=2)
+    torch.manual_seed(0)
+    model = PulsarForCausalLM(cfg)
+    model.to_training_precision(torch.bfloat16)
+    model.train()
+    model.grad_checkpoint = True
+
+    x = torch.randint(0, cfg.vocab_size, (2, 32))
+    y = torch.randint(0, cfg.vocab_size, (2, 32))
+
+    def counts():
+        return sum(float(b.mlp.expert_counts_accum.sum()) for b in model.core)
+
+    _, loss, _ = model(x, labels=y, num_pulses=2)
+    after_forward = counts()
+    loss.backward()
+    after_backward = counts()
+
+    assert after_forward > 0, (
+        "checkpointed forward accumulated no MoE counts; context_fn order is inverted"
+    )
+    assert after_backward == after_forward, (
+        f"backward changed the counters from {after_forward} to {after_backward}; "
+        f"recomputation must not double-count"
+    )

@@ -1259,14 +1259,18 @@ class PulsarForCausalLM(nn.Module):
 
                     # Blocks mutate MoE counters as a side effect. Recompute during
                     # backward would double-count them, so counters are frozen around
-                    # recompute, suppressed by a thread-local flag (see _RECOMPUTING).
-                    # context_fn tells the checkpoint machinery to raise the flag
-                    # while recomputing, so MoE counter side effects are skipped.
+                    # context_fn takes (forward_ctx, recompute_ctx) in that order, per
+                    # the torch.utils.checkpoint docs: "The function and its recomputation
+                    # will be run under the first and second context managers
+                    # respectively." This was inverted, so the ORIGINAL forward skipped
+                    # the MoE counters and the recomputation applied them - the counts
+                    # still landed exactly once, but only during backward, so a forward
+                    # that is never backpropagated never counted at all.
                     h_curr, v_first, z_loss, gate_weight_mean, bincounts = checkpoint(
                         block, h_curr, cos, sin,
                         pulse_idx=k, v_first=v_first, routing_mask=routing_mask,
                         use_reentrant=False,
-                        context_fn=lambda: (_set_recomputing(True), _set_recomputing(False)),
+                        context_fn=lambda: (_set_recomputing(False), _set_recomputing(True)),
                     )
                 else:
                     h_curr, v_first, z_loss, gate_weight_mean, bincounts = block(

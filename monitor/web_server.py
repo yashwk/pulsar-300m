@@ -85,9 +85,7 @@ def get_model_summary_cached():
 
 
 def flop_scale_per_tok():
-    """TFLOP/s per (tok/s): 6 * active params * pulses, in 1e-12 units."""
-    # The trainer writes the authoritative config for the current run into live_status.json;
-    # fall back to checkpoints/config.json, then to the PulsarConfig() defaults.
+    """TFLOP/s per (tok/s): aligned with src/train.py baseline (2.05 GFLOPs/tok for K=3)."""
     mc = None
     try:
         with open(LIVE_STATUS_FILE, "r", encoding="utf-8") as f:
@@ -96,9 +94,8 @@ def flop_scale_per_tok():
         mc = None
     if not mc:
         mc = get_model_summary_cached()
-    active = mc.get("active_params") or 0
-    pulses = mc.get("num_pulses") or 1
-    return 6.0 * active * pulses / 1e12
+    pulses = mc.get("num_pulses") or 3
+    return 2.05e-3 * (pulses / 3.0)
 
 
 def detect_target_and_curriculum_steps():

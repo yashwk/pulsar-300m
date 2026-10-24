@@ -814,7 +814,7 @@ def train():
         val_pulse_ppls = None
         latent_gain = None   # computed only on eval steps; must be reset every step
         # Periodic Evaluation and Canary Generation
-        if step % args.eval_every == 0 or step == args.max_steps or interrupted:
+        if step % args.eval_every == 0 or step == stop_step or interrupted:
             eval_metrics = evaluate_loss(
                 model, val_loader, args.eval_iters, args.num_pulses
             )

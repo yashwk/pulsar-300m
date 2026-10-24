@@ -179,24 +179,44 @@ def derive_stream_seed(stream_id: str, shard_idx: int, base_seed: int = 20261023
 
 
 def clean_think_trace(think_raw: str, max_chars: int = MAX_TRACE_CHARS) -> str:
-    """Return the reasoning trace verbatim.
+    """Return the reasoning trace verbatim or cleanly bounded without mid-sentence slicing.
 
-    The previous implementation replaced the middle of long traces with a literal
-    ``[...]`` marker. That trains the model to emit elided, step-skipping reasoning,
-    so traces are now preserved in full. The only transformation is a cap for traces
-    longer than ``max_chars``, cut on a sentence boundary and with no placeholder
-    marker inserted.
+    Never slices mid-sentence: cuts strictly at a paragraph/sentence boundary and
+    preserves the final conclusion sentence before <|/think|>.
     """
     think = think_raw.strip()
     if len(think) <= max_chars:
         return think
 
-    head = think[:max_chars]
+    # Extract final conclusion sentence from the tail so the reasoning completes cleanly
+    tail_candidates = [
+        think.rfind(".\n"),
+        think.rfind(". "),
+        think.rfind("?\n"),
+        think.rfind("! "),
+    ]
+    last_end = max(tail_candidates)
+    tail_sent = ""
+    if last_end != -1 and last_end > len(think) - 500:
+        prev_punct = max(
+            think.rfind(".\n", 0, last_end - 1),
+            think.rfind(". ", 0, last_end - 1),
+            think.rfind("\n\n", 0, last_end - 1),
+        )
+        if prev_punct != -1:
+            tail_sent = think[prev_punct + 1 : last_end + 1].strip()
+
+    reserve_tail = len(tail_sent) + 2 if tail_sent else 0
+    head_budget = max(200, max_chars - reserve_tail)
+    head = think[:head_budget]
     last_punct = max(
-        head.rfind(".\n"), head.rfind(". "), head.rfind("?\n"), head.rfind("! ")
+        head.rfind(".\n"), head.rfind(". "), head.rfind("?\n"), head.rfind("! "), head.rfind("\n\n"), head.rfind("\n")
     )
-    if last_punct > max_chars // 2:
+    if last_punct > 100:
         head = head[: last_punct + 1]
+
+    if tail_sent and not head.endswith(tail_sent):
+        return f"{head.strip()}\n{tail_sent}".strip()
     return head.strip()
 
 

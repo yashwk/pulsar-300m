@@ -2866,9 +2866,7 @@
       // 6. Chart 6: Hardware Saturation & Training Stability
       chart6.data.labels = steps;
       chart6.data.datasets[0].data = slice.map(r => r.tok_per_sec ?? null);
-      const flopScale = (lastModelConfig && lastModelConfig.active_params)
-        ? 6.0 * lastModelConfig.active_params * (lastModelConfig.num_pulses || 3) / 1e12
-        : null;
+      const flopScale = 2.05e-3 * ((lastModelConfig && lastModelConfig.num_pulses ? lastModelConfig.num_pulses : 3) / 3.0);
       chart6.data.datasets[1].data = slice.map(r => {
         if (r.tflops !== null && r.tflops !== undefined) return r.tflops;
         return (r.tok_per_sec && flopScale) ? Number((r.tok_per_sec * flopScale).toFixed(2)) : null;

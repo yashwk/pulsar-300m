@@ -140,10 +140,12 @@ def test_last_n_real_is_bounded_across_calls():
 
 def test_routing_mask_excludes_padding():
     loader = _packed_loader()
-    x, _ = loader.get_batch()
-    mask = loader.routing_mask(x)
-    if mask is None:
+    pad_idx = next((i for i, w in enumerate(loader.plan.windows) if w.pad > 0), None)
+    if pad_idx is None:
         pytest.skip("this plan has no padded windows")
+    x, _ = loader.get_batch([pad_idx])
+    mask = loader.routing_mask(x)
+    assert mask is not None, "mask should be produced for padded window"
     assert mask.shape == x.shape
     assert mask.dtype == torch.bool
     # Every row's real prefix is contiguous from position 0.
@@ -1259,9 +1261,12 @@ def test_training_step_has_no_host_sync():
         model.zero_grad(set_to_none=True)
     torch.cuda.synchronize()
 
+    mask = torch.ones_like(x, dtype=torch.bool)
+    mask[:, 24:] = False
+
     torch.cuda.set_sync_debug_mode("error")
     try:
-        _, loss, _ = model(x, labels=y, num_pulses=2)
+        _, loss, _ = model(x, labels=y, num_pulses=2, routing_mask=mask)
         loss.backward()
     except RuntimeError as exc:                      # pragma: no cover - regression path
         pytest.fail(f"host sync in the training hot path: {exc}")

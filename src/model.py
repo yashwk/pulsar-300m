@@ -799,13 +799,12 @@ class PulsarMoEMLP(nn.Module):
         # 2. Router selection: fused top-2 + sigmoid + weight normalisation (CUDA),
         #    with z-loss computed in PyTorch so autograd scales it correctly. The z
         #    tensor is [N, E] (a few hundred KB), negligible next to the router matmul.
-        if valid is not None and not bool(valid.all()):
-            lse_sq = torch.logsumexp(logits.float(), dim=-1).pow(2)
-            z_loss = self.cfg.router_z_loss_weight * lse_sq[valid].mean()
+        lse_sq = torch.logsumexp(logits.float(), dim=-1).pow(2)
+        if valid is not None:
+            valid_f = valid.to(torch.float32)
+            z_loss = self.cfg.router_z_loss_weight * ((lse_sq * valid_f).sum() / valid_f.sum().clamp_min(1.0))
         else:
-            z_loss = self.cfg.router_z_loss_weight * torch.logsumexp(
-                logits.float(), dim=-1
-            ).pow(2).mean()
+            z_loss = self.cfg.router_z_loss_weight * lse_sq.mean()
         if (HAS_PULSAR_CUDA and logits.is_cuda
                 and not torch.compiler.is_compiling()
                 and hasattr(pulsar_cuda, "moe_router_topk_forward")):

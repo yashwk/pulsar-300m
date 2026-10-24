@@ -108,6 +108,6 @@ Open [http://localhost:7860](http://localhost:7860) to view real-time loss, per-
 ---
 
 ## 📚 Technical Documentation
-- [Architecture & Derivations](docs/ARCHITECTURE.md)
-- [Model Implementation Blueprint](docs/model.md)
+- [Architecture & Implementation Specification](docs/ARCHITECTURE.md)
 - [Curriculum & Shard Specification](docs/CURRICULUM.md)
+- [Engineering Audit & Telemetry Notes](docs/AUDIT.md)

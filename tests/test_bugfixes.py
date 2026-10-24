@@ -733,7 +733,10 @@ def test_eval_forward_does_not_accumulate_routing_counters():
     x = torch.randint(0, cfg.vocab_size, (1, 16))
 
     def total_counts():
-        return sum(float(b.mlp.expert_counts_accum.sum()) for b in model.core)
+        # expert_pulse_counts is the counter the bias update actually reads when
+        # per_pulse_bias is on; expert_counts_accum is intentionally not accumulated
+        # in that mode (R-07), so absence of growth there proves nothing about eval.
+        return sum(float(b.mlp.expert_pulse_counts.sum()) for b in model.core)
 
     model.eval()
     with torch.no_grad():
@@ -1130,7 +1133,9 @@ def test_checkpointed_forward_accumulates_counters_during_forward():
     y = torch.randint(0, cfg.vocab_size, (2, 32))
 
     def counts():
-        return sum(float(b.mlp.expert_counts_accum.sum()) for b in model.core)
+        # per_pulse_bias is the default, and R-07 stops accumulating expert_counts_accum
+        # in that mode, so track the per-pulse counter that is actually live.
+        return sum(float(b.mlp.expert_pulse_counts.sum()) for b in model.core)
 
     _, loss, _ = model(x, labels=y, num_pulses=2)
     after_forward = counts()
@@ -1262,3 +1267,49 @@ def test_training_step_has_no_host_sync():
         pytest.fail(f"host sync in the training hot path: {exc}")
     finally:
         torch.cuda.set_sync_debug_mode("default")
+
+
+# ---------------------------------------------------------------------------
+# R-07: per-pulse mode must not accumulate the unused global counter
+# ---------------------------------------------------------------------------
+
+def test_per_pulse_mode_keeps_global_counter_bounded():
+    """update_biases() reads expert_pulse_counts in per-pulse mode, so the global
+    expert_counts_accum was accumulated forever without being read or zeroed."""
+    from src.model import PulsarForCausalLM
+
+    cfg = make_cfg(n_core=2, d_model=128, vocab_size=512, top_k=2)
+    cfg.per_pulse_bias = True
+    torch.manual_seed(0)
+    model = PulsarForCausalLM(cfg)
+    model.train()
+    x = torch.randint(0, cfg.vocab_size, (1, 16))
+
+    with torch.no_grad():
+        for _ in range(100):
+            model(x, labels=None, num_pulses=2)
+            for block in model.core:
+                block.mlp.update_biases(0.01, num_pulses=2)
+
+    total = sum(float(b.mlp.expert_counts_accum.sum()) for b in model.core)
+    assert total == 0, (
+        f"expert_counts_accum reached {total} after 100 per-pulse steps; it is unused "
+        f"in this mode and would grow until FP32 stops resolving +1 at 2^24"
+    )
+
+
+def test_global_mode_still_accumulates_global_counter():
+    """The skip above must be conditional - the non-per-pulse path still needs it."""
+    from src.model import PulsarForCausalLM
+
+    cfg = make_cfg(n_core=2, d_model=128, vocab_size=512, top_k=2)
+    cfg.per_pulse_bias = False
+    torch.manual_seed(0)
+    model = PulsarForCausalLM(cfg)
+    model.train()
+
+    with torch.no_grad():
+        model(torch.randint(0, cfg.vocab_size, (1, 16)), labels=None, num_pulses=2)
+
+    total = sum(float(b.mlp.expert_counts_accum.sum()) for b in model.core)
+    assert total > 0, "global mode must still accumulate expert_counts_accum"

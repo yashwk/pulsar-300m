@@ -862,7 +862,11 @@ class PulsarMoEMLP(nn.Module):
             # the next optimizer step. Suppressed during checkpoint recompute as well,
             # otherwise every counter would increment twice.
             if self.training and (not _RECOMPUTING.active):
-                self.expert_counts_accum.add_(bincounts)
+                # In per-pulse mode the bias update reads expert_pulse_counts only, so
+                # expert_counts_accum would grow forever without being read or zeroed
+                # (FP32 stops resolving +1 at 2^24). Skip it there.
+                if not self.cfg.per_pulse_bias:
+                    self.expert_counts_accum.add_(bincounts)
                 self.expert_pulse_counts[pulse_idx].add_(bincounts)
                 # Drop accounting stays on the GPU; drained by pop_moe_stats().
                 # Tracked per pulse as well as in total: drops are a per-pulse
@@ -945,6 +949,9 @@ class PulsarMoEMLP(nn.Module):
             self.expert_bias[:k].add_(bias_lr * torch.sign(avg - counts))
             self.expert_bias[:k].clamp_(-1.0, 1.0)
             self.expert_pulse_counts[:k].zero_()
+            # Reset even though it is not accumulated in this mode, so a model that
+            # switches modes (or loads an old checkpoint) cannot inherit a stale sum.
+            self.expert_counts_accum.zero_()
         else:
             avg_count = self.expert_counts_accum.mean()
             self.expert_bias.add_(bias_lr * torch.sign(avg_count - self.expert_counts_accum))
@@ -1133,8 +1140,32 @@ class PulsarForCausalLM(nn.Module):
                 print(f"[migrate] {name}: [E] -> [max_pulses, E] by broadcast")
         return migrated
 
+    def _migrate_counters(self, state_dict: dict) -> dict:
+        """Fill persistent MoE counter buffers that round-1 checkpoints lack.
+
+        expert_counts_accum / expert_pulse_counts became persistent so resume would be
+        exact, but checkpoints written before that have no such keys; strict loading then
+        fails on a missing key rather than a shape mismatch, which reads like corruption.
+        """
+        migrated = dict(state_dict)
+        # Only PERSISTENT buffers belong in a state_dict. Adding a non-persistent one
+        # makes it an unexpected key on the way back in.
+        for mod_name, module in self.named_modules():
+            for buf_name, buf in module.named_buffers(recurse=False):
+                if buf_name in module._non_persistent_buffers_set:
+                    continue
+                full = f"{mod_name}.{buf_name}" if mod_name else buf_name
+                if full in migrated:
+                    continue
+                if "counts_accum" in buf_name or "pulse_counts" in buf_name:
+                    migrated[full] = torch.zeros_like(buf)
+                    print(f"[migrate] {full}: missing in checkpoint, filled with zeros")
+        return migrated
+
     def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
-        return super().load_state_dict(self._migrate_checkpoint_bias(state_dict), strict=strict, assign=assign)
+        migrated = self._migrate_checkpoint_bias(state_dict)
+        migrated = self._migrate_counters(migrated)
+        return super().load_state_dict(migrated, strict=strict, assign=assign)
 
     @torch.no_grad()
     def pop_moe_stats(self) -> dict:

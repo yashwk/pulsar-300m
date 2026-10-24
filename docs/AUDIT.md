@@ -236,9 +236,10 @@ the `[1/E, 1]` bound.
   leverage do change. It also gives z-loss an irreducible floor of `ln(E) = 2.079`, so
   z-loss now penalises logit *spread* rather than magnitude. Verified numerically.
 - The 8,593 tok/s baseline and 8,163 tok/s floor appear nowhere in this repository and are
-  unsourced. Replaced by `docs/THROUGHPUT_BASELINE.md`, measured on current code:
-  MBS 3 / cap 1.12 = **7,916 tok/s**; MBS 2 / cap 1.375 = **7,400**; MBS 2 / cap 1.12 =
-  **7,000**. Note MBS 2 at capacity 1.12 is *slower* than at 1.375 despite less memory.
+  unsourced. Measured on current code instead: MBS 3 / cap 1.12 = **7,916 tok/s**;
+  MBS 2 / cap 1.375 = **7,400**; MBS 2 / cap 1.12 = **7,000** (20 steps each, mean of the
+  last 12 reported values). Note MBS 2 at capacity 1.12 is *slower* than at 1.375 despite
+  less memory.
 
 ### Smoke run results (300 steps, current code)
 

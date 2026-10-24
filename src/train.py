@@ -633,8 +633,11 @@ def train():
         # Accumulate gradients across micro-batches
         accum_loss_tensor = torch.zeros((), device=device, dtype=torch.float32)
         metric_accum: dict = {}
-        # Router diagnostics are sampled once per log window, on the first micro-batch.
-        is_log_step = (step == 1) or (step % args.log_every == 0)
+        # Router diagnostics are sampled, not continuous: one micro-batch out of the
+        # accumulation group, every 10 steps. There is no --log-every flag (an earlier
+        # version referenced args.log_every, which does not exist and crashed the trainer
+        # on step 2); metrics.jsonl is written every step.
+        is_log_step = (step == 1) or (step % 10 == 0)
         for micro_step in range(grad_accum):
             seed_micro = args.seed + step * 1000 + micro_step
             x, y = train_loader.get_batch(seed_micro)

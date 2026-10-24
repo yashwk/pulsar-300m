@@ -753,6 +753,11 @@ class PulsarMoEMLP(nn.Module):
         # Drop statistics, accumulated on the GPU and drained by pop_moe_stats().
         # No .item() in the hot path: syncing per micro-batch would serialise the stream.
         self.register_buffer("drop_counts_accum", torch.zeros((), dtype=torch.float32), persistent=False)
+        # What the OLD metric reported: sum(max(count - capacity, 0)) from bincounts.
+        # Kept only for cross-checking against the slot-derived value.
+        self.register_buffer(
+            "demand_over_capacity_accum", torch.zeros((), dtype=torch.float32), persistent=False
+        )
         self.register_buffer("assigned_counts_accum", torch.zeros((), dtype=torch.float32), persistent=False)
         self.register_buffer("capacity_last", torch.zeros((), dtype=torch.float32), persistent=False)
         self.register_buffer("pulse_drop_accum", torch.zeros(cfg.max_pulses, dtype=torch.float32), persistent=False)
@@ -828,6 +833,14 @@ class PulsarMoEMLP(nn.Module):
         # size its output from the data, which forces a device sync; index_add_ on a
         # known-size buffer does not. This runs 24x per micro-batch (8 blocks x 3
         # pulses), so the sync was measurable.
+        # Slot assignment is computed once, before the counters, because the REAL number
+        # of dropped assignments is the count of negative slots. Deriving drops from
+        # bincounts only equals that while the slot logic is correct - the fast-path bug
+        # discarded ~85% of assignments while this metric read 0%.
+        token_to_slot = compute_token_slots(
+            topk_idx, topk_weights, self.cfg.n_routed_experts, capacity
+        )
+
         with torch.no_grad():
             bincounts = torch.zeros(self.cfg.n_routed_experts, device=x.device, dtype=torch.float32)
             count_idx = topk_idx.reshape(-1)
@@ -855,19 +868,23 @@ class PulsarMoEMLP(nn.Module):
                 # Drop accounting stays on the GPU; drained by pop_moe_stats().
                 # Tracked per pulse as well as in total: drops are a per-pulse
                 # phenomenon, so a single global rate would hide the case that matters.
-                dropped_per_expert = (bincounts - capacity).clamp(min=0.0)
-                self.drop_counts_accum.add_(dropped_per_expert.sum())
-                self.assigned_counts_accum.add_(bincounts.sum())
-                self.pulse_drop_accum[pulse_idx].add_(dropped_per_expert.sum())
-                self.pulse_assigned_accum[pulse_idx].add_(bincounts.sum())
+                # Drops measured from the ACTUAL slot assignment.
+                dropped = (token_to_slot < 0).sum().to(torch.float32)
+                assigned = torch.full_like(dropped, float(token_to_slot.numel()))
+                # demand_over_capacity is kept for comparison: it is what the old code
+                # reported, and the two disagree whenever the slot logic is wrong.
+                self.demand_over_capacity_accum.add_(
+                    (bincounts - capacity).clamp(min=0.0).sum()
+                )
+                self.drop_counts_accum.add_(dropped)
+                self.assigned_counts_accum.add_(assigned)
+                self.pulse_drop_accum[pulse_idx].add_(dropped)
+                self.pulse_assigned_accum[pulse_idx].add_(assigned)
                 self.capacity_last.fill_(float(capacity))
 
         if (HAS_PULSAR_CUDA and x_flat.is_cuda and x_flat.dtype == torch.bfloat16
                 and not torch.compiler.is_compiling()
                 and hasattr(pulsar_cuda, "moe_dispatch_forward")):
-            token_to_slot = compute_token_slots(
-                topk_idx, topk_weights, self.cfg.n_routed_experts, capacity
-            )
             expert_inputs = _FusedMoEDispatchFunction.apply(
                 x_flat, topk_idx, token_to_slot, self.cfg.n_routed_experts, capacity
             )
@@ -888,9 +905,6 @@ class PulsarMoEMLP(nn.Module):
             # Applies the SAME capacity and drop rule as the CUDA path, so CPU
             # evaluation matches training. Without this, CPU evals silently used
             # unlimited capacity while training dropped assignments.
-            token_to_slot = compute_token_slots(
-                topk_idx, topk_weights, self.cfg.n_routed_experts, capacity
-            )
             flat_token_idx = torch.arange(N, device=x.device).unsqueeze(1).expand(N, self.cfg.top_k).reshape(-1)
             flat_expert_ids = topk_idx.reshape(-1)
             flat_weights = topk_weights.reshape(-1).to(x.dtype)
@@ -1133,6 +1147,7 @@ class PulsarForCausalLM(nn.Module):
         dropped = 0.0
         assigned = 0.0
         capacity = 0.0
+        demand_over = 0.0
         per_block_drop = []
         pulse_drop = torch.zeros(self.cfg.max_pulses, device=self.core[0].mlp.drop_counts_accum.device)
         pulse_assigned = torch.zeros_like(pulse_drop)
@@ -1147,6 +1162,8 @@ class PulsarForCausalLM(nn.Module):
             per_block_drop.append(d)
             pulse_drop += mlp.pulse_drop_accum.float()
             pulse_assigned += mlp.pulse_assigned_accum.float()
+            demand_over += float(mlp.demand_over_capacity_accum.item())
+            mlp.demand_over_capacity_accum.zero_()
             mlp.drop_counts_accum.zero_()
             mlp.assigned_counts_accum.zero_()
             mlp.pulse_drop_accum.zero_()
@@ -1161,11 +1178,19 @@ class PulsarForCausalLM(nn.Module):
             }
             for k in range(self.cfg.max_pulses)
         ]
+        # Cross-check: the slot-derived count is authoritative, the bincount heuristic is
+        # only a proxy that silently disagrees when slot assignment is broken.
+        if abs(demand_over - dropped) > max(1.0, 0.01 * max(1.0, dropped)):
+            print(
+                f"[Pulsar][WARN] MoE drop accounting mismatch: "
+                f"slot-derived {dropped:.0f} vs demand-over-capacity {demand_over:.0f}"
+            )
         return {
             "dropped": dropped,
             "assigned": assigned,
             "capacity": capacity,
             "drop_rate": (dropped / assigned) if assigned > 0 else 0.0,
+            "demand_over_capacity": demand_over,
             "per_block_dropped": per_block_drop,
             "per_pulse": per_pulse,
         }

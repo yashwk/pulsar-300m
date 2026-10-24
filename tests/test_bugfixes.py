@@ -1174,3 +1174,51 @@ def test_inv_freq_is_exact_after_training_precision():
         f"inv_freq differs from the exact formula by {max_err:.3e}; it was "
         f"up-cast from a rounded buffer rather than rebuilt"
     )
+
+
+# ---------------------------------------------------------------------------
+# R-02: drop telemetry must come from the actual slot assignment
+# ---------------------------------------------------------------------------
+
+def test_drops_measured_from_slots_not_bincounts():
+    """sum(max(count-capacity,0)) only equals the real drop count while the slot logic
+    is correct. The old fast-path bug discarded ~85% of assignments while that metric
+    read 0%. Drops are now counted from negative slots, with the old value kept as a
+    cross-check.
+    """
+    import src.model as M
+    from src.model import PulsarConfig, PulsarForCausalLM
+
+    cfg = make_cfg(n_core=2, d_model=128, vocab_size=512, top_k=2)
+    cfg.moe_capacity_factor = 10.0      # capacity far above demand: nothing should drop
+    torch.manual_seed(0)
+    model = PulsarForCausalLM(cfg)
+    model.to_training_precision(torch.bfloat16)
+    model.train()
+
+    x = torch.randint(0, cfg.vocab_size, (2, 64))
+
+    # Healthy slots: no drops, and the two measures agree.
+    with torch.no_grad():
+        model(x, labels=None, num_pulses=2)
+    good = model.pop_moe_stats()
+    assert good["dropped"] == 0, f"dropped {good['dropped']} with capacity far above demand"
+    assert good["demand_over_capacity"] == 0
+
+    # Broken slots that discard 2/3 of assignments: the slot-derived count must see it.
+    orig = M.compute_token_slots
+
+    def broken(ti, tw, E, C):
+        s = orig(ti, tw, E, C)
+        return torch.where(s % 3 == 0, s, torch.full_like(s, -1))
+
+    M.compute_token_slots = broken
+    try:
+        with torch.no_grad():
+            model(x, labels=None, num_pulses=2)
+    finally:
+        M.compute_token_slots = orig
+    bad = model.pop_moe_stats()
+
+    assert bad["dropped"] > 0, "slot-derived drops missed a deliberately broken slot fn"
+    assert bad["demand_over_capacity"] == 0, "test premise: bincount heuristic sees nothing"

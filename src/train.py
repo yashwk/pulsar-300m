@@ -317,6 +317,11 @@ def train():
     parser.add_argument("--min-lr-ratio", type=float, default=0.01, help="Minimum LR ratio during cooldown (docs specify 1 percent)")
     parser.add_argument("--eval-every", type=int, default=25, help="Steps between validation and canary generation")
     parser.add_argument("--eval-iters", type=int, default=10, help="Batches evaluated during validation")
+    parser.add_argument(
+        "--router-diag", action=argparse.BooleanOptionalAction, default=True,
+        help="Sample router diagnostics (shared-mean fraction, bias override rate) on one "
+             "micro-batch per log window. No behaviour change, no extra steady-state sync.",
+    )
     parser.add_argument("--save-every", type=int, default=25, help="Steps between saving latest.pt")
     parser.add_argument("--no-save", action="store_true",
                         help="Never write checkpoints (smoke tests). A full checkpoint is "
@@ -628,6 +633,11 @@ def train():
         # Accumulate gradients across micro-batches
         accum_loss_tensor = torch.zeros((), device=device, dtype=torch.float32)
         metric_accum: dict = {}
+        # Router diagnostics are sampled, not continuous: one micro-batch out of the
+        # accumulation group, every 10 steps. There is no --log-every flag (an earlier
+        # version referenced args.log_every, which does not exist and crashed the trainer
+        # on step 2); metrics.jsonl is written every step.
+        is_log_step = (step == 1) or (step % 10 == 0)
         for micro_step in range(grad_accum):
             seed_micro = args.seed + step * 1000 + micro_step
             x, y = train_loader.get_batch(seed_micro)
@@ -639,6 +649,9 @@ def train():
             _, loss, metrics = model(
                 x, labels=y, num_pulses=args.num_pulses,
                 subsample_offset=micro_step, routing_mask=rmask,
+                # Sampled, not continuous: one micro-batch per log window keeps the cost
+                # at a no-grad matmul per (block, pulse) instead of every step.
+                router_diag=(args.router_diag and is_log_step and micro_step == 0),
             )
             t1 = time.time()
             scaled_loss = loss / grad_accum
@@ -668,7 +681,14 @@ def train():
                 return prev + cur / n
 
             for _k, _v in metrics.items():
-                metric_accum[_k] = _avg(metric_accum.get(_k), _v, grad_accum)
+                if _k.startswith("router_diag_"):
+                    # Only present on micro_step 0, so they must NOT be divided by
+                    # grad_accum - that shrank every diagnostic by the accumulation
+                    # factor (max_top1_share has an upper bound of 1 and came out 43x
+                    # too small).
+                    metric_accum[_k] = _v
+                else:
+                    metric_accum[_k] = _avg(metric_accum.get(_k), _v, grad_accum)
             step_metrics = metric_accum
 
         accum_loss = accum_loss_tensor.item()
@@ -925,6 +945,13 @@ def train():
             # recurrent pulses help; this is the signal on whether looping pays off.
             "latent_gain": cur_latent_gain,
             # Per-pulse expert load: the aggregate is what hid the imbalance.
+            # R-01 step 1: router diagnostics. Absent on non-log steps, which is why
+            # they are optional here rather than required keys.
+            **{
+                _k: round(float(_v), 5)
+                for _k, _v in step_metrics.items()
+                if _k.startswith("router_diag_")
+            },
             "worst_expert_share_pct": round(float(worst_expert_share_pct), 2) if worst_expert_share_pct is not None else None,
             "mean_block_spread_pct": round(float(mean_block_spread_pct), 2) if mean_block_spread_pct is not None else None,
             "max_block_spread_pct": round(float(max_block_spread_pct), 2) if max_block_spread_pct is not None else None,

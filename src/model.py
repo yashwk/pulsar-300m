@@ -154,28 +154,36 @@ class _FusedSoftcapCrossEntropyFunction(torch.autograd.Function):
         ctx.N = N
 
         if reduction == "mean":
-            valid_mask = (targets != ignore_index)
-            n_valid = max(1, valid_mask.sum().item())
+            # Keep n_valid on the device. .item() here forced a host sync on every
+            # micro-batch (43 per optimizer step).
+            n_valid = (targets != ignore_index).sum().clamp_min(1).to(torch.float32)
             ctx.n_valid = n_valid
             return losses.sum() / n_valid
         elif reduction == "sum":
-            ctx.n_valid = 1
+            ctx.n_valid = None
             return losses.sum()
-        ctx.n_valid = 1
+        ctx.n_valid = None
         return losses
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         logits, targets, lse = ctx.saved_tensors
-        if ctx.reduction == "mean":
-            scale = grad_output.item() / ctx.n_valid
-        elif ctx.reduction == "sum":
-            scale = grad_output.item()
+        # grad_output / n_valid stays a device tensor so the kernel reads the scale
+        # without a host round-trip; the scalar variant is kept for the sum path.
+        if ctx.n_valid is not None:
+            scale_dev = (grad_output.reshape(()) / ctx.n_valid).to(torch.float32).contiguous()
+            d_logits = pulsar_cuda.fused_softcap_ce_backward_dev(
+                logits.contiguous(), targets.contiguous(), lse.contiguous(),
+                ctx.softcap, scale_dev, ctx.ignore_index,
+            )
         else:
-            scale = 1.0
-        d_logits = pulsar_cuda.fused_softcap_ce_backward(
-            logits.contiguous(), targets.contiguous(), lse.contiguous(), ctx.softcap, scale, ctx.ignore_index
-        )
+            # "sum" reduction: a grad_output of 1.0 is the norm, but pass it as a device
+            # tensor anyway so a non-trivial upstream gradient cannot force a sync.
+            scale_dev = grad_output.reshape(()).to(torch.float32).contiguous()
+            d_logits = pulsar_cuda.fused_softcap_ce_backward_dev(
+                logits.contiguous(), targets.contiguous(), lse.contiguous(),
+                ctx.softcap, scale_dev, ctx.ignore_index,
+            )
         return d_logits, None, None, None, None
 
 
@@ -330,6 +338,15 @@ class RotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._set_cos_sin_cache(max_seq_len)
+
+    def _inv_freq_fp32(self, device=None) -> torch.Tensor:
+        """Recompute inv_freq in FP32 from (theta, dim).
+
+        The registered buffer is not authoritative after a bf16 cast: rounding it then
+        up-casting does not recover the original frequencies.
+        """
+        dev = device if device is not None else self.inv_freq.device
+        return 1.0 / (self.theta ** (torch.arange(0, self.dim, 2).to(dev).float() / self.dim))
 
     def _set_cos_sin_cache(self, seq_len: int, device=None, dtype=None):
         self.max_seq_len = seq_len
@@ -564,23 +581,17 @@ def compute_token_slots(
         counts.index_add_(0, flat_e, torch.ones(M, device=device, dtype=torch.long))
         start_off = counts.cumsum(0) - counts            # [E] group start per expert
 
-        # Fast path: everything fits.
+        # Single path, no branch and no host sync.
         #
         # The rank must be the assignment's ORDINAL WITHIN ITS EXPERT, not its position
-        # in the flattened token order. `arange(M) - start_off[flat_e]` is only correct
-        # when assignments are already grouped by expert; the router emits them in token
-        # order, so with interleaved experts (e.g. [[0,1],[0,1]]) it produced
-        # [0, -1, 2, 1]: slot 0 and 1 land in expert 0, and 2/1 collide or overflow.
-        # The stable sort by expert id establishes that grouping.
-        if int(counts.max()) <= capacity:
-            order = torch.argsort(flat_e, stable=True)
-            rank = torch.empty(M, device=device, dtype=torch.long)
-            rank[order] = torch.arange(M, device=device) - start_off[flat_e[order]]
-            return rank.to(torch.int32).view(N, K)
-
-        # Slow path: order by (expert asc, weight desc) so low-weight assignments drop.
-        # start_off is indexed by EXPERT, so the per-expert group start must be taken
-        # from the expert id of the sorted element, not from its position.
+        # in the flattened token order, so assignments are ordered by (expert asc,
+        # weight desc). That one ordering does both jobs: it establishes the expert
+        # grouping the rank needs, and it puts the highest-weight assignments first so
+        # only the lowest-weight ones fall past capacity.
+        #
+        # The previous version branched on `int(counts.max()) <= capacity` to skip the
+        # sort, but that .item() forced a device sync 24x per forward. Measured cost of
+        # the branch itself was 0.10 ms/call, so the sync was the only reason to have it.
         flat_w = topk_weights.reshape(-1).float()
         order = torch.argsort(flat_w, descending=True, stable=True)
         order = order[torch.argsort(flat_e[order], stable=True)]
@@ -744,6 +755,11 @@ class PulsarMoEMLP(nn.Module):
         # Drop statistics, accumulated on the GPU and drained by pop_moe_stats().
         # No .item() in the hot path: syncing per micro-batch would serialise the stream.
         self.register_buffer("drop_counts_accum", torch.zeros((), dtype=torch.float32), persistent=False)
+        # What the OLD metric reported: sum(max(count - capacity, 0)) from bincounts.
+        # Kept only for cross-checking against the slot-derived value.
+        self.register_buffer(
+            "demand_over_capacity_accum", torch.zeros((), dtype=torch.float32), persistent=False
+        )
         self.register_buffer("assigned_counts_accum", torch.zeros((), dtype=torch.float32), persistent=False)
         self.register_buffer("capacity_last", torch.zeros((), dtype=torch.float32), persistent=False)
         self.register_buffer("pulse_drop_accum", torch.zeros(cfg.max_pulses, dtype=torch.float32), persistent=False)
@@ -751,10 +767,12 @@ class PulsarMoEMLP(nn.Module):
 
     def forward(
         self, x: torch.Tensor, pulse_idx: int = 0, routing_mask: torch.Tensor | None = None,
+        router_diag: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         B, T, D = x.shape
         N = B * T
         x_flat = x.view(N, D)
+        router_diag = getattr(self, "_diag_capture", None) is not None
 
         # 1. Pulse-indexed router logits
         # Router logits in FP32. bf16 spacing near |logit|=1 is ~0.008, comparable to
@@ -819,46 +837,59 @@ class PulsarMoEMLP(nn.Module):
         # size its output from the data, which forces a device sync; index_add_ on a
         # known-size buffer does not. This runs 24x per micro-batch (8 blocks x 3
         # pulses), so the sync was measurable.
+        # Slot assignment is computed once, before the counters, because the REAL number
+        # of dropped assignments is the count of negative slots. Deriving drops from
+        # bincounts only equals that while the slot logic is correct - the fast-path bug
+        # discarded ~85% of assignments while this metric read 0%.
+        token_to_slot = compute_token_slots(
+            topk_idx, topk_weights, self.cfg.n_routed_experts, capacity
+        )
+
         with torch.no_grad():
             bincounts = torch.zeros(self.cfg.n_routed_experts, device=x.device, dtype=torch.float32)
             count_idx = topk_idx.reshape(-1)
-            if valid is not None and not bool(valid.all()):
-                # Map padded assignments onto a valid expert and weight them by 0, so
-                # index_add_ cannot add entries from padding.
-                weights = torch.ones(topk_idx.numel(), device=x.device, dtype=torch.float32)
-                weights = weights * valid.repeat_interleave(self.cfg.top_k).float()
-                count_idx = torch.where(valid.repeat_interleave(self.cfg.top_k), count_idx,
-                                        torch.zeros_like(count_idx))
-                bincounts.index_add_(0, count_idx, weights)
+            # Branch-free, so no host sync on `valid.all()`. Padded assignments are
+            # remapped onto expert 0 and weighted 0, which index_add_ discards; the
+            # unmasked case is simply the same expression with an all-ones weight.
+            if valid is not None:
+                assign_valid = valid.repeat_interleave(self.cfg.top_k)
+                weights = assign_valid.to(torch.float32)
+                count_idx = torch.where(assign_valid, count_idx, torch.zeros_like(count_idx))
             else:
-                bincounts.index_add_(
-                    0, count_idx,
-                    torch.ones(topk_idx.numel(), device=x.device, dtype=torch.float32),
-                )
+                weights = torch.ones(topk_idx.numel(), device=x.device, dtype=torch.float32)
+            bincounts.index_add_(0, count_idx, weights)
             # Counters feed the auxiliary-loss-free bias update, so only TRAINING
             # forwards may move them. Validation and generation were accumulating too:
             # one eval forward added 768 assignments and shifted the routing bias before
             # the next optimizer step. Suppressed during checkpoint recompute as well,
             # otherwise every counter would increment twice.
             if self.training and (not _RECOMPUTING.active):
-                self.expert_counts_accum.add_(bincounts)
+                # In per-pulse mode the bias update reads expert_pulse_counts only, so
+                # expert_counts_accum would grow forever without being read or zeroed
+                # (FP32 stops resolving +1 at 2^24). Skip it there.
+                if not self.cfg.per_pulse_bias:
+                    self.expert_counts_accum.add_(bincounts)
                 self.expert_pulse_counts[pulse_idx].add_(bincounts)
                 # Drop accounting stays on the GPU; drained by pop_moe_stats().
                 # Tracked per pulse as well as in total: drops are a per-pulse
                 # phenomenon, so a single global rate would hide the case that matters.
-                dropped_per_expert = (bincounts - capacity).clamp(min=0.0)
-                self.drop_counts_accum.add_(dropped_per_expert.sum())
-                self.assigned_counts_accum.add_(bincounts.sum())
-                self.pulse_drop_accum[pulse_idx].add_(dropped_per_expert.sum())
-                self.pulse_assigned_accum[pulse_idx].add_(bincounts.sum())
+                # Drops measured from the ACTUAL slot assignment.
+                dropped = (token_to_slot < 0).sum().to(torch.float32)
+                assigned = torch.full_like(dropped, float(token_to_slot.numel()))
+                # demand_over_capacity is kept for comparison: it is what the old code
+                # reported, and the two disagree whenever the slot logic is wrong.
+                self.demand_over_capacity_accum.add_(
+                    (bincounts - capacity).clamp(min=0.0).sum()
+                )
+                self.drop_counts_accum.add_(dropped)
+                self.assigned_counts_accum.add_(assigned)
+                self.pulse_drop_accum[pulse_idx].add_(dropped)
+                self.pulse_assigned_accum[pulse_idx].add_(assigned)
                 self.capacity_last.fill_(float(capacity))
 
         if (HAS_PULSAR_CUDA and x_flat.is_cuda and x_flat.dtype == torch.bfloat16
                 and not torch.compiler.is_compiling()
                 and hasattr(pulsar_cuda, "moe_dispatch_forward")):
-            token_to_slot = compute_token_slots(
-                topk_idx, topk_weights, self.cfg.n_routed_experts, capacity
-            )
             expert_inputs = _FusedMoEDispatchFunction.apply(
                 x_flat, topk_idx, token_to_slot, self.cfg.n_routed_experts, capacity
             )
@@ -879,9 +910,6 @@ class PulsarMoEMLP(nn.Module):
             # Applies the SAME capacity and drop rule as the CUDA path, so CPU
             # evaluation matches training. Without this, CPU evals silently used
             # unlimited capacity while training dropped assignments.
-            token_to_slot = compute_token_slots(
-                topk_idx, topk_weights, self.cfg.n_routed_experts, capacity
-            )
             flat_token_idx = torch.arange(N, device=x.device).unsqueeze(1).expand(N, self.cfg.top_k).reshape(-1)
             flat_expert_ids = topk_idx.reshape(-1)
             flat_weights = topk_weights.reshape(-1).to(x.dtype)
@@ -908,7 +936,68 @@ class PulsarMoEMLP(nn.Module):
         # matter what the router does - the old value was pinned at 0.5 by construction.
         # The per-token max is the quantity that actually moves as routing sharpens.
         mean_max_weight = topk_weights.detach().max(dim=-1).values.mean() if topk_weights.ndim == 2 else topk_weights.detach().mean()
+        if router_diag:
+            self._diag_capture.append(
+                (pulse_idx, x_flat.detach(), logits.detach(), topk_idx.detach())
+            )
         return out, z_loss, mean_max_weight, bincounts
+
+    def router_diagnostics(self, x_flat: torch.Tensor, logits: torch.Tensor,
+                           topk_idx: torch.Tensor, pulse_idx: int) -> dict:
+        """Measure whether the router is being driven by a token-independent term.
+
+        The hypothesis under test is that by pulse 3 the hidden state carries a strong
+        batch-mean component, so a router update along +/-x_bar moves the logits of all
+        tokens together and saturates sigmoid. shared_mean_frac is the share of
+        logit variance explained by that shared term:
+
+            Var_e(w_e . mu) / (Var_e(w_e . mu) + mean_tokens Var_e(w_e . (x - mu)))
+
+        Also reports how often the balancing bias overrides the content-based top-2.
+        Runs under no_grad on the caller's sample; no host syncs here.
+        """
+        with torch.no_grad():
+            xf = x_flat.float()
+            mu = xf.mean(dim=0, keepdim=True)                       # [1, D]
+            centred = xf - mu
+            w = self.router_weight[pulse_idx].float()
+
+            shared = mu @ w.t()                                     # [1, E]
+            diff = centred @ w.t()                                  # [N, E]
+            var_shared = shared.var(dim=-1, unbiased=False).mean()
+            var_diff = diff.var(dim=-1, unbiased=False).mean()
+            denom = (var_shared + var_diff).clamp_min(1e-12)
+            shared_mean_frac = (var_shared / denom).reshape(())
+
+            # bias_override_rate: top-2 with bias differs from top-2 without it.
+            bias = (self.expert_bias[pulse_idx] if self.cfg.per_pulse_bias
+                    else self.expert_bias).float()
+            k = self.cfg.top_k
+            scores = torch.sigmoid(logits.float())
+            with_bias = torch.topk(scores + bias, k=k, dim=-1).indices
+            without = torch.topk(scores, k=k, dim=-1).indices
+            # Compare as sets: the same two experts in a different order is not an override.
+            same = (with_bias.unsqueeze(-1) == without.unsqueeze(1)).any(-1).sum(-1) == k
+            bias_override_rate = (~same).float().mean()
+
+            # Top-1 share per expert and router entropy (bits of the top-1 histogram).
+            counts = torch.bincount(topk_idx[:, 0].reshape(-1),
+                                    minlength=self.cfg.n_routed_experts).float()
+            shares = counts / counts.sum().clamp_min(1.0)
+            ent = -(shares * (shares + 1e-9).log()).sum()
+
+            abs_bias = bias.abs()
+
+        return {
+            "shared_mean_frac": shared_mean_frac.detach(),
+            "bias_override_rate": bias_override_rate.detach(),
+            "top1_entropy": ent.detach(),
+            "max_top1_share": shares.max().detach(),
+            "bias_abs_p50": abs_bias.median().detach() if abs_bias.numel() else torch.zeros(()),
+            "bias_abs_p99": (
+                torch.quantile(abs_bias.float(), 0.99) if abs_bias.numel() else torch.zeros(())
+            ),
+        }
 
     def update_biases(self, bias_lr: float = 0.001, num_pulses: int | None = None):
         """Auxiliary-loss-free bias update.
@@ -923,6 +1012,9 @@ class PulsarMoEMLP(nn.Module):
             self.expert_bias[:k].add_(bias_lr * torch.sign(avg - counts))
             self.expert_bias[:k].clamp_(-1.0, 1.0)
             self.expert_pulse_counts[:k].zero_()
+            # Reset even though it is not accumulated in this mode, so a model that
+            # switches modes (or loads an old checkpoint) cannot inherit a stale sum.
+            self.expert_counts_accum.zero_()
         else:
             avg_count = self.expert_counts_accum.mean()
             self.expert_bias.add_(bias_lr * torch.sign(avg_count - self.expert_counts_accum))
@@ -1020,7 +1112,13 @@ class PulsarForCausalLM(nn.Module):
         # context length after a device/dtype move.
         for rope in (getattr(self, "rope_local", None), getattr(self, "rope_global", None)):
             if rope is not None:
-                rope.inv_freq.data = rope.inv_freq.data.float()
+                # REBUILD from (theta, dim) in FP32. Calling .float() on the buffer only
+                # up-casts values that self.to(bf16) already rounded: measured error is
+                # 3.65e-3 relative (0.37%), i.e. up to ~0.5 rad of angle error by
+                # position 1024 and tens of radians at 32k. Training stayed
+                # self-consistent only because every path used the same rounded table;
+                # any FP32 eval or export would place tokens differently.
+                rope.inv_freq.data = rope._inv_freq_fp32(device=rope.inv_freq.device)
                 rope._set_cos_sin_cache(rope.max_seq_len, device=rope.inv_freq.device, dtype=torch.float32)
 
         return self
@@ -1105,8 +1203,32 @@ class PulsarForCausalLM(nn.Module):
                 print(f"[migrate] {name}: [E] -> [max_pulses, E] by broadcast")
         return migrated
 
+    def _migrate_counters(self, state_dict: dict) -> dict:
+        """Fill persistent MoE counter buffers that round-1 checkpoints lack.
+
+        expert_counts_accum / expert_pulse_counts became persistent so resume would be
+        exact, but checkpoints written before that have no such keys; strict loading then
+        fails on a missing key rather than a shape mismatch, which reads like corruption.
+        """
+        migrated = dict(state_dict)
+        # Only PERSISTENT buffers belong in a state_dict. Adding a non-persistent one
+        # makes it an unexpected key on the way back in.
+        for mod_name, module in self.named_modules():
+            for buf_name, buf in module.named_buffers(recurse=False):
+                if buf_name in module._non_persistent_buffers_set:
+                    continue
+                full = f"{mod_name}.{buf_name}" if mod_name else buf_name
+                if full in migrated:
+                    continue
+                if "counts_accum" in buf_name or "pulse_counts" in buf_name:
+                    migrated[full] = torch.zeros_like(buf)
+                    print(f"[migrate] {full}: missing in checkpoint, filled with zeros")
+        return migrated
+
     def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
-        return super().load_state_dict(self._migrate_checkpoint_bias(state_dict), strict=strict, assign=assign)
+        migrated = self._migrate_checkpoint_bias(state_dict)
+        migrated = self._migrate_counters(migrated)
+        return super().load_state_dict(migrated, strict=strict, assign=assign)
 
     @torch.no_grad()
     def pop_moe_stats(self) -> dict:
@@ -1118,6 +1240,7 @@ class PulsarForCausalLM(nn.Module):
         dropped = 0.0
         assigned = 0.0
         capacity = 0.0
+        demand_over = 0.0
         per_block_drop = []
         pulse_drop = torch.zeros(self.cfg.max_pulses, device=self.core[0].mlp.drop_counts_accum.device)
         pulse_assigned = torch.zeros_like(pulse_drop)
@@ -1132,6 +1255,8 @@ class PulsarForCausalLM(nn.Module):
             per_block_drop.append(d)
             pulse_drop += mlp.pulse_drop_accum.float()
             pulse_assigned += mlp.pulse_assigned_accum.float()
+            demand_over += float(mlp.demand_over_capacity_accum.item())
+            mlp.demand_over_capacity_accum.zero_()
             mlp.drop_counts_accum.zero_()
             mlp.assigned_counts_accum.zero_()
             mlp.pulse_drop_accum.zero_()
@@ -1146,11 +1271,19 @@ class PulsarForCausalLM(nn.Module):
             }
             for k in range(self.cfg.max_pulses)
         ]
+        # Cross-check: the slot-derived count is authoritative, the bincount heuristic is
+        # only a proxy that silently disagrees when slot assignment is broken.
+        if abs(demand_over - dropped) > max(1.0, 0.01 * max(1.0, dropped)):
+            print(
+                f"[Pulsar][WARN] MoE drop accounting mismatch: "
+                f"slot-derived {dropped:.0f} vs demand-over-capacity {demand_over:.0f}"
+            )
         return {
             "dropped": dropped,
             "assigned": assigned,
             "capacity": capacity,
             "drop_rate": (dropped / assigned) if assigned > 0 else 0.0,
+            "demand_over_capacity": demand_over,
             "per_block_dropped": per_block_drop,
             "per_pulse": per_pulse,
         }
@@ -1187,6 +1320,7 @@ class PulsarForCausalLM(nn.Module):
         subsample_offset: int = 0,
         eval_full_pulses: bool = False,
         routing_mask: torch.Tensor | None = None,
+        router_diag: bool = False,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, dict[str, float]]:
         B, T = input_ids.shape
         K = num_pulses if num_pulses is not None else self.cfg.default_pulses
@@ -1197,6 +1331,13 @@ class PulsarForCausalLM(nn.Module):
         h_0 = self.tok_emb(input_ids)
         cos_local, sin_local = self.rope_local(h_0, T)
         cos_global, sin_global = self.rope_global(h_0, T)
+
+        # Router diagnostics are sampled, not continuous: capture is enabled for this
+        # forward only, and the trainer calls it on at most one micro-batch per log
+        # window. Cost is a no-grad matmul per (block, pulse) on that one batch.
+        if router_diag:
+            for block in self.core:
+                block.mlp._diag_capture = []
 
         h_0_norm = self.anchor_norm(h_0)
         h_pulse = h_0
@@ -1259,14 +1400,18 @@ class PulsarForCausalLM(nn.Module):
 
                     # Blocks mutate MoE counters as a side effect. Recompute during
                     # backward would double-count them, so counters are frozen around
-                    # recompute, suppressed by a thread-local flag (see _RECOMPUTING).
-                    # context_fn tells the checkpoint machinery to raise the flag
-                    # while recomputing, so MoE counter side effects are skipped.
+                    # context_fn takes (forward_ctx, recompute_ctx) in that order, per
+                    # the torch.utils.checkpoint docs: "The function and its recomputation
+                    # will be run under the first and second context managers
+                    # respectively." This was inverted, so the ORIGINAL forward skipped
+                    # the MoE counters and the recomputation applied them - the counts
+                    # still landed exactly once, but only during backward, so a forward
+                    # that is never backpropagated never counted at all.
                     h_curr, v_first, z_loss, gate_weight_mean, bincounts = checkpoint(
                         block, h_curr, cos, sin,
                         pulse_idx=k, v_first=v_first, routing_mask=routing_mask,
                         use_reentrant=False,
-                        context_fn=lambda: (_set_recomputing(True), _set_recomputing(False)),
+                        context_fn=lambda: (_set_recomputing(False), _set_recomputing(True)),
                     )
                 else:
                     h_curr, v_first, z_loss, gate_weight_mean, bincounts = block(
@@ -1376,7 +1521,6 @@ class PulsarForCausalLM(nn.Module):
             "router_max_bias": max_bias,
             "expert_pcts": expert_pct,
             "expert_pcts_per_pulse": expert_pct_per_pulse,
-            # The honest imbalance numbers: these are not diluted across blocks.
             "worst_expert_share_pct": worst_expert_share,
             "mean_block_spread_pct": mean_block_spread,
             "max_block_spread_pct": max_block_spread,
@@ -1389,6 +1533,31 @@ class PulsarForCausalLM(nn.Module):
             "delta_pulse_2": pulse_delta_t[1] if len(pulse_delta_t) >= 2 else (pulse_delta_t[0] if pulse_delta_t else zero),
             "delta_pulse_3": pulse_delta_t[-1] if pulse_delta_t else zero,
         }
+        # Router diagnostics (R-01 step 1): aggregated over (block, pulse) for this
+        # forward only. Empty unless router_diag was requested.
+        router_diag_metrics = {}
+        if router_diag:
+            captured = [
+                entry
+                for block in self.core
+                for entry in (getattr(block.mlp, "_diag_capture", None) or [])
+            ]
+            for block in self.core:
+                block.mlp._diag_capture = None
+            if captured:
+                modules = [b.mlp for b in self.core for _ in range(K)]
+                per = [
+                    mod.router_diagnostics(xf, lg, ti, pi)
+                    for (pi, xf, lg, ti), mod in zip(captured, modules)
+                ]
+                router_diag_metrics = {
+                    f"router_diag_{key}": torch.stack(
+                        [d[key].reshape(()) for d in per]
+                    ).mean()
+                    for key in per[0]
+                }
+                metrics.update(router_diag_metrics)
+
         return logits, total_loss, metrics
 
     def get_model_summary(self, num_pulses: int | None = None) -> dict:

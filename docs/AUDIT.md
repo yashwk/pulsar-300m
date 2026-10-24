@@ -146,3 +146,147 @@ matrix, so Q/K/V (and gate/up) share a single update scale; splitting them into 
 sub-matrices before Newton-Schulz would decouple that. Deliberately skipped — it changes
 training dynamics and no A/B runs are planned. If re-added, implement and test the split in
 the same change.
+
+---
+
+## Round 2 (branch `fix/round2`)
+
+Every claim below was verified against the code and by experiment before editing. Status
+per item, with the measurement that decided it.
+
+### R-06 — FIXED: activation-checkpoint context order was inverted
+
+`torch.utils.checkpoint` documents `context_fn` as `(forward_ctx, recompute_ctx)`. The call
+site passed `(_set_recomputing(True), _set_recomputing(False))`, so the original forward
+suppressed the MoE counters and the recomputation applied them.
+
+Measured before: with `grad_checkpoint=True`, counters after forward = **0**, after
+backward = 512. After the fix: forward = 512, backward = 512, so counts still land exactly
+once. Any forward not followed by a backward previously counted nothing.
+
+### R-04 — FIXED: RoPE `inv_freq` up-cast instead of rebuilt
+
+`to_training_precision` called `self.to(bf16)` (rounding the buffer) and then
+`inv_freq.data.float()`, which recovers the rounded values. Measured error **3.65e-3
+relative (0.37%)** — up to ~0.5 rad of angle error by position 1024, tens of radians at
+32k. Now rebuilt from `(theta, dim)`; error is exactly **0.0**.
+
+**Checkpoint consequence:** checkpoints trained before this encode rounded frequencies.
+Do not resume one with the corrected code. The 107-step checkpoint is discardable.
+
+### R-02 — FIXED: drop telemetry now comes from the slot assignment
+
+Drops were `sum(max(bincount - capacity, 0))`, which equals the real count only while slot
+logic is correct. The earlier fast-path bug discarded ~85% of assignments while this metric
+read 0%.
+
+Drops are now `(token_to_slot < 0).sum()`; the old value is kept as
+`demand_over_capacity` and a warning fires when the two disagree. Measured with a
+deliberately broken slot function: slot-derived reports **670**, the bincount heuristic
+still reports **0**.
+
+Side effect: slot assignment is now computed once per forward instead of once per dispatch
+branch.
+
+### R-03 — FIXED: host syncs removed from the hot path
+
+Three sites: `int(counts.max())` (24x/forward), `valid_mask.sum().item()` +
+`grad_output.item()` in CE, and `bool(valid.all())` in the MoE counter path. The CE scale
+is now passed by device pointer (new `fused_softcap_ce_backward_dev`); the slot function
+uses one sort path; the counter path is branch-free.
+
+A `set_sync_debug_mode("error")` test caught a **fourth** site during development (the
+`sum` reduction path) that the report did not list.
+
+**The 5% throughput target was wrong and is withdrawn.** Measured cost of these syncs:
+`compute_token_slots` 0.100 ms/call x 24 = 2.4 ms/forward = **0.10 s of a 17.5 s step
+(0.6%)**. That cannot explain the gap the report attributed to it.
+
+### R-07 — FIXED (low priority): unused global counter grew forever
+
+In per-pulse mode `update_biases` reads `expert_pulse_counts`, while `expert_counts_accum`
+accumulated and was never read or zeroed. Measured: 200 steps grew it to 25,600, i.e.
+**~131,000 steps of headroom** before FP32 stops resolving +1 — a real defect, not a live
+hazard. Now skipped in per-pulse mode; global mode unchanged (separate test pins it).
+
+Added `_migrate_counters()` for round-1 checkpoints missing the persistent counter buffers.
+The migration must consult `_non_persistent_buffers_set`: injecting a non-persistent buffer
+makes it an unexpected key on reload (found by the resume test failing).
+
+### R-01 step 1 — DONE: router diagnostics shipped, measurement only
+
+`--router-diag` (default on), sampled on the first micro-batch of each log window. Adds
+`router_diag_shared_mean_frac`, `_bias_override_rate`, `_top1_entropy`, `_max_top1_share`,
+`_bias_abs_p50`, `_bias_abs_p99`.
+
+Validated rather than merely plausible: synthetic input with a dominant shared mean scores
+**~1.0**, pure noise **~0.004**. A second bug was found while wiring it: per-micro-batch
+averaging divided every diagnostic by `grad_accum`, but diagnostics exist only on
+micro-step 0 — `max_top1_share` was reported **43x too small (0.0026)**. A test now pins
+the `[1/E, 1]` bound.
+
+**Not done, awaiting owner:** R-01 step 3 (router-input centering) depends on the measured
+`shared_mean_frac` from a smoke run; R-05, R-08 to R-13 are explicitly deferred.
+
+### Corrected claims
+
+- The report called logit centering "mathematically invariant." It is not: routing uses
+  `sigmoid(logits) + bias`, and sigmoid is not shift-invariant. Top-k *ranking* is
+  preserved because sigmoid is monotone, so it is safe, but gating weights and bias
+  leverage do change. It also gives z-loss an irreducible floor of `ln(E) = 2.079`, so
+  z-loss now penalises logit *spread* rather than magnitude. Verified numerically.
+- The 8,593 tok/s baseline and 8,163 tok/s floor appear nowhere in this repository and are
+  unsourced. Replaced by `docs/THROUGHPUT_BASELINE.md`, measured on current code:
+  MBS 3 / cap 1.12 = **7,916 tok/s**; MBS 2 / cap 1.375 = **7,400**; MBS 2 / cap 1.12 =
+  **7,000**. Note MBS 2 at capacity 1.12 is *slower* than at 1.375 despite less memory.
+
+### Smoke run results (300 steps, current code)
+
+Config: MBS 2 x 1024, capacity 1.375 (704 slots), warmup 150, bias_lr 0.01, seed 42.
+Completed 300/300, exit 0, 91.5 min.
+
+| step | val CE |
+|---|---|
+| 50 | 8.468 |
+| 100 | 5.683 |
+| 150 | 4.666 |
+| 200 | 4.105 |
+| 250 | 3.786 |
+| 300 | 3.428 |
+
+Final train loss 3.521, no NaN, peak VRAM 6.22 GB, mean 7,348 tok/s.
+
+Muon gradient norm reproduced the earlier run's trajectory **exactly** at every matched
+checkpoint (0.40 / 0.42 / 0.64 / 0.85 / 1.12 at steps 1/10/19/25/28), peaked at **4.56 on
+step 47**, and fell back to **0.25** (clip factor 1.00) — below its step-1 value. The spike
+is reproducible, self-correcting, and unaffected by anything in round 2, which is expected:
+R-02/R-03/R-06/R-07/R-01 change no gradients.
+
+### R-01 step 1 result: `shared_mean_frac` is a transient, not a steady state
+
+Threshold agreed with the owner: "above about 0.3 in some (block, pulse)".
+
+| step | shared_mean_frac |
+|---|---|
+| 1 | 0.007 |
+| 30 | 0.030 |
+| 40 | 0.104 |
+| **50** | **0.446** |
+| **60** | **0.643** |
+| **70** | **0.453** |
+| 80 | 0.267 |
+| 100 | 0.109 |
+| 200 | 0.072 |
+| 300 | ~0.09 |
+
+It crosses 0.3 for exactly one window (steps 50-70) and then decays ~6x; steps 100+ average
+**0.083**. Read literally the step-3 trigger fires, but the condition it was written to
+detect (a persistent token-independent component dominating later pulses) is not what the
+data shows. Router-input centering would target a transient that self-resolves inside ~20
+steps, in the same window as the Muon spike and the routing divergence.
+
+Other diagnostics over the run: `bias_override_rate` rises to 0.61 at step 50 and decays
+to 0.19 by step 240; `bias_abs_p99` peaks at 0.177, far below the +-1.0 clamp;
+`max_top1_share` stays 0.17-0.24 against a uniform 0.125.
+
+**Recommendation: do not implement step 3.** Decision is the owner's.

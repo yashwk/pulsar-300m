@@ -78,6 +78,14 @@ torch::Tensor fused_softcap_ce_backward_cuda(
     float grad_scale,
     int64_t ignore_index
 );
+torch::Tensor fused_softcap_ce_backward_dev_cuda(
+    torch::Tensor logits,
+    torch::Tensor targets,
+    torch::Tensor lse,
+    float softcap,
+    torch::Tensor grad_scale_dev,
+    int64_t ignore_index
+);
 
 std::vector<torch::Tensor> moe_router_topk_forward_cuda(
     torch::Tensor logits,
@@ -112,6 +120,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("logits"), py::arg("targets"), py::arg("softcap") = 30.0f, py::arg("ignore_index") = -100);
     m.def("fused_softcap_ce_backward", &fused_softcap_ce_backward_cuda, "Fused Softcap Cross-Entropy Backward (CUDA)",
           py::arg("logits"), py::arg("targets"), py::arg("lse"), py::arg("softcap") = 30.0f, py::arg("grad_scale") = 1.0f, py::arg("ignore_index") = -100);
+    m.def("fused_softcap_ce_backward_dev", &fused_softcap_ce_backward_dev_cuda,
+          "Fused Softcap Cross-Entropy Backward with a device-side grad scale (no host sync)",
+          py::arg("logits"), py::arg("targets"), py::arg("lse"), py::arg("softcap") = 30.0f,
+          py::arg("grad_scale_dev"), py::arg("ignore_index") = -100);
     m.def("moe_router_topk_forward", &moe_router_topk_forward_cuda, "Fused MoE Router Top-2 Forward (CUDA)",
           py::arg("logits"), py::arg("expert_bias"), py::arg("z_loss_weight") = 1e-4f);
     m.def("moe_router_topk_backward", &moe_router_topk_backward_cuda, "Fused MoE Router Top-2 Backward (CUDA)",

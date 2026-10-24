@@ -733,7 +733,10 @@ def test_eval_forward_does_not_accumulate_routing_counters():
     x = torch.randint(0, cfg.vocab_size, (1, 16))
 
     def total_counts():
-        return sum(float(b.mlp.expert_counts_accum.sum()) for b in model.core)
+        # expert_pulse_counts is the counter the bias update actually reads when
+        # per_pulse_bias is on; expert_counts_accum is intentionally not accumulated
+        # in that mode (R-07), so absence of growth there proves nothing about eval.
+        return sum(float(b.mlp.expert_pulse_counts.sum()) for b in model.core)
 
     model.eval()
     with torch.no_grad():
@@ -1104,3 +1107,269 @@ def test_per_block_imbalance_is_not_diluted():
         f"maximum {agg_max:.1f}% - the imbalance is being diluted"
     )
     assert worst > 40, f"worst_expert_share {worst:.1f}% too low for a forced collapse"
+
+
+# ---------------------------------------------------------------------------
+# R-06: activation-checkpoint context order
+# ---------------------------------------------------------------------------
+
+def test_checkpointed_forward_accumulates_counters_during_forward():
+    """context_fn is (forward_ctx, recompute_ctx).
+
+    It was inverted, so the original forward skipped the MoE counters and the
+    recomputation applied them. Counts still landed once, but only in backward - a
+    forward never followed by backward counted nothing at all.
+    """
+    from src.model import PulsarConfig, PulsarForCausalLM
+
+    cfg = make_cfg(n_core=2, d_model=128, vocab_size=512, top_k=2)
+    torch.manual_seed(0)
+    model = PulsarForCausalLM(cfg)
+    model.to_training_precision(torch.bfloat16)
+    model.train()
+    model.grad_checkpoint = True
+
+    x = torch.randint(0, cfg.vocab_size, (2, 32))
+    y = torch.randint(0, cfg.vocab_size, (2, 32))
+
+    def counts():
+        # per_pulse_bias is the default, and R-07 stops accumulating expert_counts_accum
+        # in that mode, so track the per-pulse counter that is actually live.
+        return sum(float(b.mlp.expert_pulse_counts.sum()) for b in model.core)
+
+    _, loss, _ = model(x, labels=y, num_pulses=2)
+    after_forward = counts()
+    loss.backward()
+    after_backward = counts()
+
+    assert after_forward > 0, (
+        "checkpointed forward accumulated no MoE counts; context_fn order is inverted"
+    )
+    assert after_backward == after_forward, (
+        f"backward changed the counters from {after_forward} to {after_backward}; "
+        f"recomputation must not double-count"
+    )
+
+
+# ---------------------------------------------------------------------------
+# R-04: RoPE frequencies must survive the bf16 cast
+# ---------------------------------------------------------------------------
+
+def test_inv_freq_is_exact_after_training_precision():
+    """to_training_precision used to up-cast the bf16-rounded buffer.
+
+    self.to(bf16) rounds inv_freq first; .float() afterwards recovers the rounded
+    values, not the originals - 3.65e-3 relative error, which is ~0.5 rad of angle
+    error by position 1024. It must be rebuilt from (theta, dim) instead.
+    """
+    from src.model import PulsarForCausalLM
+
+    cfg = make_cfg(n_core=2, d_model=128, vocab_size=512, top_k=2)
+    torch.manual_seed(0)
+    model = PulsarForCausalLM(cfg)
+    model.to_training_precision(torch.bfloat16)
+
+    rope = [m for _, m in model.named_modules() if hasattr(m, "inv_freq")][0]
+    expected = 1.0 / (
+        rope.theta ** (torch.arange(0, rope.dim, 2).float() / rope.dim)
+    )
+    assert rope.inv_freq.dtype == torch.float32
+    max_err = (rope.inv_freq.float() - expected).abs().max().item()
+    assert max_err == 0.0, (
+        f"inv_freq differs from the exact formula by {max_err:.3e}; it was "
+        f"up-cast from a rounded buffer rather than rebuilt"
+    )
+
+
+# ---------------------------------------------------------------------------
+# R-02: drop telemetry must come from the actual slot assignment
+# ---------------------------------------------------------------------------
+
+def test_drops_measured_from_slots_not_bincounts():
+    """sum(max(count-capacity,0)) only equals the real drop count while the slot logic
+    is correct. The old fast-path bug discarded ~85% of assignments while that metric
+    read 0%. Drops are now counted from negative slots, with the old value kept as a
+    cross-check.
+    """
+    import src.model as M
+    from src.model import PulsarConfig, PulsarForCausalLM
+
+    cfg = make_cfg(n_core=2, d_model=128, vocab_size=512, top_k=2)
+    cfg.moe_capacity_factor = 10.0      # capacity far above demand: nothing should drop
+    torch.manual_seed(0)
+    model = PulsarForCausalLM(cfg)
+    model.to_training_precision(torch.bfloat16)
+    model.train()
+
+    x = torch.randint(0, cfg.vocab_size, (2, 64))
+
+    # Healthy slots: no drops, and the two measures agree.
+    with torch.no_grad():
+        model(x, labels=None, num_pulses=2)
+    good = model.pop_moe_stats()
+    assert good["dropped"] == 0, f"dropped {good['dropped']} with capacity far above demand"
+    assert good["demand_over_capacity"] == 0
+
+    # Broken slots that discard 2/3 of assignments: the slot-derived count must see it.
+    orig = M.compute_token_slots
+
+    def broken(ti, tw, E, C):
+        s = orig(ti, tw, E, C)
+        return torch.where(s % 3 == 0, s, torch.full_like(s, -1))
+
+    M.compute_token_slots = broken
+    try:
+        with torch.no_grad():
+            model(x, labels=None, num_pulses=2)
+    finally:
+        M.compute_token_slots = orig
+    bad = model.pop_moe_stats()
+
+    assert bad["dropped"] > 0, "slot-derived drops missed a deliberately broken slot fn"
+    assert bad["demand_over_capacity"] == 0, "test premise: bincount heuristic sees nothing"
+
+
+# ---------------------------------------------------------------------------
+# R-03: no host synchronisation in the training hot path
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not HAS_CUDA, reason="needs CUDA to detect syncs")
+def test_training_step_has_no_host_sync():
+    """Hot-path .item()/bool(tensor) forced a device sync 24x per forward.
+
+    torch.cuda.set_sync_debug_mode("error") turns any host sync into an exception, so
+    this catches regressions structurally rather than by timing.
+    """
+    from src.model import PulsarConfig, PulsarForCausalLM
+
+    cfg = make_cfg(n_core=2, d_model=128, vocab_size=512, top_k=2)
+    torch.manual_seed(0)
+    model = PulsarForCausalLM(cfg).cuda()
+    model.to_training_precision(torch.bfloat16)
+    model.train()
+
+    x = torch.randint(0, cfg.vocab_size, (2, 32), device="cuda")
+    y = torch.randint(0, cfg.vocab_size, (2, 32), device="cuda")
+
+    # Warm up so lazy CUDA init is not mistaken for a sync.
+    try:
+        _, loss, _ = model(x, labels=y, num_pulses=2)
+        loss.backward()
+    finally:
+        model.zero_grad(set_to_none=True)
+    torch.cuda.synchronize()
+
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        _, loss, _ = model(x, labels=y, num_pulses=2)
+        loss.backward()
+    except RuntimeError as exc:                      # pragma: no cover - regression path
+        pytest.fail(f"host sync in the training hot path: {exc}")
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+
+# ---------------------------------------------------------------------------
+# R-07: per-pulse mode must not accumulate the unused global counter
+# ---------------------------------------------------------------------------
+
+def test_per_pulse_mode_keeps_global_counter_bounded():
+    """update_biases() reads expert_pulse_counts in per-pulse mode, so the global
+    expert_counts_accum was accumulated forever without being read or zeroed."""
+    from src.model import PulsarForCausalLM
+
+    cfg = make_cfg(n_core=2, d_model=128, vocab_size=512, top_k=2)
+    cfg.per_pulse_bias = True
+    torch.manual_seed(0)
+    model = PulsarForCausalLM(cfg)
+    model.train()
+    x = torch.randint(0, cfg.vocab_size, (1, 16))
+
+    with torch.no_grad():
+        for _ in range(100):
+            model(x, labels=None, num_pulses=2)
+            for block in model.core:
+                block.mlp.update_biases(0.01, num_pulses=2)
+
+    total = sum(float(b.mlp.expert_counts_accum.sum()) for b in model.core)
+    assert total == 0, (
+        f"expert_counts_accum reached {total} after 100 per-pulse steps; it is unused "
+        f"in this mode and would grow until FP32 stops resolving +1 at 2^24"
+    )
+
+
+def test_global_mode_still_accumulates_global_counter():
+    """The skip above must be conditional - the non-per-pulse path still needs it."""
+    from src.model import PulsarForCausalLM
+
+    cfg = make_cfg(n_core=2, d_model=128, vocab_size=512, top_k=2)
+    cfg.per_pulse_bias = False
+    torch.manual_seed(0)
+    model = PulsarForCausalLM(cfg)
+    model.train()
+
+    with torch.no_grad():
+        model(torch.randint(0, cfg.vocab_size, (1, 16)), labels=None, num_pulses=2)
+
+    total = sum(float(b.mlp.expert_counts_accum.sum()) for b in model.core)
+    assert total > 0, "global mode must still accumulate expert_counts_accum"
+
+
+# ---------------------------------------------------------------------------
+# R-01 step 1: router diagnostics (measurement only, no behaviour change)
+# ---------------------------------------------------------------------------
+
+def test_shared_mean_frac_detects_a_dominant_batch_mean():
+    """The diagnostic must separate "driven by a shared token-independent term" from
+    "driven by per-token content", otherwise the number is unfalsifiable."""
+    import torch as _t
+
+    from src.model import PulsarMoEMLP
+
+    cfg = make_cfg(n_core=2, d_model=128, vocab_size=512, top_k=2)
+    _t.manual_seed(0)
+    mlp = PulsarMoEMLP(cfg)
+    N, D = 256, cfg.d_model
+
+    def measure(x):
+        logits = x @ mlp.router_weight[0].float().t()
+        idx = _t.topk(logits, cfg.top_k, dim=-1).indices
+        return float(mlp.router_diagnostics(x, logits, idx, 0)["shared_mean_frac"])
+
+    noise_only = _t.randn(N, D)
+    with_shared = _t.randn(N, D) * 0.1 + _t.randn(1, D) * 5.0
+
+    frac_pure = measure(noise_only)
+    frac_shared = measure(with_shared)
+
+    assert frac_pure < 0.2, f"pure noise scored {frac_pure:.3f}, expected near 0"
+    assert frac_shared > 0.8, f"shared-mean input scored {frac_shared:.3f}, expected near 1"
+
+
+def test_router_diag_absent_unless_requested():
+    """Diagnostics are sampled, not continuous: a normal forward must not pay for them."""
+    from src.model import PulsarForCausalLM
+
+    cfg = make_cfg(n_core=2, d_model=128, vocab_size=512, top_k=2)
+    torch.manual_seed(0)
+    model = PulsarForCausalLM(cfg)
+    model.train()
+    x = torch.randint(0, cfg.vocab_size, (2, 32))
+
+    _, _, plain = model(x, labels=x, num_pulses=2)
+    assert not any(k.startswith("router_diag_") for k in plain)
+
+    _, _, with_diag = model(x, labels=x, num_pulses=2, router_diag=True)
+    keys = [k for k in with_diag if k.startswith("router_diag_")]
+    assert keys, "router_diag=True produced no diagnostic fields"
+    for k in keys:
+        val = float(with_diag[k])
+        assert val == val, f"{k} is NaN"
+        assert abs(val) < 1e3, f"{k} is implausible ({val})"
+
+    # max_top1_share is a fraction bounded below by uniform (1/E) and above by 1.
+    share = float(with_diag["router_diag_max_top1_share"])
+    assert 1.0 / cfg.n_routed_experts - 1e-6 <= share <= 1.0, (
+        f"max_top1_share {share} outside [1/E, 1]; the value was probably divided by "
+        f"the gradient-accumulation factor"
+    )

@@ -104,8 +104,12 @@ def detect_target_and_curriculum_steps():
     curriculum_steps = None
     if os.path.exists(log_file):
         try:
-            with open(log_file, "r", encoding="utf-8") as f:
-                content = f.read(16384)
+            with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+                # Seek to near end of log to read the most recent session's banner
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - 65536))
+                content = f.read()
                 m = re.findall(r"Starting training: Steps \d+ -> (\d+)(?:\s+\(Curriculum Horizon:\s*(\d+)\))?", content)
                 if m:
                     last_m = m[-1]
@@ -304,9 +308,14 @@ def enrich_status_payload(data):
     elif "status" not in data or data["status"] == "cooling":
         data["status"] = "training"
     target_step, curriculum_steps = detect_target_and_curriculum_steps()
-    if target_step is not None:
+    if data.get("target_steps") is not None:
+        target_step = data["target_steps"]
+    elif data.get("target_step") is not None:
+        target_step = data["target_step"]
         data["target_steps"] = target_step
-    if curriculum_steps is not None:
+    elif target_step is not None:
+        data["target_steps"] = target_step
+    if curriculum_steps is not None and "curriculum_steps" not in data:
         data["curriculum_steps"] = curriculum_steps
 
     max_steps = data.get("max_steps") or curriculum_steps or 10000

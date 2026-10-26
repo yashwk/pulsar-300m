@@ -207,6 +207,10 @@ def test_muon_step_does_not_promote_gradients_to_fp32():
     """
     import src.optim as optim_mod
 
+    free_bytes, total_bytes = torch.cuda.mem_get_info()
+    if free_bytes < 600 * 1024 * 1024:
+        pytest.skip(f"Not enough free VRAM ({free_bytes / 1e6:.0f} MB free) for 500 MB peak test")
+
     params = [torch.nn.Parameter(torch.zeros(8, 1024, 2048, device="cuda",
                                               dtype=torch.bfloat16))]
     opt = optim_mod.Muon(params, lr=0.02, momentum=0.95)

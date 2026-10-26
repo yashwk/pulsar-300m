@@ -538,7 +538,8 @@ def train():
         )
         if os.path.exists(resume_file):
             print(f"\n[Pulsar] Resuming from checkpoint: {resume_file}")
-            ckpt = torch.load(resume_file, map_location=device, weights_only=False)
+            # Load to CPU first to prevent a 3.4 GB VRAM allocation spike on consumer GPUs
+            ckpt = torch.load(resume_file, map_location="cpu", weights_only=False)
             model.load_state_dict(ckpt["model"], strict=False)
 
             if "opt_muon" in ckpt and ckpt["opt_muon"] is not None:
@@ -551,6 +552,11 @@ def train():
             start_step = ckpt.get("global_step", 0)
             tokens_seen = ckpt.get("tokens_seen", 0)
             best_val_loss = ckpt.get("best_val_loss", float("inf"))
+
+            # Free checkpoint CPU memory and flush any lingering GPU caches
+            del ckpt
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             # A packed loaders' position is its cursor, not the RNG seed: without this
             # a resumed run restarts at window 0 and retrains the opening data.
@@ -913,6 +919,8 @@ def train():
         metric_record = {
             "step": step,
             "max_steps": args.max_steps,
+            "target_step": args.target_step if args.target_step is not None else args.max_steps,
+            "target_steps": args.target_step if args.target_step is not None else args.max_steps,
             "tokens_seen": tokens_seen,
             "train_dataset_tokens": train_loader.total_tokens,
             "num_train_shards": len(train_shards),

@@ -3095,9 +3095,9 @@
 
           const bParams = document.getElementById('hdrBadgeParams');
           if (bParams) {
-            const totM = ((mc.total_params || 298552384) / 1e6).toFixed(1);
-            const actM = ((mc.active_params || 146800640) / 1e6).toFixed(1);
-            bParams.innerText = `${totM}M Total (${actM}M Active)`;
+            const totM = mc.total_params ? `${(mc.total_params / 1e6).toFixed(1)}M Total` : '-- Total';
+            const actM = mc.active_params ? `${(mc.active_params / 1e6).toFixed(1)}M Active` : '-- Active';
+            bParams.innerText = `${totM} (${actM})`;
           }
         }
         if (data.device_name) {
@@ -3107,56 +3107,72 @@
 
         // 2. Dual Horizon Progress Bars
         const step = data.step || 0;
-        const maxSteps = data.max_steps || (data.total_steps || 100);
+        const maxSteps = data.curriculum_steps || data.max_steps || data.target_steps || 0;
         const targetSteps = data.target_steps || data.active_target || maxSteps;
-        const stepPct = Math.min(100, ((step / targetSteps) * 100)).toFixed(1);
-        document.getElementById('valStepText').innerText = (data.target_steps && data.target_steps < maxSteps)
+        const stepPct = targetSteps > 0 ? Math.min(100, ((step / targetSteps) * 100)).toFixed(1) : '0.0';
+        document.getElementById('valStepText').innerText = (targetSteps && maxSteps && targetSteps < maxSteps)
             ? `Step ${step.toLocaleString()} / ${targetSteps.toLocaleString()} (Curriculum: ${maxSteps.toLocaleString()})`
-            : `Step ${step.toLocaleString()} / ${maxSteps.toLocaleString()}`;
+            : `Step ${step.toLocaleString()} / ${(targetSteps || maxSteps || step).toLocaleString()}`;
         document.getElementById('valStepPct').innerText = `${stepPct}%`;
         document.getElementById('stepProgressBar').style.width = `${stepPct}%`;
-        document.getElementById('valPhase').innerText = data.phase || (step >= targetSteps ? 'Target Completed' : 'Stable Phase');
+        document.getElementById('valPhase').innerText = data.phase || (step >= targetSteps && targetSteps > 0 ? 'Target Completed' : 'Stable Phase');
         document.getElementById('valETA').innerText = data.eta_str || '--:--';
         document.getElementById('valElapsed').innerText = data.elapsed_str || '--';
 
-        // Run Completion / Milestone Status Banner
+        // Run Completion / Milestone Status Banner:
+        // Strictly authoritatively driven by data.status === 'completed' or data.phase === 'Target Completed'
         const runBanner = document.getElementById('runStatusBanner');
         if (runBanner) {
-          if (step >= targetSteps && targetSteps > 0) {
+          const isTargetReached = (data.status === 'completed' || data.phase === 'Target Completed') && (targetSteps > 0 && step >= targetSteps);
+          if (isTargetReached) {
             runBanner.style.display = 'flex';
-            document.getElementById('runStatusTitle').innerText = `SESSION TARGET REACHED (${targetSteps} STEPS)`;
+            document.getElementById('runStatusTitle').innerText = `SESSION TARGET REACHED (${targetSteps.toLocaleString()} STEPS)`;
             document.getElementById('runStatusBadge').innerText = `Best Val: ${data.best_val_loss ? data.best_val_loss.toFixed(4) : '--'}`;
-            document.getElementById('runStatusDesc').innerText = `Target step ${targetSteps} reached successfully. Checkpoint saved to checkpoints/latest.pt and checkpoints/milestone_step_${targetSteps}.pt.`;
+            document.getElementById('runStatusDesc').innerText = `Target step ${targetSteps.toLocaleString()} reached successfully. Checkpoint saved to checkpoints/latest.pt and checkpoints/milestone_step_${targetSteps}.pt.`;
           } else {
             runBanner.style.display = 'none';
           }
         }
 
         const tokensSeen = data.tokens_seen || 0;
-        const datasetTokens = data.train_dataset_tokens || 950387366;
-        const numShards = data.num_train_shards || 2;
-        const datasetPct = ((tokensSeen / datasetTokens) * 100).toFixed(2);
+        const datasetTokens = data.train_dataset_tokens || 0;
+        const numShards = data.num_train_shards || 1;
+        const datasetPct = datasetTokens > 0 ? Math.min(100, ((tokensSeen / datasetTokens) * 100)).toFixed(2) : '0.00';
         
         // Dynamic Shard Traversal & Epoch Math
-        const shardSize = datasetTokens / Math.max(1, numShards);
-        const currentShardIdx = Math.min(numShards, Math.floor(tokensSeen / shardSize) + 1);
-        const tokensInCurrentShard = tokensSeen % shardSize;
-        const shardPct = ((tokensInCurrentShard / shardSize) * 100).toFixed(1);
+        const shardSize = (datasetTokens > 0 && numShards > 0) ? (datasetTokens / numShards) : 0;
+        const currentShardIdx = shardSize > 0 ? Math.min(numShards, Math.floor(tokensSeen / shardSize) + 1) : 1;
+        const tokensInCurrentShard = shardSize > 0 ? (tokensSeen % shardSize) : 0;
+        const shardPct = shardSize > 0 ? ((tokensInCurrentShard / shardSize) * 100).toFixed(1) : '0.0';
         const tokensRemainingInShard = Math.max(0, shardSize - tokensInCurrentShard);
-        const batchTokens = data.global_batch_tokens || 131072;
-        const stepsToNextShard = Math.ceil(tokensRemainingInShard / batchTokens);
-        const totalEpochSteps = Math.ceil(datasetTokens / batchTokens);
+        const batchTokens = data.global_batch_tokens || 0;
+        const stepsToNextShard = (batchTokens > 0 && tokensRemainingInShard > 0) ? Math.ceil(tokensRemainingInShard / batchTokens) : 0;
+        const totalEpochSteps = batchTokens > 0 ? Math.ceil(datasetTokens / batchTokens) : 0;
 
         const horizonTitleEl = document.getElementById('datasetHorizonTitle');
         if (horizonTitleEl) horizonTitleEl.innerText = `Dataset Horizon (${numShards} Shards Zero-Copy)`;
         
         const shardsTextEl = document.getElementById('valShardsText');
-        if (shardsTextEl) shardsTextEl.innerText = `Shard ${currentShardIdx}/${numShards} (${(tokensInCurrentShard / 1e6).toFixed(1)}M / ${(shardSize / 1e6).toFixed(1)}M • ${shardPct}%)`;
+        if (shardsTextEl) {
+          if (shardSize > 0) {
+            shardsTextEl.innerText = `Shard ${currentShardIdx}/${numShards} (${(tokensInCurrentShard / 1e6).toFixed(1)}M / ${(shardSize / 1e6).toFixed(1)}M • ${shardPct}%)`;
+          } else {
+            shardsTextEl.innerText = `Shard ${currentShardIdx}/${numShards}`;
+          }
+        }
 
         const batchEl = document.getElementById('valBatchText');
-        if (batchEl) batchEl.innerText = `${batchTokens.toLocaleString()} tok/step (~${stepsToNextShard.toLocaleString()} steps to Shard ${currentShardIdx < numShards ? currentShardIdx + 1 : 1})`;
+        if (batchEl) {
+          if (batchTokens > 0) {
+            batchEl.innerText = `${batchTokens.toLocaleString()} tok/step (~${stepsToNextShard.toLocaleString()} steps to Shard ${currentShardIdx < numShards ? currentShardIdx + 1 : 1})`;
+          } else {
+            batchEl.innerText = `-- tok/step`;
+          }
+        }
 
-        document.getElementById('valTokensText').innerText = `${(tokensSeen / 1e6).toFixed(2)}M / ${(datasetTokens / 1e6).toFixed(1)}M Total Tokens (${totalEpochSteps.toLocaleString()} steps / epoch)`;
+        document.getElementById('valTokensText').innerText = datasetTokens > 0
+          ? `${(tokensSeen / 1e6).toFixed(2)}M / ${(datasetTokens / 1e6).toFixed(1)}M Total Tokens (${totalEpochSteps.toLocaleString()} steps / epoch)`
+          : `${(tokensSeen / 1e6).toFixed(2)}M Total Tokens`;
         document.getElementById('valDatasetPct').innerText = `${datasetPct}%`;
         document.getElementById('datasetProgressBar').style.width = `${Math.min(100, datasetPct)}%`;
 
@@ -3467,13 +3483,13 @@
           }
           const compEl = document.getElementById('diagActiveCompute');
           if (compEl) {
-            compEl.innerText = `${((mc.active_params || 146800640) / 1e6).toFixed(1)}M Active`;
+            compEl.innerText = mc.active_params ? `${(mc.active_params / 1e6).toFixed(1)}M Active` : '-- Active';
           }
           const paramDetEl = document.getElementById('diagActiveParamsDetail');
           if (paramDetEl) {
-            const nEmbedM = ((mc.non_embed_active_params || 96468992) / 1e6).toFixed(1);
-            const totM = ((mc.total_params || 298552384) / 1e6).toFixed(1);
-            paramDetEl.innerText = `${nEmbedM}M non-embed | ${totM}M total`;
+            const nEmbedM = mc.non_embed_active_params ? `${(mc.non_embed_active_params / 1e6).toFixed(1)}M non-embed` : '--';
+            const totM = mc.total_params ? `${(mc.total_params / 1e6).toFixed(1)}M total` : '--';
+            paramDetEl.innerText = `${nEmbedM} | ${totM}`;
           }
         }
 

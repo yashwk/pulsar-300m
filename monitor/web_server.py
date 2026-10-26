@@ -98,17 +98,60 @@ def flop_scale_per_tok():
     return 2.05e-3 * (pulses / 3.0)
 
 
+RUN_CONFIG_FILE = os.path.join(CHECKPOINT_DIR, "run_config.json")
+_run_config_cache = {"key": None, "value": None}
+_run_config_lock = threading.Lock()
+
+
+def get_run_config():
+    """Read authoritative session configuration (SSOT written by train.py)."""
+    if not os.path.exists(RUN_CONFIG_FILE):
+        return {}
+    try:
+        st = os.stat(RUN_CONFIG_FILE)
+        key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return {}
+    with _run_config_lock:
+        if _run_config_cache["key"] == key and _run_config_cache["value"] is not None:
+            return dict(_run_config_cache["value"])
+    try:
+        with open(RUN_CONFIG_FILE, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        cfg = {}
+    with _run_config_lock:
+        _run_config_cache["key"], _run_config_cache["value"] = key, cfg
+    return dict(cfg)
+
+
 def detect_target_and_curriculum_steps():
+    # 1. Authoritative run_config.json (Single Source of Truth)
+    rc = get_run_config()
+    target_from_rc = rc.get("target_steps") or rc.get("target_step")
+    curriculum_from_rc = rc.get("curriculum_steps") or rc.get("max_steps")
+    if target_from_rc:
+        return int(target_from_rc), int(curriculum_from_rc) if curriculum_from_rc else None
+
+    # 2. Live status file
+    if os.path.exists(LIVE_STATUS_FILE):
+        try:
+            with open(LIVE_STATUS_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+                tgt = d.get("target_steps") or d.get("target_step")
+                cur = d.get("curriculum_steps") or d.get("max_steps")
+                if tgt:
+                    return int(tgt), int(cur) if cur else None
+        except Exception:
+            pass
+
+    # 3. Log file scan without arbitrary byte limits
     log_file = os.path.join(CHECKPOINT_DIR, "train.log")
     target_step = None
     curriculum_steps = None
     if os.path.exists(log_file):
         try:
             with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
-                # Seek to near end of log to read the most recent session's banner
-                f.seek(0, os.SEEK_END)
-                size = f.tell()
-                f.seek(max(0, size - 65536))
                 content = f.read()
                 m = re.findall(r"Starting training: Steps \d+ -> (\d+)(?:\s+\(Curriculum Horizon:\s*(\d+)\))?", content)
                 if m:
@@ -307,25 +350,42 @@ def enrich_status_payload(data):
         data["cooling_total_s"] = cooling_info["cooling_total_s"]
     elif "status" not in data or data["status"] == "cooling":
         data["status"] = "training"
-    target_step, curriculum_steps = detect_target_and_curriculum_steps()
-    if data.get("target_steps") is not None:
-        target_step = data["target_steps"]
-    elif data.get("target_step") is not None:
-        target_step = data["target_step"]
-        data["target_steps"] = target_step
-    elif target_step is not None:
-        data["target_steps"] = target_step
-    if curriculum_steps is not None and "curriculum_steps" not in data:
-        data["curriculum_steps"] = curriculum_steps
 
-    max_steps = data.get("max_steps") or curriculum_steps or 10000
-    # Prefer the target the trainer reports live; fall back to train.log, then the horizon.
-    active_target = data.get("target_steps")
-    if active_target is None:
-        active_target = target_step if target_step is not None else max_steps
+    # Merge authoritative run configuration (SSOT)
+    rc = get_run_config()
+    for k in (
+        "target_steps",
+        "target_step",
+        "max_steps",
+        "curriculum_steps",
+        "warmup_steps",
+        "cooldown_steps",
+        "global_batch_tokens",
+        "seq_len",
+        "num_pulses",
+        "lr_schedule",
+    ):
+        if rc.get(k) is not None and data.get(k) is None:
+            data[k] = rc[k]
+
+    target_step, curriculum_steps = detect_target_and_curriculum_steps()
+    if data.get("target_steps") is None:
+        if data.get("target_step") is not None:
+            data["target_steps"] = data["target_step"]
+        elif target_step is not None:
+            data["target_steps"] = target_step
+
+    if data.get("curriculum_steps") is None:
+        if curriculum_steps is not None:
+            data["curriculum_steps"] = curriculum_steps
+        elif data.get("max_steps") is not None:
+            data["curriculum_steps"] = data["max_steps"]
+
+    max_steps = data.get("curriculum_steps") or data.get("max_steps") or data.get("target_steps") or 0
+    active_target = data.get("target_steps") or target_step or max_steps
 
     step = data.get("step", 0)
-    tok_per_sec = data.get("tok_per_sec", 10000.0)
+    tok_per_sec = float(data.get("tok_per_sec") or 0.0)
 
     grads = load_csv_grads()
     if step in grads:
@@ -344,20 +404,26 @@ def enrich_status_payload(data):
 
     batch_tokens = float(data.get("global_batch_tokens") or 131072.0)
     rem = max(0, active_target - step)
-    step_time = (batch_tokens / max(1.0, tok_per_sec))
-    eta_sec = rem * step_time
-    m, s = divmod(int(eta_sec), 60)
-    h, m = divmod(m, 60)
-    data["eta_str"] = f"{h}h {m:02d}m" if h > 0 else f"{m:02d}m {s:02d}s"
+    step_time = (batch_tokens / max(1.0, tok_per_sec)) if tok_per_sec > 0 else 0.0
 
-    elapsed_sec = step * step_time
-    em, es = divmod(int(elapsed_sec), 60)
-    eh, em = divmod(em, 60)
-    data["elapsed_str"] = f"{eh}h {em:02d}m" if eh > 0 else f"{em:02d}m {es:02d}s"
+    if step_time > 0 and rem > 0:
+        eta_sec = rem * step_time
+        m, s = divmod(int(eta_sec), 60)
+        h, m = divmod(m, 60)
+        data["eta_str"] = f"{h}h {m:02d}m" if h > 0 else f"{m:02d}m {s:02d}s"
+    elif rem == 0:
+        data["eta_str"] = "00m 00s"
+    else:
+        data["eta_str"] = "--:--"
 
-    # Prefer the value the trainer reports. The old hardcoded 100 silently mislabelled
-    # the phase for any run with a different warmup (e.g. 150: the dashboard announced
-    # "Stable Phase" at step 100 while the LR was still ramping).
+    if step_time > 0:
+        elapsed_sec = step * step_time
+        em, es = divmod(int(elapsed_sec), 60)
+        eh, em = divmod(em, 60)
+        data["elapsed_str"] = f"{eh}h {em:02d}m" if eh > 0 else f"{em:02d}m {es:02d}s"
+    else:
+        data["elapsed_str"] = "--"
+
     warmup_steps = data.get("warmup_steps")
     if warmup_steps is None:
         warmup_steps = _run_config_value("warmup_steps", 0)
@@ -368,9 +434,10 @@ def enrich_status_payload(data):
     data["active_target"] = active_target
     data["warmup_steps"] = warmup_steps
     data["cooldown_steps"] = cooldown_steps
-    if step >= active_target:
+
+    if data.get("status") == "completed" or (active_target > 0 and step >= active_target):
         data["phase"] = "Target Completed"
-    elif step <= warmup_steps:
+    elif step <= warmup_steps and warmup_steps > 0:
         data["phase"] = f"Warmup ({step}/{warmup_steps})"
     elif cooldown_steps > 0 and step >= (max_steps - cooldown_steps):
         data["phase"] = "Cooldown / Decay"
@@ -382,9 +449,8 @@ def enrich_status_payload(data):
     train_shards = sorted(glob.glob(os.path.join(data_dir, "train*.bin")))
     train_shards = [s for s in train_shards if not s.endswith(".tmp")]
     disk_shards_count = len(train_shards) if train_shards else 1
-    disk_dataset_tokens = sum(os.path.getsize(p) // 2 for p in train_shards) if train_shards else 475368303
+    disk_dataset_tokens = sum(os.path.getsize(p) // 2 for p in train_shards) if train_shards else 0
 
-    # If training is not actively overriding with a specific subset, or if live data is missing / has fewer shards
     curr_shards = data.get("num_train_shards")
     if not curr_shards or curr_shards < disk_shards_count:
         data["num_train_shards"] = disk_shards_count

@@ -638,6 +638,28 @@ def train():
     stop_step = args.target_step if args.target_step is not None else args.max_steps
     print(f"\n[Pulsar] Starting training: Steps {start_step + 1} -> {stop_step} (Curriculum Horizon: {args.max_steps})...\n")
 
+    # Authoritative Run Configuration (SSOT for telemetry monitor)
+    session_config = {
+        "start_step": start_step,
+        "target_step": stop_step,
+        "target_steps": stop_step,
+        "max_steps": args.max_steps,
+        "curriculum_steps": args.max_steps,
+        "warmup_steps": args.warmup_steps,
+        "cooldown_steps": args.cooldown_steps,
+        "global_batch_tokens": effective_global_batch_tokens,
+        "seq_len": args.seq_len,
+        "num_pulses": args.num_pulses,
+        "lr_schedule": args.lr_schedule,
+    }
+    run_cfg_path = os.path.join(args.checkpoint_dir, "run_config.json")
+    try:
+        with open(run_cfg_path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(session_config, f, indent=2)
+        os.replace(run_cfg_path + ".tmp", run_cfg_path)
+    except Exception as e:
+        print(f"[Pulsar] Warning: could not write {run_cfg_path}: {e}")
+
     for step in range(start_step + 1, stop_step + 1):
         # Update learning rates with WSD or Cosine schedule
         lr_factor = get_lr_factor(
@@ -1094,8 +1116,18 @@ def train():
             break
 
     total_time = time.time() - t_start
+    final_status = "interrupted" if interrupted else "completed"
+    if 'live_payload' in locals() and os.path.exists(live_file):
+        try:
+            live_payload["status"] = final_status
+            with open(live_tmp, "w", encoding="utf-8") as f:
+                json.dump(live_payload, f, indent=2)
+            os.replace(live_tmp, live_file)
+        except Exception:
+            pass
+
     print(f"\n=======================================================")
-    print(f"Training finished in {total_time/60:.2f} mins.")
+    print(f"Training finished in {total_time/60:.2f} mins (Status: {final_status}).")
     print(f"Tokens seen: {tokens_seen:,} | Best Val Loss: {best_val_loss:.4f}")
     print(f"Latest checkpoint: {latest_ckpt_path}")
     print(f"=======================================================\n")

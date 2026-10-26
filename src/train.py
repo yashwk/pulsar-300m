@@ -165,15 +165,27 @@ def generate_canary(
     model: torch.nn.Module,
     tokenizer: AutoTokenizer,
     prompt: str,
-    max_new_tokens: int = 30,
+    max_new_tokens: int = 512,
     temperature: float = 0.7,
     device: str = "cuda",
     repetition_penalty: float = 1.15,
 ) -> str:
-    """Autoregressively decode tokens using full recurrent depth."""
+    """Autoregressively decode tokens using full recurrent depth until EOS or end token."""
     was_training = model.training
     model.eval()
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+
+    # Dynamic end-of-sequence termination tokens
+    stop_token_ids = set()
+    if tokenizer.eos_token_id is not None:
+        stop_token_ids.add(tokenizer.eos_token_id)
+    for tok_str in ["<|im_end|>", "<|endoftext|>", "</s>"]:
+        try:
+            tid = tokenizer.convert_tokens_to_ids(tok_str)
+            if tid is not None and tid != getattr(tokenizer, "unk_token_id", None):
+                stop_token_ids.add(tid)
+        except Exception:
+            pass
 
     with torch.no_grad():
         for _ in range(max_new_tokens):
@@ -195,7 +207,7 @@ def generate_canary(
             next_token = torch.multinomial(probs, num_samples=1)
             input_ids = torch.cat([input_ids, next_token], dim=1)
 
-            if next_token.item() == tokenizer.eos_token_id:
+            if next_token.item() in stop_token_ids:
                 break
 
     if was_training:
@@ -898,10 +910,10 @@ def train():
                 category = canary_meta["category"]
                 try:
                     generation = generate_canary(
-                        model, tokenizer, prompt, max_new_tokens=35, temperature=0.7, device=device
+                        model, tokenizer, prompt, max_new_tokens=512, temperature=0.7, device=device
                     )
-                    generation_clean = generation.replace("\n", " ").strip()
-                    print(f"  [{tag}] {generation_clean}")
+                    generation_clean = generation.strip()
+                    print(f"  [{tag}] {generation_clean.replace(chr(10), ' ')[:140]}...")
                     latest_canaries.append({
                         "id": canary_idx,
                         "tag": tag,

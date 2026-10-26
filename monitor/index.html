@@ -2547,11 +2547,11 @@
       // 2. Python Canary
       if (tag === 'Python') {
         const fullPy = (completionText.startsWith(promptText)) ? completionText : (promptText + completionText);
-        const hasRecursiveCall = /\bfibonacci(_sequence)?\s*\(/i.test(completionText);
-        const hasEot = completionText.includes('<|endoftext|>');
+        const hasRecursiveCall = /\b(quicksort|fibonacci)\s*\(/i.test(completionText);
+        const hasEot = completionText.includes('<|endoftext|>') || completionText.includes('<|im_end|>');
         
         const evalBadge = hasRecursiveCall
-          ? `<span class="canary-eval-badge eval-badge-emerald">Logic: Recursive Case Defined</span>`
+          ? `<span class="canary-eval-badge eval-badge-emerald">Logic: Recursive Partition Defined</span>`
           : `<span class="canary-eval-badge eval-badge-amber">Incomplete Logic</span>`;
 
         return `
@@ -2559,7 +2559,7 @@
             <div class="canary-header-left">
               <span class="canary-tag tag-python">Python</span>
               <span class="canary-title-text">Python Algorithm Synthesis</span>
-              <span class="canary-meta-pill">Task: Fibonacci Generator</span>
+              <span class="canary-meta-pill">Task: Quicksort Partitioning</span>
             </div>
             <div class="canary-header-right-tools">
               ${evalBadge}

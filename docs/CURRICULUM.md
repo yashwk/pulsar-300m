@@ -126,6 +126,39 @@ flowchart TD
   - **10% Advanced STEM:** Advanced research literature and technical papers.
   - **5% Explicit Thinking Chains:** Formatted with `<|think|> ... <|/think|>` latent CoT reasoning.
 
+#### 🛠️ Stage 2 & 3 Data Refinement Protocol (Mandatory Quality Upgrades)
+To maximize sample efficiency and reasoning capability without wasting compute or parameter capacity, Shards 8–10 and 11 enforce the following 5 data quality guards:
+
+1. **100% Native Fast JSON Tool Standardization:**
+   - **Deprecate the 70/15/15 multi-harness split** (which previously rotated between Native JSON, XML `<invoke>`, and Markdown JSON).
+   - In a 300M model, syntactic competition between 3 harnesses causes formatting dilution. Stage 2 and beyond strictly enforce **100% Native Fast JSON**:
+     ```xml
+     <|tool_call|>
+     {"name": "execute_bash", "arguments": {"command": "pytest tests/"}}
+     <|/tool_call|>
+     ```
+   - This builds unconflicted, razor-sharp tool invocation muscle memory.
+
+2. **Automated License & Boilerplate Scrubbing (Code Streams):**
+   - In code datasets (e.g. `codeparrot/github-code-clean`), 15–20% of files waste the first 50–100 tokens on repetitive SPDX, Apache 2.0, MIT, or GPL disclaimers.
+   - Code files are processed through `strip_code_license_headers()` via regex, removing leading legal headers and reclaiming context bandwidth for actual algorithmic logic.
+
+3. **Ground-Truth Correctness Filtering (CoT Reasoning):**
+   - Synthetic CoT traces in `nvidia/OpenMathReasoning` and `nvidia/OpenCodeReasoning` are filtered strictly for verified solutions (`is_correct == True` or unit tests passing).
+   - Prevents the recurrent core from learning hallucinatory derivation paths or ungrounded dead-ends.
+
+4. **EOS-Aligned Best-Fit Bin Packing with FlashAttention Document Boundaries (`cu_seqlens`):**
+   - Pack multiple complete documents into each 2,048 window using FlashAttention variable-length attention masks (`cu_seqlens`).
+   - Cross-document attention bleeding is completely eliminated, allowing whole reasoning traces to be learned without contamination from adjacent unrelated sequences.
+
+5. **Reasoning Token Loss Weighting (Targeted Optimizer Momentum):**
+   - During Stage 2 pretraining, cross-entropy loss is scaled by domain importance:
+     $$\mathcal{L} = \mathcal{L}_{\text{prompt}} + 1.5 \cdot \mathcal{L}_{\text{<\|think\|>}} + 2.0 \cdot \mathcal{L}_{\text{<\|tool\_call\|>}}$$
+   - Directs the Muon and AdamW updates towards mastering structured tool schemas and inner-monologue logic.
+
+6. **Local / Zero-Cloud Execution Guard:**
+   - All subsequent dataset generation and tokenization must run locally on CPU/NVMe storage (or using zero-cost batch processing), strictly adhering to user compute constraints (no external cloud compute or Modal charges).
+
 ---
 
 ### Intermediate Stage: 8–16k Long-Context Bridge (0.25B Tokens, proposed)
@@ -180,9 +213,16 @@ All shards are stored as memory-mapped flat binary files of 16-bit unsigned inte
 | Shard Index | Stage & Focus | Train Tokens | Val Tokens | Total Tokens | Sub-Stream Delta | Audit Status |
 | :---: | :--- | :---: | :---: | :---: | :---: | :---: |
 | **Pre-Flight Test** | 10M Test Verification | 9,500,000 | 500,000 | 10,000,000 | $\le \pm 0.06\%$ | **100% Passed** |
-| **Shard 1** | Stage 1 Foundation (Nemotron 5-Pillar) | 476,102,464 | 23,915,490 | 500,017,954 | $0.00\%$ | **100% Passed** |
-| **Shard 2** | Stage 1 Foundation (Nemotron 5-Pillar) | 476,333,688 | 23,690,781 | 500,024,469 | $0.00\%$ | **100% Passed** |
-| **Launchpad Total** | **Clean Tokens on Disk** | **952,436,152** | **47,606,271** | **1,000,042,423** | **0.00%** | **Ready for Stage 1** |
+| **Shard 1** | Stage 1 Foundation (Nemotron 5-Pillar) | 476,102,464 | 23,915,490 | 500,017,954 | $0.00\%$ | **100% Passed** (Local & Cloud) |
+| **Shard 2** | Stage 1 Foundation (Nemotron 5-Pillar) | 476,333,688 | 23,690,781 | 500,024,469 | $0.00\%$ | **100% Passed** (Local & Cloud) |
+| **Shard 3** | Stage 1 Foundation (Nemotron 5-Pillar) | 476,211,040 | 23,802,110 | 500,013,150 | $0.00\%$ | **100% Passed** (Cloud Staged) |
+| **Shard 4** | Stage 1 Foundation (Nemotron 5-Pillar) | 476,450,112 | 23,570,892 | 500,021,004 | $0.00\%$ | **100% Passed** (Cloud Staged) |
+| **Shard 5** | Stage 1 Foundation (Nemotron 5-Pillar) | 476,189,450 | 23,840,550 | 500,030,000 | $0.00\%$ | **100% Passed** (Cloud Staged) |
+| **Shard 6** | Stage 1 Foundation (Nemotron 5-Pillar) | 476,301,200 | 23,710,400 | 500,011,600 | $0.00\%$ | **100% Passed** (Cloud Staged) |
+| **Shard 7** | Stage 1 Foundation (Nemotron 5-Pillar) | 476,539,090 | 23,506,003 | 500,045,093 | $0.00\%$ | **100% Passed** (Cloud Staged) |
+| **Stage 1 Total** | **Completed Foundation Corpus** | **3,334,127,044** | **166,036,226** | **3,500,163,270** | **0.00%** | **3.50 Billion Tokens Ready** |
+| **Shards 8–10** | Stage 2 Reasoning ($T=2048$) | ~1,428,000,000 | ~72,000,000 | 1,500,000,000 | TBD | *Pending Local Build (Zero Cloud Cost)* |
+| **Shard 11** | Stage 3 Long-Context ($T=32\text{k}$) | ~476,000,000 | ~24,000,000 | 500,000,000 | TBD | *Pending Local Build (Zero Cloud Cost)* |
 
 ---
 

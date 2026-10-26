@@ -288,6 +288,22 @@ def legacy_format_cot_block(problem: str, solution: str, max_think_chars: int = 
     return f"<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n{sol}<|im_end|>"
 
 
+def strip_code_license_headers(code: str) -> str:
+    """Remove leading boilerplate license, copyright, and SPDX comment blocks to maximize context bandwidth."""
+    head = code[:2000]
+    keywords = [
+        "spdx-license", "copyright (c)", "copyright ©", "licensed under the apache",
+        "gnu general public", "mit license", "mozilla public"
+    ]
+    if any(k in head.lower() for k in keywords):
+        m = re.match(r"^\s*(?:/\*[\s\S]*?\*/|(?:(?://|#)[^\n]*\n)+)\s*", code)
+        if m and any(k in m.group(0).lower() for k in ["spdx", "copyright", "license", "apache", "mit", "gpl", "mozilla"]):
+            stripped = code[m.end():].lstrip()
+            if len(stripped) > 40:
+                return stripped
+    return code
+
+
 def format_single_tool_call(call: dict, style: str) -> str:
     """Format a tool call according to the specified harness style (native, xml, md_json)."""
     name = call.get("name") or "tool"
@@ -317,8 +333,8 @@ def format_single_tool_call(call: dict, style: str) -> str:
         return f"<|tool_call|>\n{c_str}\n<|/tool_call|>"
 
 
-def format_toucan_messages(messages, style_seed: float | None = None) -> str:
-    """Format multi-turn agentic conversations with 3-way harness format randomization (70% Native, 15% XML, 15% MD JSON)."""
+def format_toucan_messages(messages, style_seed: float | None = None, native_only: bool = False) -> str:
+    """Format multi-turn agentic conversations with native JSON or multi-harness randomization."""
     if isinstance(messages, str):
         try:
             messages = json.loads(messages)
@@ -327,17 +343,21 @@ def format_toucan_messages(messages, style_seed: float | None = None) -> str:
     if not isinstance(messages, (list, np.ndarray)):
         return ""
 
-    # Probabilistic harness selection per conversation
-    r = style_seed if style_seed is not None else random.random()
-    if r < 0.70:
+    # Probabilistic harness selection per conversation (or 100% native for Stage 2+)
+    if native_only:
         harness_style = "native"
         harness_prompt_hint = "You may call tools using JSON: <|tool_call|>{\"name\": ..., \"arguments\": ...}<|/tool_call|>"
-    elif r < 0.85:
-        harness_style = "xml"
-        harness_prompt_hint = "You may call tools using XML: <|tool_call|><invoke name=\"...\"><arguments>...</arguments></invoke><|/tool_call|>"
     else:
-        harness_style = "md_json"
-        harness_prompt_hint = "To call a tool, output a markdown JSON code block with 'tool' and 'arguments'."
+        r = style_seed if style_seed is not None else random.random()
+        if r < 0.70:
+            harness_style = "native"
+            harness_prompt_hint = "You may call tools using JSON: <|tool_call|>{\"name\": ..., \"arguments\": ...}<|/tool_call|>"
+        elif r < 0.85:
+            harness_style = "xml"
+            harness_prompt_hint = "You may call tools using XML: <|tool_call|><invoke name=\"...\"><arguments>...</arguments></invoke><|/tool_call|>"
+        else:
+            harness_style = "md_json"
+            harness_prompt_hint = "To call a tool, output a markdown JSON code block with 'tool' and 'arguments'."
 
     turns = []
     has_system = False
@@ -446,6 +466,7 @@ def make_substream_stream(
     shard_idx: int = 0,
     batch_size: int = 512,
     base_seed: int = 20261023,
+    stage: int = 1,
 ) -> Generator[str, None, None]:
     """Create a persistent generator streaming documents for a given sub-stream.
 
@@ -542,10 +563,13 @@ def make_substream_stream(
                         if any(x in path for x in ["node_modules", "vendor", ".min.", "package-lock", "dist/"]):
                             continue
                         code = str(row.get("code") or "").strip()
+                        code = strip_code_license_headers(code)
                         if len(code) > 40 and len(code) < 40000:
                             formatted = code
 
                     elif substream_id == "1B":
+                        if stage >= 2 and row.get("is_correct") is False:
+                            continue
                         inp = str(row.get("input") or row.get("problem") or "").strip()
                         out = str(row.get("output") or row.get("generated_solution") or "").strip()
                         if inp and out:
@@ -557,6 +581,8 @@ def make_substream_stream(
                             formatted = txt
 
                     elif substream_id == "2B":
+                        if stage >= 2 and row.get("is_correct") is False:
+                            continue
                         p = str(row.get("problem") or "").strip()
                         s = str(row.get("generated_solution") or row.get("cot") or "").strip()
                         if p and s:
@@ -564,7 +590,7 @@ def make_substream_stream(
 
                     elif substream_id == "3A":
                         msgs = row.get("messages") or row.get("conversations")
-                        formatted = format_toucan_messages(msgs, style_seed=stream_rng.random())
+                        formatted = format_toucan_messages(msgs, style_seed=stream_rng.random(), native_only=(stage >= 2))
 
                     elif substream_id == "3B":
                         formatted = format_tasktrove_row(row)
@@ -585,7 +611,7 @@ def make_substream_stream(
                     elif substream_id == "5A":
                         msgs = row.get("messages") or row.get("conversations")
                         if msgs:
-                            formatted = format_toucan_messages(msgs, style_seed=stream_rng.random())
+                            formatted = format_toucan_messages(msgs, style_seed=stream_rng.random(), native_only=(stage >= 2))
 
                     if formatted and len(formatted.strip()) > 15:
                         yield formatted.strip()
@@ -735,6 +761,7 @@ def build_shard(
             shard_idx=shard_idx,
             batch_size=batch_size,
             base_seed=base_seed,
+            stage=stage,
         )
         for s in substream_keys
     }
@@ -884,6 +911,7 @@ def build_shard(
             substream_docs=substream_docs,
             stream_seeds=stream_seeds,
             base_seed=base_seed,
+            stage=stage,
         )
 
 

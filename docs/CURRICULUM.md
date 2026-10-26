@@ -269,3 +269,4 @@ All shards are stored as memory-mapped flat binary files of 16-bit unsigned inte
 | **Thermal Protection Policy** | `Every 100 steps` | Periodic 100-second cooling pause to prevent hardware thermal throttling |
 | **Validation Interval** | `Every 50 steps` | Evaluates loss across held-out validation shards and logs generation canaries |
 | **Checkpoint Cadence** | `Every 50 steps` | Atomically writes `latest.pt` and tracks running `best.pt` validation records |
+| **Checkpoint Storage** | `checkpoints/` | Single flat directory for all runs, milestones (`milestone_step_<step>.pt`), and telemetry; never use separate folders |

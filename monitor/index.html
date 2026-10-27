@@ -1971,7 +1971,7 @@
     </div>
 
     <!-- GRPO RLVR Reasoning Alignment Bay (Branched Verification) -->
-    <div class="canary-section" id="grpoSection" style="margin-top: 0.75rem;">
+    <div class="canary-section" id="grpoSection" style="margin-top: 0.75rem; display: none;">
       <div class="canary-header-bar">
         <div class="canary-title" style="color: var(--cyan);">
           GRPO RLVR REASONING ALIGNMENT BAY
@@ -3649,7 +3649,9 @@
         }
 
         // Update GRPO Reasoning Alignment Section
-        if (data.grpo) {
+        const grpoSec = document.getElementById('grpoSection');
+        if (data.grpo && (data.grpo.status === 'running' || data.grpo.status === 'completed')) {
+          if (grpoSec) grpoSec.style.display = 'flex';
           const g = data.grpo;
           const statusBadge = document.getElementById('grpoStatusBadge');
           if (statusBadge) {
@@ -3704,6 +3706,8 @@
               });
             }
           }
+        } else {
+          if (grpoSec) grpoSec.style.display = 'none';
         }
       } catch (err) {
         console.warn('Dashboard poll error', err);

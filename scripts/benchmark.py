@@ -201,11 +201,15 @@ def evaluate_python_ast(code: str) -> Tuple[bool, str]:
             if line.startswith("<|"):
                 break
             func_lines.append(line)
-        try:
-            ast.parse("\n".join(func_lines))
-            return True, "Valid AST (truncated at stop token)"
-        except SyntaxError:
-            return False, f"SyntaxError: {e.msg} at line {e.lineno}"
+        # Progressive parsing: find the longest valid Python block
+        for end_idx in range(len(func_lines), 0, -1):
+            candidate = "\n".join(func_lines[:end_idx])
+            try:
+                ast.parse(candidate)
+                return True, f"Valid AST (lines 1..{end_idx})"
+            except SyntaxError:
+                pass
+        return False, f"SyntaxError: {e.msg} at line {e.lineno}"
 
 
 def evaluate_tool_schema(text: str) -> Tuple[bool, str, Dict[str, Any] | None]:
@@ -305,7 +309,7 @@ def run_benchmark(
             "name": item["name"],
             "passed": passed,
             "message": msg,
-            "sample": gen[:120].replace("\n", " "),
+            "sample": gen[len(prompt):len(prompt)+120].replace("\n", " "),
         })
     py_rate = (py_passes / len(PYTHON_BENCHMARKS)) * 100
     print(f"  Python AST Pass Rate: {py_passes}/{len(PYTHON_BENCHMARKS)} ({py_rate:.1f}%)")
@@ -326,7 +330,8 @@ def run_benchmark(
             repetition_penalty=repetition_penalty,
             stream=False,
         )
-        passed, msg, payload = evaluate_tool_schema(gen)
+        completion = gen[len(prompt):]
+        passed, msg, payload = evaluate_tool_schema(completion)
         if passed:
             tool_passes += 1
         status = "PASS" if passed else "FAIL"
@@ -337,7 +342,7 @@ def run_benchmark(
             "passed": passed,
             "message": msg,
             "payload": payload,
-            "sample": gen[:120].replace("\n", " "),
+            "sample": completion[:120].replace("\n", " "),
         })
     tool_rate = (tool_passes / len(TOOL_BENCHMARKS)) * 100
     print(f"  Tool Schema Pass Rate: {tool_passes}/{len(TOOL_BENCHMARKS)} ({tool_rate:.1f}%)")
@@ -359,6 +364,7 @@ def run_benchmark(
             repetition_penalty=repetition_penalty,
             stream=False,
         )
+        completion = gen[len(prompt):]
         cot_ok, target_ok, sample = evaluate_math_cot(gen, item["target"])
         if cot_ok:
             cot_passes += 1

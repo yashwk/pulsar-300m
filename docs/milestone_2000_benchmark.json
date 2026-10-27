@@ -1,0 +1,145 @@
+{
+  "checkpoint": "checkpoints/milestone_step_2000.pt",
+  "device": "cuda",
+  "temperature": 0.7,
+  "top_p": 0.9,
+  "repetition_penalty": 1.15,
+  "timestamp": "2026-10-27 07:29:43",
+  "suites": {
+    "python": {
+      "pass_rate": 100.0,
+      "details": [
+        {
+          "id": "py_01",
+          "name": "Fibonacci Function",
+          "passed": true,
+          "message": "Valid AST (lines 1..4)",
+          "sample": "     # Initial Initial Menu   while True:     mid = float(input[idx]    return (warwar, 1)   def main():     \"\"\"Implemen"
+        },
+        {
+          "id": "py_02",
+          "name": "Is Palindrome",
+          "passed": true,
+          "message": "Valid AST (lines 1..3)",
+          "sample": "     Args:     - p (optional)   - A string to store. Can be any 'name' or 's'   - If no such characters are found, retur"
+        },
+        {
+          "id": "py_03",
+          "name": "Binary Search",
+          "passed": true,
+          "message": "Valid AST (lines 1..3)",
+          "sample": "     def get_func, dep = 0   \t\tif (left.equals(engine))        return set(int(int(int(int(int(int(int(int(int(int(int(in"
+        },
+        {
+          "id": "py_04",
+          "name": "Merge Sorted Lists",
+          "passed": true,
+          "message": "Valid AST (lines 1..2)",
+          "sample": "    return [[0, 1  # Example usage: diff --with-call=True` to validate the function ```  This implementation is not a si"
+        },
+        {
+          "id": "py_05",
+          "name": "Quicksort Implementation",
+          "passed": true,
+          "message": "Valid AST (lines 1..3)",
+          "sample": "    return [0, 2, 4, 6, 8, 7, 5, 3, 4, 9, 2, 1, 8, 3, 4, 1, 1, 2, 2, 1, 6, 2, 3, 1, 4, 3, 4, 2, 2, 1, 1, 1, 1, 2, 1, 1, "
+        }
+      ]
+    },
+    "tool_calling": {
+      "pass_rate": 0.0,
+      "details": [
+        {
+          "id": "tool_01",
+          "name": "File Rename Tool",
+          "passed": false,
+          "message": "Missing <|tool_call|> JSON pattern",
+          "payload": null,
+          "sample": "<|tool_call|> {\"name\": \"terminalterminal\", \" \" \" \" \" \" \" \" \" \" \" \" \" \" \" \" \" \" \" \" \" \" \" \" \" \" \" \" \" \" \" \" \" \" \" \" \" \" \""
+        },
+        {
+          "id": "tool_02",
+          "name": "Current Weather Tool",
+          "passed": false,
+          "message": "Missing <|tool_call|> JSON pattern",
+          "payload": null,
+          "sample": "The given question, \"Recomes the new location of a mountain where a rich tapestry of theological paintings, including mo"
+        },
+        {
+          "id": "tool_03",
+          "name": "Database Query Tool",
+          "passed": false,
+          "message": "Missing <|tool_call|> JSON pattern",
+          "payload": null,
+          "sample": "The provided query returned an error, indicating that the function is not supported in this environment. The system itse"
+        },
+        {
+          "id": "tool_04",
+          "name": "Bash Command Tool",
+          "passed": false,
+          "message": "Missing <|tool_call|> JSON pattern",
+          "payload": null,
+          "sample": "The query didn't return an empty string that appears to be the correct one. I'll use the search for that item in the las"
+        },
+        {
+          "id": "tool_05",
+          "name": "Calculator Tool",
+          "passed": false,
+          "message": "Missing <|tool_call|> JSON pattern",
+          "payload": null,
+          "sample": "The problem is that we need to find the value of the square root of two numbers, which can be calculated using the formu"
+        }
+      ]
+    },
+    "math": {
+      "cot_structure_rate": 0.0,
+      "target_accuracy": 20.0,
+      "details": [
+        {
+          "id": "math_01",
+          "name": "Train Speed Word Problem",
+          "cot_structured": false,
+          "target_correct": false,
+          "target": "60",
+          "sample": "<|im_start|>user\nIf a train travels 120 km in 2 hours, what is its average speed in km/h?<|im_end|>\n"
+        },
+        {
+          "id": "math_02",
+          "name": "Linear Equation",
+          "cot_structured": false,
+          "target_correct": true,
+          "target": "10",
+          "sample": "<|im_start|>user\nSolve for x: 3*x + 15 = 45.<|im_end|>\n<|im_start|>assistant\n<|think|>\nOkay, let's s"
+        },
+        {
+          "id": "math_03",
+          "name": "Percentage Calculation",
+          "cot_structured": false,
+          "target_correct": false,
+          "target": "12",
+          "sample": "<|im_start|>user\nWhat is 15 percent of 80?<|im_end|>\n<|im_start|>assistant\n<|think|>\nOkay, so I need"
+        },
+        {
+          "id": "math_04",
+          "name": "Right Triangle Hypotenuse",
+          "cot_structured": false,
+          "target_correct": false,
+          "target": "5",
+          "sample": "<|im_start|>user\nIn a right-angled triangle with legs of length 3 and 4, what is the hypotenuse?<|im"
+        },
+        {
+          "id": "math_05",
+          "name": "Geometric Progression",
+          "cot_structured": false,
+          "target_correct": false,
+          "target": "162",
+          "sample": "<|im_start|>user\nWhat is the next term in the sequence: 2, 6, 18, 54, ...?<|im_end|>\n<|im_start|>ass"
+        }
+      ]
+    },
+    "performance": {
+      "decode_tok_per_sec": 60.47,
+      "kv_cache_1024_mb": 16.0
+    }
+  }
+}

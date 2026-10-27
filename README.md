@@ -124,6 +124,7 @@ python src/infer.py --benchmark
 ---
 
 ## 📚 Technical Documentation
+- [2,000-Step Pretraining Milestone Report (CE: 2.0643, PPL: 7.88, Python AST: 100%)](docs/TRAINING_RUN_2000.md)
 - [500-Step Pretraining Milestone Report (CE: 2.6761, Latent Gain: +0.1465)](docs/TRAINING_RUN_500.md)
 - [Architecture & Implementation Specification](docs/ARCHITECTURE.md)
 - [Curriculum & Shard Specification](docs/CURRICULUM.md)

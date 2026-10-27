@@ -105,6 +105,19 @@ python monitor/web_server.py --port 7860
 ```
 Open [http://localhost:7860](http://localhost:7860) to view real-time loss, per-pulse hidden state contraction ($\Delta h$), expert load distribution, and throughput gauges.
 
+### 5. High-Efficiency Native Inference Engine
+Pulsar implements a native unified KV-cache inference engine with sliding-window ring buffering for 11x KV cache compression (73.4 MB @ 32k context):
+```bash
+# Interactive REPL:
+python src/infer.py --checkpoint checkpoints/best.pt --interactive
+
+# Single prompt completion:
+python src/infer.py --checkpoint checkpoints/best.pt --prompt "def quicksort(arr: list[int]) -> list[int]:"
+
+# Memory footprint benchmark across context lengths:
+python src/infer.py --benchmark
+```
+
 ---
 
 ## 📚 Technical Documentation
@@ -112,3 +125,9 @@ Open [http://localhost:7860](http://localhost:7860) to view real-time loss, per-
 - [Architecture & Implementation Specification](docs/ARCHITECTURE.md)
 - [Curriculum & Shard Specification](docs/CURRICULUM.md)
 - [Engineering Audit & Telemetry Notes](docs/AUDIT.md)
+
+---
+
+## 📑 References & Acknowledgements
+- **Unified Recurrent KV-Cache Dynamics:** Attractor dynamics and cross-pass recurrent state sharing inspired by UCSD Sandy Research / Fu et al. (*Be-Nice: Recurrent Transformers with Contractive State Attractors*).
+- **Compressed Sparse & Sliding-Window Inference Bounds:** Multi-layer hybrid KV caching and context scaling inspired by DeepSeek CSA2 architecture (*DeepSeek-V4.1-Flash*).

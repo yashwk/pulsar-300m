@@ -40,3 +40,4 @@ tmp/
 .gemini/
 .playwright-mcp/
 .DS_Store
+notes.jsonl

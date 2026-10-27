@@ -1,0 +1,42 @@
+{
+  "version": "1.0",
+  "run_state": {
+    "max_stalled_step_time_multiplier": 3.0,
+    "description": "Mark run stalled if no new metrics received for more than 3x median step time."
+  },
+  "loss": {
+    "max_loss_gap_nats": 0.15,
+    "description": "Watch if |train_ce_final - val_ce_final| exceeds 0.15 nats."
+  },
+  "gradients": {
+    "max_clip_fraction": 0.30,
+    "clip_norm_threshold": 1.0,
+    "description": "Watch if more than 30% of steps in rolling window exceed the gradient clipping threshold."
+  },
+  "throughput": {
+    "min_tok_per_sec": 6000.0,
+    "vram_alert_gb": 7.5,
+    "description": "Alert if peak VRAM exceeds 7.5 GB on an 8 GB device, or throughput drops below floor."
+  },
+  "moe_drops": {
+    "ok_max_pct": 2.0,
+    "watch_max_pct": 5.0,
+    "description": "Under 2.0% is OK, 2.0% - 5.0% is WATCH, over 5.0% is ALERT."
+  },
+  "moe_balance": {
+    "worst_expert_share_watch_pct": 25.0,
+    "worst_expert_share_alert_pct": 35.0,
+    "bias_abs_p99_watch": 0.30,
+    "description": "Uniform expert share is 12.5%. Watch if any expert exceeds 25%, Alert if exceeds 35%."
+  },
+  "recurrent_loops": {
+    "evaluation_start_step": 3000,
+    "gain_23_min_threshold": 0.01,
+    "consecutive_evals_required": 3,
+    "description": "Watch if Pulse 2 -> Pulse 3 gain (ce2 - ce3) drops below 0.01 for 3 consecutive evaluations after step 3,000."
+  },
+  "numerics": {
+    "max_nan_inf_count": 0,
+    "description": "Alert immediately on any NaN or Inf loss or gradient norm."
+  }
+}

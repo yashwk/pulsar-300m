@@ -13,6 +13,7 @@ import argparse
 import csv
 import glob
 import json
+import mimetypes
 import os
 import re
 import sys
@@ -22,10 +23,31 @@ from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+from monitor.v2_api import (
+    IncrementalMetricsReader,
+    downsample_records,
+    evaluate_health,
+    load_thresholds,
+    get_timeline_events,
+    list_checkpoints,
+    load_notes,
+    add_note,
+)
+
+MONITOR_DIR = os.path.dirname(os.path.abspath(__file__))
+V2_STATIC_DIR = os.path.join(MONITOR_DIR, "v2")
+THRESHOLDS_FILE = os.path.join(MONITOR_DIR, "thresholds.json")
+NOTES_FILE = os.path.join(MONITOR_DIR, "notes.jsonl")
+
 CHECKPOINT_DIR = "checkpoints"
 LIVE_STATUS_FILE = os.path.join(CHECKPOINT_DIR, "live_status.json")
 METRICS_JSONL_FILE = os.path.join(CHECKPOINT_DIR, "metrics.jsonl")
 STATIC_HTML_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
+_v2_incremental_reader = IncrementalMetricsReader(METRICS_JSONL_FILE)
 
 # Fallback used only when checkpoints/config.json is missing AND the trainer has not
 # written model_config into live_status.json. Values are PulsarConfig() defaults
@@ -529,21 +551,35 @@ class PulsarMonitorHandler(SimpleHTTPRequestHandler):
 
         if path == "/" or path == "/index.html":
             self.serve_dashboard()
+        elif path in ("/v2", "/v2/", "/v2/index.html"):
+            self.serve_v2_dashboard()
+        elif path.startswith("/v2/"):
+            self.serve_v2_static(path[4:])
         elif path == "/favicon.ico":
             self.send_response(HTTPStatus.NO_CONTENT)
             self.end_headers()
         elif path == "/api/status":
             self.serve_status()
+        elif path == "/api/health":
+            self.serve_health()
+        elif path == "/api/events":
+            self.serve_events()
+        elif path == "/api/checkpoints":
+            self.serve_checkpoints()
+        elif path == "/api/notes":
+            self.serve_notes()
+        elif path == "/api/stream":
+            self.serve_stream()
         elif path == "/api/canaries":
             self.serve_canaries()
         elif path == "/api/history":
-            last_n = 1000
-            max_points = 1500
+            last_n = None
+            max_points = 2000
+            since_step = None
+            fields = None
             if "last_n" in query:
                 val = query["last_n"][0].lower()
-                if val in ("0", "all"):
-                    last_n = 0
-                else:
+                if val not in ("0", "all"):
                     try:
                         last_n = int(val)
                     except ValueError:
@@ -553,9 +589,24 @@ class PulsarMonitorHandler(SimpleHTTPRequestHandler):
                     max_points = int(query["max_points"][0])
                 except ValueError:
                     pass
-            self.serve_history(last_n, max_points=max_points)
+            if "since_step" in query:
+                try:
+                    since_step = int(query["since_step"][0])
+                except ValueError:
+                    pass
+            if "fields" in query:
+                fields = [f.strip() for f in query["fields"][0].split(",") if f.strip()]
+            self.serve_history(last_n, max_points=max_points, since_step=since_step, fields=fields)
         else:
             self.send_error(HTTPStatus.NOT_FOUND, f"File not found: {path}")
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path == "/api/notes":
+            self.handle_post_notes()
+        else:
+            self.send_error(HTTPStatus.NOT_FOUND, f"Endpoint not found: {path}")
 
     def serve_dashboard(self):
         if not os.path.exists(STATIC_HTML_FILE):
@@ -592,43 +643,167 @@ class PulsarMonitorHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def serve_history(self, last_n: int, max_points: int = 1500):
-        # Parsed (and TFLOP/s-annotated) records are cached by file mtime+size, so the
-        # 10 s poll does not re-read/parse the whole JSONL every time.
-        records = load_history_records()
+    def serve_v2_dashboard(self):
+        v2_index = os.path.join(V2_STATIC_DIR, "index.html")
+        if not os.path.exists(v2_index):
+            self.send_error(HTTPStatus.NOT_FOUND, "monitor/v2/index.html not found")
+            return
+        with open(v2_index, "rb") as f:
+            content = f.read()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+
+    def serve_v2_static(self, rel_path: str):
+        rel_path = rel_path.lstrip("/\\")
+        full_path = os.path.abspath(os.path.join(V2_STATIC_DIR, rel_path))
+        if not full_path.startswith(os.path.abspath(V2_STATIC_DIR)):
+            self.send_error(HTTPStatus.FORBIDDEN, "Access denied")
+            return
+        if not os.path.exists(full_path) or os.path.isdir(full_path):
+            self.send_error(HTTPStatus.NOT_FOUND, f"File not found: {rel_path}")
+            return
+
+        ctype, _ = mimetypes.guess_type(full_path)
+        if not ctype:
+            if full_path.endswith(".js"):
+                ctype = "application/javascript"
+            elif full_path.endswith(".css"):
+                ctype = "text/css"
+            else:
+                ctype = "application/octet-stream"
+
+        with open(full_path, "rb") as f:
+            content = f.read()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+
+    def serve_health(self):
+        th = load_thresholds(THRESHOLDS_FILE)
+        status_data = {}
+        if os.path.exists(LIVE_STATUS_FILE):
+            try:
+                with open(LIVE_STATUS_FILE, "r", encoding="utf-8") as f:
+                    status_data = json.load(f)
+                status_data = enrich_status_payload(status_data)
+            except Exception:
+                pass
+        records = _v2_incremental_reader.read_records()
+        health = evaluate_health(status_data, records, th)
+        payload = json.dumps(health).encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def serve_events(self):
+        records = _v2_incremental_reader.read_records()
+        events = get_timeline_events(records, NOTES_FILE)
+        payload = json.dumps({"count": len(events), "events": events}).encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def serve_checkpoints(self):
+        ckpts = list_checkpoints(CHECKPOINT_DIR)
+        payload = json.dumps({"count": len(ckpts), "checkpoints": ckpts}).encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def serve_notes(self):
+        notes = load_notes(NOTES_FILE)
+        payload = json.dumps({"count": len(notes), "notes": notes}).encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def handle_post_notes(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length).decode("utf-8")
+            data = json.loads(body)
+            step = int(data.get("step", 0))
+            text = str(data.get("text", "")).strip()
+            author = str(data.get("author", "User")).strip() or "User"
+            tag = str(data.get("tag", "general")).strip() or "general"
+            if not text:
+                self.send_error(HTTPStatus.BAD_REQUEST, "Missing note text")
+                return
+            new_note = add_note(NOTES_FILE, step, text, author, tag)
+            payload = json.dumps({"status": "success", "note": new_note}).encode("utf-8")
+            self.send_response(HTTPStatus.CREATED)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        except Exception as e:
+            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
+
+    def serve_stream(self):
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+        self.wfile.write(b": connected\n\n")
+        self.wfile.flush()
+
+        for _ in range(120):
+            try:
+                status_data = {}
+                if os.path.exists(LIVE_STATUS_FILE):
+                    try:
+                        with open(LIVE_STATUS_FILE, "r", encoding="utf-8") as f:
+                            status_data = json.load(f)
+                        status_data = enrich_status_payload(status_data)
+                    except Exception:
+                        pass
+                event_line = f"data: {json.dumps(status_data)}\n\n".encode("utf-8")
+                self.wfile.write(event_line)
+                self.wfile.flush()
+                time.sleep(1.5)
+            except (BrokenPipeError, ConnectionResetError):
+                break
+            except Exception:
+                break
+
+    def serve_history(
+        self,
+        last_n: int | None = None,
+        max_points: int = 2000,
+        since_step: int | None = None,
+        fields: list[str] | None = None,
+    ):
+        records = _v2_incremental_reader.read_records()
         grads = load_csv_grads()
 
-        if last_n > 0 and len(records) > last_n:
-            parsed = records[-last_n:]
-        else:
-            # If last_n <= 0, use all records from Step 1
-            parsed = records
-
-        # metrics.csv holds its own grad columns; merge per request (small file).
-        for item in parsed:
+        for item in records:
             s = item.get("step")
             if s in grads:
                 item["grad_norm_total"] = grads[s]["grad_norm_total"]
                 item["grad_norm_muon"] = grads[s]["grad_norm_muon"]
                 item["grad_norm_adam"] = grads[s]["grad_norm_adam"]
 
-        if max_points > 0 and len(parsed) > max_points:
-            # Smart decimation: keep all evals, keep last 50 steps at full resolution, stride others
-            eval_steps = [r for r in parsed if r.get("val_loss") is not None]
-            recent_steps = parsed[-50:]
-            must_have_steps = set(r["step"] for r in eval_steps + recent_steps)
+        if last_n is not None and last_n > 0 and len(records) > last_n:
+            records = records[-last_n:]
 
-            other_steps = [r for r in parsed if r["step"] not in must_have_steps]
-            budget = max(100, max_points - len(must_have_steps))
-            stride = max(1, len(other_steps) // budget)
-            sampled_other = other_steps[::stride]
-
-            merged = sorted(eval_steps + recent_steps + sampled_other, key=lambda r: r["step"])
-            records = merged
-        else:
-            records = parsed
-
-        payload = json.dumps({"count": len(records), "history": records}).encode("utf-8")
+        sampled = downsample_records(records, max_points=max_points, fields=fields, since_step=since_step)
+        payload = json.dumps({"count": len(sampled), "history": sampled}).encode("utf-8")
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))

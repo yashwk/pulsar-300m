@@ -7,14 +7,20 @@ Eliminates the separate Critic/Value network to operate within tight VRAM bounds
 Theoretical foundation:
 - DeepSeekMath (Shao et al., 2024) / DeepSeek-R1 (2025)
 - Normalized intra-group relative advantage: A_i = (R_i - mean(R)) / (std(R) + eps)
-- Verifiable reward functions: Math accuracy, Python AST validity, and CoT format tags.
+- Verifiable reward functions: Math accuracy, Python AST validity, MCP tool schema, and CoT format tags.
+
+Safety and Invariance:
+- Strictly treats pretraining checkpoints and logs (latest.pt, best.pt, metrics.jsonl, live_status.json)
+  as read-only and immutable.
+- Telemetry state is written to distinct files: checkpoints/grpo_status.json and checkpoints/grpo_metrics.jsonl.
+- Aligned weights are saved to checkpoints/pulsar_grpo_hybrid.pt.
 
 Usage:
     python scripts/grpo_train.py \
-      --checkpoint checkpoints/best.pt \
+      --checkpoint checkpoints/milestone_step_4000.pt \
       --group-size 4 \
       --lr 1e-5 \
-      --max-steps 200 \
+      --max-steps 50 \
       --device cuda
 """
 
@@ -119,23 +125,65 @@ def reward_python_ast(completion: str) -> float:
         return 0.0
 
 
-def evaluate_rewards(completion: str, target: str, task_type: str = "math") -> float:
-    """Aggregate rule-based rewards."""
+def reward_tool_call(completion: str, expected_tool: str) -> float:
+    """Reward valid MCP agentic tool call syntax and schema."""
+    m = re.findall(r"<\|tool_call\|>(.*?)<\|/tool_call\|>", completion, re.DOTALL)
+    if not m:
+        m = re.findall(r"<\|tool_call\|>(.*)", completion, re.DOTALL)
+    if not m:
+        return 0.0
+
+    raw = m[0].strip()
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list) and len(data) > 0:
+            first = data[0]
+            if isinstance(first, dict) and first.get("name") == expected_tool:
+                return 1.0
+            elif isinstance(first, dict) and "name" in first:
+                return 0.5
+        elif isinstance(data, dict):
+            if data.get("name") == expected_tool:
+                return 1.0
+            elif "name" in data:
+                return 0.5
+    except Exception:
+        pass
+    return 0.0
+
+
+def evaluate_rewards(completion: str, target: str, task_type: str = "math") -> Tuple[float, Dict[str, float]]:
+    """Aggregate rule-based rewards with category breakdown."""
     fmt_score = reward_format(completion)
+    acc_score = 0.0
+
     if task_type == "math":
         acc_score = reward_math(completion, target)
-        return acc_score * 0.8 + fmt_score * 0.2
+        total = acc_score * 0.8 + fmt_score * 0.2
     elif task_type == "python":
-        ast_score = reward_python_ast(completion)
-        return ast_score * 0.8 + fmt_score * 0.2
-    return fmt_score
+        acc_score = reward_python_ast(completion)
+        total = acc_score * 0.8 + fmt_score * 0.2
+    elif task_type == "tool":
+        acc_score = reward_tool_call(completion, target)
+        total = acc_score * 0.8 + fmt_score * 0.2
+    else:
+        total = fmt_score
+
+    breakdown = {
+        "total": float(total),
+        "accuracy": float(acc_score),
+        "format": float(fmt_score),
+        "task_type": task_type,
+    }
+    return float(total), breakdown
 
 
 # ---------------------------------------------------------------------------
-# Default Curated RL Prompts
+# Default Curated Multi-Task RL Prompts
 # ---------------------------------------------------------------------------
 
 DEFAULT_RL_TASKS = [
+    # --- Math Tasks (Verifiable Numeric / Algebraic Solutions) ---
     {
         "type": "math",
         "prompt": "<|im_start|>user\nIf a train travels 120 km in 2 hours, what is its average speed in km/h?<|im_end|>\n<|im_start|>assistant\n<|think|>\n",
@@ -161,12 +209,52 @@ DEFAULT_RL_TASKS = [
         "prompt": "<|im_start|>user\nWhat is the next number in the geometric progression: 2, 6, 18, 54, ...?<|im_end|>\n<|im_start|>assistant\n<|think|>\n",
         "target": "162"
     },
+    # --- Python Programming Tasks (Verifiable AST Syntax) ---
     {
         "type": "python",
         "prompt": "<|im_start|>user\nWrite a python function `is_even(n: int) -> bool` that returns True if n is even.<|im_end|>\n<|im_start|>assistant\n```python\n",
         "target": "def is_even(n: int) -> bool:\n    return n % 2 == 0\n"
     },
+    {
+        "type": "python",
+        "prompt": "<|im_start|>user\nWrite a python function `factorial(n: int) -> int` to compute n factorial iteratively.<|im_end|>\n<|im_start|>assistant\n```python\n",
+        "target": "def factorial(n: int) -> int:\n    res = 1\n    for i in range(1, n + 1):\n        res *= i\n    return res\n"
+    },
+    {
+        "type": "python",
+        "prompt": "<|im_start|>user\nWrite a python function `reverse_list(lst: list) -> list` that returns a reversed list.<|im_end|>\n<|im_start|>assistant\n```python\n",
+        "target": "def reverse_list(lst: list) -> list:\n    return lst[::-1]\n"
+    },
+    # --- Agentic Tool Calling Tasks (Verifiable JSON MCP Schema) ---
+    {
+        "type": "tool",
+        "prompt": "<|im_start|>user\nRename scan_01.pdf to 2026_Invoice.pdf in /home/user/docs<|im_end|>\n<|im_start|>assistant\n<|tool_call|>",
+        "target": "rename_file"
+    },
+    {
+        "type": "tool",
+        "prompt": "<|im_start|>user\nCheck git commit history on the current repository<|im_end|>\n<|im_start|>assistant\n<|tool_call|>",
+        "target": "git_log"
+    },
+    {
+        "type": "tool",
+        "prompt": "<|im_start|>user\nFind all occurrences of 'TODO' in src/train.py<|im_end|>\n<|im_start|>assistant\n<|tool_call|>",
+        "target": "search_code"
+    },
 ]
+
+
+# ---------------------------------------------------------------------------
+# Atomic File Writers
+# ---------------------------------------------------------------------------
+
+def write_atomic_json(filepath: str, data: dict):
+    """Write dictionary to JSON file atomically to prevent partial reads by the web server."""
+    os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+    tmp_path = filepath + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp_path, filepath)
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +279,6 @@ class GRPOTrainer:
         self.clip_epsilon = clip_epsilon
         self.beta_kl = beta_kl
 
-        # Freeze reference model weights by keeping a clone of initial parameters or checkpoint
         self.optimizer = torch.optim.AdamW(
             [p for p in self.model.parameters() if p.requires_grad],
             lr=lr,
@@ -203,7 +290,7 @@ class GRPOTrainer:
     def sample_group(
         self, prompt_text: str, max_new_tokens: int = 128, temperature: float = 0.8
     ) -> List[Tuple[torch.Tensor, str]]:
-        """Sample a group of G rollouts sequentially to bound memory."""
+        """Sample a group of G rollouts sequentially to bound GPU memory."""
         self.model.eval()
         prompt_ids = self.tokenizer.encode(prompt_text, return_tensors="pt").to(self.device)
         group = []
@@ -224,7 +311,7 @@ class GRPOTrainer:
 
         return group
 
-    def compute_grpo_step(self, task: Dict[str, Any]) -> Dict[str, float]:
+    def compute_grpo_step(self, task: Dict[str, Any]) -> Dict[str, Any]:
         """Execute one complete GRPO policy optimization iteration."""
         prompt = task["prompt"]
         target = task["target"]
@@ -235,9 +322,11 @@ class GRPOTrainer:
 
         # 2. Score rewards
         raw_rewards = []
+        breakdowns = []
         for _, comp in group:
-            r = evaluate_rewards(comp, target, task_type=task_type)
+            r, bd = evaluate_rewards(comp, target, task_type=task_type)
             raw_rewards.append(r)
+            breakdowns.append(bd)
 
         rewards_tensor = torch.tensor(raw_rewards, dtype=torch.float32, device=self.device)
         mean_r = rewards_tensor.mean()
@@ -277,11 +366,32 @@ class GRPOTrainer:
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
 
+        # Extract summaries for telemetry inspector
+        rollouts_summary = []
+        for j, (_, comp) in enumerate(group):
+            rollouts_summary.append({
+                "id": j + 1,
+                "completion": comp[:160].replace("\n", " "),
+                "reward": round(raw_rewards[j], 3),
+                "accuracy": round(breakdowns[j]["accuracy"], 2),
+                "format": round(breakdowns[j]["format"], 2),
+                "advantage": round(advantages[j].item(), 3),
+            })
+
+        best_idx = int(rewards_tensor.argmax().item())
+        mean_acc = sum(b["accuracy"] for b in breakdowns) / len(breakdowns)
+        mean_fmt = sum(b["format"] for b in breakdowns) / len(breakdowns)
+
         return {
             "mean_reward": mean_r.item(),
             "max_reward": rewards_tensor.max().item(),
             "loss": total_loss / self.group_size,
-            "best_completion": group[rewards_tensor.argmax().item()][1][:80].replace("\n", " "),
+            "accuracy": mean_acc,
+            "format": mean_fmt,
+            "task_type": task_type,
+            "target": target,
+            "best_completion": group[best_idx][1][:80].replace("\n", " "),
+            "rollouts_summary": rollouts_summary,
         }
 
 
@@ -291,19 +401,52 @@ class GRPOTrainer:
 
 def main():
     parser = argparse.ArgumentParser(description="Pulsar GRPO Reinforcement Learning Harness")
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/best.pt", help="Base checkpoint path")
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/milestone_step_4000.pt", help="Base snapshot checkpoint path")
+    parser.add_argument("--output-checkpoint", type=str, default="checkpoints/pulsar_grpo_hybrid.pt", help="Target path to save aligned weights")
+    parser.add_argument("--status-file", type=str, default="checkpoints/grpo_status.json", help="Path for live telemetry state")
+    parser.add_argument("--metrics-file", type=str, default="checkpoints/grpo_metrics.jsonl", help="Path for metrics history")
     parser.add_argument("--group-size", type=int, default=4, help="Rollout group size (G)")
     parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
-    parser.add_argument("--max-steps", type=int, default=100, help="Total GRPO optimization steps")
+    parser.add_argument("--max-steps", type=int, default=50, help="Total GRPO optimization steps")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
+    # Pretraining trunk immutability check
+    FORBIDDEN_FILES = {
+        "latest.pt",
+        "best.pt",
+        "metrics.jsonl",
+        "live_status.json",
+        "run_config.json",
+        "train.log",
+        "metrics.csv",
+    }
+    for path, name in [
+        (args.output_checkpoint, "output_checkpoint"),
+        (args.status_file, "status_file"),
+        (args.metrics_file, "metrics_file"),
+    ]:
+        base = os.path.basename(path)
+        if base in FORBIDDEN_FILES or base.startswith("milestone_step_"):
+            raise ValueError(
+                f"Safety violation: {name} cannot point to pretraining trunk artifact '{base}'. "
+                f"GRPO branch outputs must remain strictly isolated."
+            )
+
     print("=======================================================")
-    print("  PULSAR GRPO REASONING ALIGNMENT HARNESS")
-    print(f"  Base Model:   {args.checkpoint}")
-    print(f"  Group Size G: {args.group_size} rollouts / prompt")
-    print(f"  Device:       {args.device} | LR: {args.lr}")
+    print("  PULSAR GRPO HYBRID REASONING ALIGNMENT HARNESS")
+    print(f"  Base Model:       {args.checkpoint}")
+    print(f"  Target Output:    {args.output_checkpoint}")
+    print(f"  Group Size G:     {args.group_size} rollouts / prompt")
+    print(f"  Device:           {args.device} | LR: {args.lr}")
+    print(f"  Status Telemetry: {args.status_file}")
     print("=======================================================\n")
+
+    # Fallback to best.pt or latest.pt if the milestone checkpoint does not exist yet
+    if not os.path.exists(args.checkpoint):
+        fallback = "checkpoints/best.pt" if os.path.exists("checkpoints/best.pt") else "checkpoints/latest.pt"
+        print(f"[Warning] Specified checkpoint '{args.checkpoint}' not found. Falling back to '{fallback}'.")
+        args.checkpoint = fallback
 
     tokenizer = AutoTokenizer.from_pretrained("data/pulsar_tokenizer")
     ck = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
@@ -312,7 +455,7 @@ def main():
 
     model = PulsarForCausalLM(cfg).to(args.device, dtype=torch.bfloat16)
     model.load_state_dict(ck.get("model", ck))
-    print("[Pulsar] Model weights loaded successfully.")
+    print("[Pulsar] Base model weights loaded successfully in read-only mode.")
 
     trainer = GRPOTrainer(
         model=model,
@@ -322,10 +465,63 @@ def main():
         lr=args.lr,
     )
 
-    print(f"\n[GRPO] Beginning training across {len(DEFAULT_RL_TASKS)} verifiable tasks...")
+    # Initial status update
+    write_atomic_json(args.status_file, {
+        "status": "running",
+        "mode": "grpo_rlvr",
+        "base_checkpoint": args.checkpoint,
+        "output_checkpoint": args.output_checkpoint,
+        "step": 0,
+        "max_steps": args.max_steps,
+        "group_size": args.group_size,
+        "mean_reward": 0.0,
+        "max_reward": 0.0,
+        "policy_loss": 0.0,
+        "accuracy": 0.0,
+        "format": 0.0,
+        "recent_task": "",
+        "recent_completion": "",
+        "rollouts": [],
+        "last_updated": time.time(),
+    })
+
+    print(f"\n[GRPO] Beginning training across {len(DEFAULT_RL_TASKS)} verifiable hybrid tasks...")
     for step in range(1, args.max_steps + 1):
         task = DEFAULT_RL_TASKS[(step - 1) % len(DEFAULT_RL_TASKS)]
         metrics = trainer.compute_grpo_step(task)
+
+        # Write atomic telemetry
+        write_atomic_json(args.status_file, {
+            "status": "running" if step < args.max_steps else "completed",
+            "mode": "grpo_rlvr",
+            "base_checkpoint": args.checkpoint,
+            "output_checkpoint": args.output_checkpoint,
+            "step": step,
+            "max_steps": args.max_steps,
+            "group_size": args.group_size,
+            "mean_reward": round(metrics["mean_reward"], 4),
+            "max_reward": round(metrics["max_reward"], 4),
+            "policy_loss": round(metrics["loss"], 4),
+            "accuracy": round(metrics["accuracy"], 3),
+            "format": round(metrics["format"], 3),
+            "recent_task": f"[{metrics['task_type'].upper()}] -> {metrics['target']}",
+            "recent_completion": metrics["best_completion"],
+            "rollouts": metrics["rollouts_summary"],
+            "last_updated": time.time(),
+        })
+
+        # Append to metrics history
+        with open(args.metrics_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "step": step,
+                "mean_reward": round(metrics["mean_reward"], 4),
+                "max_reward": round(metrics["max_reward"], 4),
+                "policy_loss": round(metrics["loss"], 4),
+                "accuracy": round(metrics["accuracy"], 3),
+                "format": round(metrics["format"], 3),
+                "task_type": metrics["task_type"],
+                "timestamp": time.time(),
+            }) + "\n")
 
         if step % 5 == 0 or step == 1:
             print(
@@ -336,16 +532,17 @@ def main():
                 f"Top: {metrics['best_completion']}"
             )
 
-    output_path = "checkpoints/pulsar_grpo_math.pt"
+    # Save aligned weights
     torch.save(
         {
             "global_step": args.max_steps,
+            "base_checkpoint": args.checkpoint,
             "model": model.state_dict(),
             "config": cfg.to_dict(),
         },
-        output_path,
+        args.output_checkpoint,
     )
-    print(f"\n[GRPO] Training completed. Saved aligned weights -> {output_path}")
+    print(f"\n[GRPO] Training completed. Saved aligned weights -> {args.output_checkpoint}")
 
 
 if __name__ == "__main__":

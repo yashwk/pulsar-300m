@@ -194,6 +194,10 @@ class PulsarInferenceEngine:
         self.model.eval()
         self.model.to(self.device)
 
+        # Adaptive Early-Exit (Ouro / Zhu et al., 2025)
+        self.early_exit_threshold: Optional[float] = None
+        self.early_exit_counts = [0] * self.cfg.default_pulses
+
         # Stop token IDs
         self.stop_token_ids: Set[int] = {self.cfg.eos_token_id}
         for tok_str in ["<|im_end|>", "<|endoftext|>", "</s>"]:
@@ -202,6 +206,29 @@ class PulsarInferenceEngine:
                 pass
             except Exception:
                 pass
+
+    def set_early_exit_threshold(self, threshold: Optional[float]):
+        """Set confidence threshold for adaptive recurrent early-exit."""
+        self.early_exit_threshold = threshold
+        self.early_exit_counts = [0] * self.cfg.default_pulses
+
+    def get_early_exit_stats(self) -> dict:
+        """Compute distribution of recurrent pulse depth exits."""
+        total = sum(self.early_exit_counts)
+        if total == 0:
+            return {}
+        p1 = self.early_exit_counts[0] / total * 100.0
+        p2 = self.early_exit_counts[1] / total * 100.0
+        p3 = self.early_exit_counts[2] / total * 100.0
+        eff_layers = (8 * self.early_exit_counts[0] + 16 * self.early_exit_counts[1] + 24 * self.early_exit_counts[2]) / total
+        speedup = 24.0 / eff_layers
+        return {
+            "total_tokens": total,
+            "pulse_counts": list(self.early_exit_counts),
+            "pulse_pcts": [p1, p2, p3],
+            "effective_layers": eff_layers,
+            "compute_speedup": speedup,
+        }
 
     @torch.inference_mode()
     def _step_attention(
@@ -446,7 +473,7 @@ class PulsarInferenceEngine:
 
     @torch.inference_mode()
     def decode_step(self, token_id: int, pos: int, kv_cache: UnifiedKVCache) -> torch.Tensor:
-        """Autoregressively evaluate token at position `pos`, running all K recurrent pulses."""
+        """Autoregressively evaluate token at position `pos`, with optional adaptive early-exit."""
         h_pulse = None
         h_0_norm = None
         logits = None
@@ -454,6 +481,18 @@ class PulsarInferenceEngine:
             logits, h_pulse, h_0_norm = self.decode_pulse_pass(
                 token_id, pos, kv_cache, pulse_idx=k, h_pulse_prev=h_pulse, h_0_norm_cached=h_0_norm
             )
+            # Adaptive Early-Exit (Ouro / Zhu et al., 2025):
+            # If top-1 confidence >= threshold after pulse 1 or 2, exit early and save compute.
+            if self.early_exit_threshold is not None and k < self.cfg.default_pulses - 1:
+                probs = F.softmax(logits, dim=-1)
+                max_prob = probs.max(dim=-1).values.item()
+                if max_prob >= self.early_exit_threshold:
+                    self.early_exit_counts[k] += 1
+                    break
+        else:
+            if self.early_exit_threshold is not None:
+                self.early_exit_counts[self.cfg.default_pulses - 1] += 1
+
         kv_cache.seq_len = pos + 1
         return logits
 
@@ -681,6 +720,13 @@ class PulsarInferenceEngine:
             sys.stdout.write("\n")
             sys.stdout.flush()
 
+        if self.early_exit_threshold is not None:
+            stats = self.get_early_exit_stats()
+            if stats:
+                print(f"\n[Adaptive Early-Exit Stats | Threshold: {self.early_exit_threshold:.2f}]")
+                print(f"  Tokens: {stats['total_tokens']} | P1 (8L): {stats['pulse_pcts'][0]:.1f}% | P2 (16L): {stats['pulse_pcts'][1]:.1f}% | P3 (24L): {stats['pulse_pcts'][2]:.1f}%")
+                print(f"  Effective Depth: {stats['effective_layers']:.1f} layers | Speedup: {stats['compute_speedup']:.2f}x")
+
         return prompt + "".join(accumulated)
 
 
@@ -729,6 +775,7 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature (0 for greedy)")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p nucleus sampling threshold")
     parser.add_argument("--speculative", action="store_true", help="Enable self-speculative decoding (Pulse 1 draft + Pulse 3 verify)")
+    parser.add_argument("--early-exit-threshold", type=float, default=None, help="Confidence threshold for adaptive recurrent early exit (e.g. 0.90 to 0.95). Exits early when top-1 token probability exceeds threshold, saving compute.")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
@@ -748,6 +795,8 @@ def main():
         return
 
     engine, tokenizer = load_inference_model(args.checkpoint, device=args.device)
+    if args.early_exit_threshold is not None:
+        engine.set_early_exit_threshold(args.early_exit_threshold)
 
     if args.interactive:
         print("\n=======================================================")

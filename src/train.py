@@ -385,6 +385,8 @@ def train():
     parser.add_argument("--compile", action="store_true", default=False, help="Enable torch.compile")
     parser.add_argument("--thermal-cooldown-every", type=int, default=0, help="Cooldown pause frequency in steps")
     parser.add_argument("--thermal-cooldown-seconds", type=int, default=100, help="Duration of thermal cooldown pause")
+    parser.add_argument("--reset-dataset", action="store_true", default=False,
+                        help="Reset dataset window cursor to 0 upon resume (crucial when switching shards or transitioning curriculum stages, while preserving model weights, step count, and optimizer moments).")
     args = parser.parse_args()
 
     # Logging setup
@@ -573,10 +575,14 @@ def train():
             # A packed loaders' position is its cursor, not the RNG seed: without this
             # a resumed run restarts at window 0 and retrains the opening data.
             if isinstance(train_loader, PackedBatchLoader):
-                consumed = start_step * grad_accum * args.micro_batch_size
-                train_loader._cursor = consumed
-                print(f"[Pulsar] Packed sampler resumed at window {consumed:,} "
-                      f"of {len(train_loader.plan.windows):,}")
+                if args.reset_dataset:
+                    train_loader._cursor = 0
+                    print("[Pulsar] Packed sampler cursor reset to window 0 (new curriculum stage/shards).")
+                else:
+                    consumed = start_step * grad_accum * args.micro_batch_size
+                    train_loader._cursor = consumed
+                    print(f"[Pulsar] Packed sampler resumed at window {consumed:,} "
+                          f"of {len(train_loader.plan.windows):,}")
             print(f"[Pulsar] Resumed successfully at global_step {start_step} ({tokens_seen:,} tokens, best_val_loss={best_val_loss:.4f})")
         else:
             print(f"[Pulsar] Notice: Checkpoint '{resume_file}' not found. Starting from Step 0.")

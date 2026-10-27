@@ -66,12 +66,23 @@ SUBSTREAM_CONFIG = {
     "5A": {"name": "5A. Multi-Turn Assistant Chat", "weight": 8.0, "pillar": "Pillar 5: Multi-Turn Chat"},
 }
 
+# Stage 2 Mix: High-Density Reasoning & Niche Upsample (35% Code, 30% Math, 20% Agentic, 10% STEM, 5% CoT Dialogue)
+# Context T = 2048, best-fit packed windows. 65% total reasoning/agentic density.
+SUBSTREAM_CONFIG_STAGE2 = {
+    "1B": {"name": "1B. Competitive Code (CoT)", "weight": 25.0, "pillar": "Pillar 1: Code"},
+    "1A": {"name": "1A. Clean Code (Direct)", "weight": 10.0, "pillar": "Pillar 1: Code"},
+    "2B": {"name": "2B. Math Reasoning (CoT)", "weight": 20.0, "pillar": "Pillar 2: Mathematics"},
+    "2A": {"name": "2A. Math Textbooks (Direct)", "weight": 10.0, "pillar": "Pillar 2: Mathematics"},
+    "3A": {"name": "3A. Agentic MCP Tools", "weight": 15.0, "pillar": "Pillar 3: Agentic MCP"},
+    "3B": {"name": "3B. Structured Schemas & Tasks", "weight": 5.0, "pillar": "Pillar 3: Agentic MCP"},
+    "4B": {"name": "4B. Educational STEM Web", "weight": 10.0, "pillar": "Pillar 4: STEM & Knowledge"},
+    "5B": {"name": "5B. Deep CoT Dialogue", "weight": 5.0, "pillar": "Pillar 5: CoT Dialogue"},
+}
+
 # Mix for the long-context stages (intermediate 8-16k and Stage 3). Reasoning streams
-# are weighted far higher than in Stage 1/2 because 53-80% of these traces fit whole at
+# are weighted far higher than in Stage 1 because 53-80% of these traces fit whole at
 # 8k+, so the document-aligned loader can present complete question -> reasoning ->
-# answer arcs. Stage 1/2 keep the 20% CoT mix: their T=1024/2048 windows only ever see
-# the opening fragment of an 8k trace, so raising the share there buys fragments, not
-# arcs. Weights are a PROPOSAL for the owner to confirm; see docs/CURRICULUM.md.
+# answer arcs.
 SUBSTREAM_CONFIG_LONG = {
     "1B": {"name": "1B. Competitive Code (CoT)", "weight": 15.0, "pillar": "Pillar 1: Code"},
     "2B": {"name": "2B. Math Reasoning (CoT)", "weight": 15.0, "pillar": "Pillar 2: Mathematics"},
@@ -84,19 +95,24 @@ SUBSTREAM_CONFIG_LONG = {
     "5A": {"name": "5A. Multi-Turn Assistant Chat", "weight": 6.0, "pillar": "Pillar 5: Multi-Turn Chat"},
 }
 
-# Reasoning share (1B + 2B + 3A) of each mix, used by the dry-run report.
+# Reasoning share (1B + 2B + 3A + 5B) of each mix
 STAGE1_REASONING_WEIGHT = 8.0 + 8.0 + 10.0   # 26.0% (18% CoT + agentic 3A)
+STAGE2_REASONING_WEIGHT = 25.0 + 20.0 + 15.0 + 5.0  # 65.0%
 LONG_REASONING_WEIGHT = 15.0 + 15.0 + 12.0   # 42.0%
 
 
 def substream_config_for_stage(stage: int) -> dict:
     """Return the sub-stream mix for a curriculum stage.
 
-    Stages 1 and 2 use the documented 20% CoT Nemotron mix. Stage 3 (and the
-    intermediate long-context stage, which is built with ``--stage 3``) uses the
-    reasoning-heavy mix because only there do whole traces fit in one window.
+    Stage 1: Foundation 80/20 mix (26% reasoning/agentic).
+    Stage 2: High-Density Reasoning & Niche Upsample (65% reasoning/agentic, T=2048).
+    Stage 3: Long-Context 32k Cooldown (reasoning-heavy full trace mix).
     """
-    return SUBSTREAM_CONFIG_LONG if stage >= 3 else SUBSTREAM_CONFIG
+    if stage == 2:
+        return SUBSTREAM_CONFIG_STAGE2
+    elif stage >= 3:
+        return SUBSTREAM_CONFIG_LONG
+    return SUBSTREAM_CONFIG
 
 
 # ==============================================================================
@@ -148,6 +164,10 @@ def normalize_special_tags(text: str) -> str:
     return (
         text.replace("<think>", "<|think|>")
         .replace("</think>", "<|/think|>")
+        .replace("<|begin_of_thought|>", "<|think|>")
+        .replace("<|end_of_thought|>", "<|/think|>")
+        .replace("<|begin_of_solution|>", "")
+        .replace("<|end_of_solution|>", "")
         .replace("<tool_call>", "<|tool_call|>")
         .replace("</tool_call>", "<|/tool_call|>")
         .replace("<function_call>", "<|tool_call|>")
@@ -456,6 +476,41 @@ def format_tasktrove_row(row: dict) -> str:
     return ""
 
 
+def format_openthoughts_row(convs: list, system_prompt: str = "") -> str:
+    """Format an OpenThoughts CoT conversation into Pulsar's native schema."""
+    user_msg = ""
+    assist_msg = ""
+    for turn in convs:
+        role = turn.get("from")
+        val = str(turn.get("value") or "").strip()
+        if role in ("user", "human"):
+            user_msg = val
+        elif role in ("assistant", "gpt"):
+            assist_msg = val
+    if not user_msg or not assist_msg:
+        return ""
+
+    if "<|begin_of_thought|>" in assist_msg and "<|end_of_thought|>" in assist_msg:
+        parts = assist_msg.split("<|begin_of_thought|>", 1)[1]
+        think_text, sol_text = parts.split("<|end_of_thought|>", 1)
+        think_text = clean_think_trace(think_text.strip())
+        sol_text = sol_text.replace("<|begin_of_solution|>", "").replace("<|end_of_solution|>", "").strip()
+        final_assist = f"<|think|>\n{think_text}\n<|/think|>\n{sol_text}"
+    else:
+        norm = normalize_special_tags(assist_msg)
+        if "<|think|>" in norm and "<|/think|>" in norm:
+            final_assist = norm
+        else:
+            final_assist = f"<|think|>\n{clean_think_trace(norm)}\n<|/think|>"
+
+    parts = []
+    if system_prompt:
+        parts.append(f"<|im_start|>system\n{system_prompt.strip()}<|im_end|>")
+    parts.append(f"<|im_start|>user\n{user_msg.strip()}<|im_end|>")
+    parts.append(f"<|im_start|>assistant\n{final_assist.strip()}<|im_end|>")
+    return "\n".join(parts)
+
+
 # ==============================================================================
 # Parquet Streaming Generators per Sub-stream
 # ==============================================================================
@@ -510,6 +565,10 @@ def make_substream_stream(
         # HuggingFaceTB/smoltalk + nvidia/Nemotron-Post-Training
         repo_id = "HuggingFaceTB/smoltalk"
         prefix = "data/all/train-"
+    elif substream_id == "5B":
+        # open-thoughts/OpenThoughts-114k (Deep CoT Dialogue)
+        repo_id = "open-thoughts/OpenThoughts-114k"
+        prefix = "data/train-"
     else:
         raise ValueError(f"Unknown sub-stream ID: {substream_id}")
 
@@ -601,9 +660,10 @@ def make_substream_stream(
                             formatted = txt
 
                     elif substream_id == "4B":
-                        # Educational STEM web: require high educational score
+                        # Educational STEM web: require high educational score (>= 3.5 in Stage 2+ for high-density academic STEM)
+                        min_score = 3.5 if stage >= 2 else 2.5
                         score = row.get("score") or row.get("int_score") or 0
-                        if float(score) >= 2.5:
+                        if float(score) >= min_score:
                             txt = str(row.get("text") or "").strip()
                             if len(txt) > 50:
                                 formatted = txt
@@ -612,6 +672,12 @@ def make_substream_stream(
                         msgs = row.get("messages") or row.get("conversations")
                         if msgs:
                             formatted = format_toucan_messages(msgs, style_seed=stream_rng.random(), native_only=(stage >= 2))
+
+                    elif substream_id == "5B":
+                        convs = row.get("conversations")
+                        sys_prompt = str(row.get("system") or "").strip()
+                        if convs:
+                            formatted = format_openthoughts_row(convs, system_prompt=sys_prompt)
 
                     if formatted and len(formatted.strip()) > 15:
                         yield formatted.strip()
@@ -722,8 +788,12 @@ def build_shard(
 
     print("==================================================================")
     print(f"   PULSAR SHARD BUILDER: SHARD {shard_idx}/{num_shards - 1}   ")
-    print(f"   Stage {stage} | Target: {total_tokens:,} tokens | Mix: "
-          f"{'long-context (reasoning-heavy)' if stage >= 3 else 'Nemotron 80/20'}")
+    stage_desc = (
+        'Stage 3 Long-Context 32k Cooldown' if stage >= 3
+        else ('Stage 2 High-Density Reasoning (65% CoT/Agentic, T=2048)' if stage == 2
+        else 'Stage 1 Foundation (80/20 Direct/CoT, T=1024)')
+    )
+    print(f"   Stage {stage} | Target: {total_tokens:,} tokens | Mix: {stage_desc}")
     print(f"   Traces: un-elided (cap {MAX_TRACE_CHARS:,} chars) | Seed: {base_seed} + per-stream sha256")
     print("==================================================================")
     free_gb, avail_ram = check_system_resources(min_disk_gb=3.0, min_ram_mb=400.0)

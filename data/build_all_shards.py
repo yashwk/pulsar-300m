@@ -116,9 +116,12 @@ def prefetch_shard_parquets(shard_idx: int, num_shards: int = 12):
         ("nvidia/OpenCodeReasoning", f"split_0/train-{shard_idx:05d}-of-00030.parquet"),
         ("nvidia/OpenMathReasoning", f"data/cot-{shard_idx:05d}-of-00144.parquet"),
         ("Agent-Ark/Toucan-1.5M", f"Kimi-K2/train-{shard_idx:05d}-of-00040.parquet"),
-        ("nvidia/Nemotron-Pretraining-Specialized-v1", f"Nemotron-Pretraining-InfiniByte-Reasoning/part_{shard_idx:06d}.parquet"),
-        ("nvidia/Nemotron-Post-Training-Dataset-v2", f"data/chat-{shard_idx:05d}-of-00012.parquet"),
     ]
+    if stage == 2:
+        ot_idx = shard_idx % 6
+        files_to_download.append(("open-thoughts/OpenThoughts-114k", f"data/train-{ot_idx:05d}-of-00006.parquet"))
+    else:
+        files_to_download.append(("HuggingFaceTB/smoltalk", f"data/all/train-{shard_idx:05d}-of-00040.parquet"))
 
     print(f"\n[Prefetcher] Background prefetching {len(files_to_download)} Parquets for Shard {shard_idx} via hf-transfer...")
     t0 = time.time()
@@ -163,6 +166,7 @@ def run_shard_build(shard_idx: int, num_shards: int, total_tokens: int, cleanup_
         sys.executable,
         "-u",
         "data/prepare_shards.py",
+        "--stage", str(stage),
         "--shard-idx", str(shard_idx),
         "--num-shards", str(num_shards),
         "--total-tokens", str(total_tokens),

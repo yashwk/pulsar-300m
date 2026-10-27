@@ -39,7 +39,6 @@ from monitor.v2_api import (
 )
 
 MONITOR_DIR = os.path.dirname(os.path.abspath(__file__))
-V2_STATIC_DIR = os.path.join(MONITOR_DIR, "v2")
 THRESHOLDS_FILE = os.path.join(MONITOR_DIR, "thresholds.json")
 NOTES_FILE = os.path.join(MONITOR_DIR, "notes.jsonl")
 
@@ -551,10 +550,6 @@ class PulsarMonitorHandler(SimpleHTTPRequestHandler):
 
         if path in ("/", "/index.html"):
             self.serve_dashboard()
-        elif path in ("/v2", "/v2/", "/v2/index.html"):
-            self.serve_v2_dashboard()
-        elif path.startswith("/v2/"):
-            self.serve_v2_static(path[4:])
         elif path == "/favicon.ico":
             self.send_response(HTTPStatus.NO_CONTENT)
             self.end_headers()
@@ -642,46 +637,6 @@ class PulsarMonitorHandler(SimpleHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
-
-    def serve_v2_dashboard(self):
-        v2_index = os.path.join(V2_STATIC_DIR, "index.html")
-        if not os.path.exists(v2_index):
-            self.send_error(HTTPStatus.NOT_FOUND, "monitor/v2/index.html not found")
-            return
-        with open(v2_index, "rb") as f:
-            content = f.read()
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(content)))
-        self.end_headers()
-        self.wfile.write(content)
-
-    def serve_v2_static(self, rel_path: str):
-        rel_path = rel_path.lstrip("/\\")
-        full_path = os.path.abspath(os.path.join(V2_STATIC_DIR, rel_path))
-        if not full_path.startswith(os.path.abspath(V2_STATIC_DIR)):
-            self.send_error(HTTPStatus.FORBIDDEN, "Access denied")
-            return
-        if not os.path.exists(full_path) or os.path.isdir(full_path):
-            self.send_error(HTTPStatus.NOT_FOUND, f"File not found: {rel_path}")
-            return
-
-        ctype, _ = mimetypes.guess_type(full_path)
-        if not ctype:
-            if full_path.endswith(".js"):
-                ctype = "application/javascript"
-            elif full_path.endswith(".css"):
-                ctype = "text/css"
-            else:
-                ctype = "application/octet-stream"
-
-        with open(full_path, "rb") as f:
-            content = f.read()
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(content)))
-        self.end_headers()
-        self.wfile.write(content)
 
     def serve_health(self):
         th = load_thresholds(THRESHOLDS_FILE)

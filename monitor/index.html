@@ -820,11 +820,41 @@
       gap: 0.5rem;
     }
 
-    .canary-filters-group {
+    .canary-tabs-group {
       display: flex;
       align-items: center;
-      gap: 0.25rem;
+      gap: 0.35rem;
       flex-wrap: wrap;
+    }
+
+    .canary-tab-btn {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+      padding: 0.28rem 0.65rem;
+      border-radius: 4px;
+      font-size: 0.74rem;
+      font-family: var(--font-mono);
+      font-weight: 600;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      transition: all 0.15s ease;
+    }
+
+    .canary-tab-btn:hover {
+      background: var(--bg-card-hover);
+      color: var(--text-main);
+      border-color: var(--border-focus);
+    }
+
+    .canary-tab-btn.active {
+      background: var(--text-main);
+      border-color: var(--text-main);
+      color: var(--bg-base);
+      font-weight: 700;
+      box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
     }
 
     .filter-btn {
@@ -1926,14 +1956,8 @@
       </div>
 
       <div class="canary-sub-toolbar">
-        <div class="canary-filters-group">
-          <span class="toolbar-label">Domain:</span>
-          <button class="filter-btn active" onclick="setCanaryFilter('ALL', this)">All (5)</button>
-          <button class="filter-btn" onclick="setCanaryFilter('SQL', this)">SQL</button>
-          <button class="filter-btn" onclick="setCanaryFilter('Python', this)">Python</button>
-          <button class="filter-btn" onclick="setCanaryFilter('Tool Calling / JSON', this)">JSON Tool</button>
-          <button class="filter-btn" onclick="setCanaryFilter('Math / Reasoning', this)">Math</button>
-          <button class="filter-btn" onclick="setCanaryFilter('General Knowledge', this)">Knowledge</button>
+        <div class="canary-tabs-group" id="canaryTabsContainer">
+          <!-- Rendered dynamically as probe tabs -->
         </div>
         <div class="canary-meta-status">
           <span>Active Milestone: <strong id="viewingMilestoneLabel" style="color: var(--white);">Latest Live</strong></span>
@@ -2345,7 +2369,7 @@
     let isSmoothingOn = true;
     let milestoneCanaries = [];
     let selectedMilestoneIdx = -1; // -1 = Latest Live
-    let canaryCategoryFilter = 'ALL';
+    let selectedCanaryTabIdx = 0;
     let isCompareMode = false;
 
     // Initialize Theme immediately
@@ -2394,12 +2418,8 @@
       chart1.update('none');
     }
 
-    function setCanaryFilter(filter, btn) {
-      canaryCategoryFilter = filter;
-      if (btn && btn.parentElement) {
-        btn.parentElement.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
-        btn.classList.add('active');
-      }
+    function selectCanaryTab(idx) {
+      selectedCanaryTabIdx = idx;
       renderSelectedCanaries();
     }
 
@@ -2934,6 +2954,7 @@
 
     function renderSelectedCanaries() {
       const grid = document.getElementById('canaryGrid');
+      const tabsContainer = document.getElementById('canaryTabsContainer');
       const labelEl = document.getElementById('viewingMilestoneLabel');
       if (!grid || milestoneCanaries.length === 0) return;
 
@@ -2948,80 +2969,95 @@
         labelEl.innerText = `${milestone.label || 'Step ' + milestone.step}${valLossStr}`;
       }
 
-      grid.innerHTML = '';
-      let canaries = milestone.canaries || [];
-
-      // Filter by domain if requested
-      if (canaryCategoryFilter !== 'ALL') {
-        const filt = canaryCategoryFilter.toLowerCase();
-        canaries = canaries.filter(c => {
-          const t = inferCanaryTag(c, c.prompt).toLowerCase();
-          const cat = (c.category || '').toLowerCase();
-          if (filt === 'sql') return t.includes('sql') || cat.includes('sql');
-          if (filt === 'python') return t.includes('python') || cat.includes('python');
-          if (filt.includes('tool') || filt.includes('json')) return t.includes('tool') || t.includes('json') || cat.includes('tool') || cat.includes('json');
-          if (filt.includes('math')) return t.includes('math') || cat.includes('math') || t.includes('reasoning');
-          if (filt.includes('knowledge')) return t.includes('knowledge') || cat.includes('knowledge') || t.includes('learning') || t.includes('science');
-          return t.includes(filt) || cat.includes(filt);
-        });
+      const canaries = milestone.canaries || [];
+      if (canaries.length === 0) {
+        grid.innerHTML = '<div style="color: var(--text-dim); padding: 1.5rem; text-align: center; font-family: var(--font-mono);">No canaries recorded for this milestone.</div>';
+        if (tabsContainer) tabsContainer.innerHTML = '';
+        return;
       }
 
-      canaries.forEach(c => {
-        const card = document.createElement('div');
-        card.className = 'canary-card';
+      if (selectedCanaryTabIdx >= canaries.length) {
+        selectedCanaryTabIdx = 0;
+      }
 
-        let promptText = c.prompt || '';
-        let completionText = c.completion || '';
+      // Render Dynamic Tabs Bar
+      if (tabsContainer) {
+        tabsContainer.innerHTML = canaries.map((c, idx) => {
+          const isActive = (idx === selectedCanaryTabIdx);
+          const rawTag = c.tag || c.category || `Probe ${idx + 1}`;
+          let icon = '📄';
+          const tLower = rawTag.toLowerCase();
+          if (tLower.includes('python')) icon = '🐍';
+          else if (tLower.includes('tool')) icon = '🛠️';
+          else if (tLower.includes('math')) icon = '📐';
+          else if (tLower.includes('bash') || tLower.includes('cli')) icon = '💻';
+          else if (tLower.includes('stem') || tLower.includes('knowledge') || tLower.includes('science')) icon = '🔬';
+          else if (tLower.includes('sql')) icon = '🗄️';
 
-        if (!isCompareMode) {
-          // Standard Single-Milestone Tailored View
-          card.innerHTML = renderCanaryContent(c, promptText, completionText);
-        } else {
-          // Side-by-Side Milestone Comparison Mode
-          const baseCanary = baselineMilestone.canaries?.find(bc => bc.tag === c.tag) || c;
-          const basePrompt = baseCanary.prompt || promptText;
-          const baseComp = baseCanary.completion || '';
+          return `<button class="canary-tab-btn ${isActive ? 'active' : ''}" onclick="selectCanaryTab(${idx})">
+            <span>${icon}</span>
+            <span>${escapeHtml(rawTag)}</span>
+          </button>`;
+        }).join('');
+      }
 
-          card.innerHTML = `
-            <div class="canary-card-header">
-              <div class="canary-header-left">
-                <span class="canary-tag tag-${c.tag.toLowerCase().includes('sql') ? 'sql' : c.tag.toLowerCase().includes('python') ? 'python' : c.tag.toLowerCase().includes('tool') ? 'tool' : c.tag.toLowerCase().includes('math') ? 'math' : 'general'}">${escapeHtml(c.tag)}</span>
-                <span class="canary-title-text">${escapeHtml(c.tag)} Qualitative Progression</span>
+      // Render ONLY the Selected Canary Probe Card
+      grid.innerHTML = '';
+      const c = canaries[selectedCanaryTabIdx] || canaries[0];
+      const card = document.createElement('div');
+      card.className = 'canary-card';
+
+      let promptText = c.prompt || '';
+      let completionText = c.completion || '';
+
+      if (!isCompareMode) {
+        // Standard Single-Milestone Tailored View
+        card.innerHTML = renderCanaryContent(c, promptText, completionText);
+      } else {
+        // Side-by-Side Milestone Comparison Mode
+        const baseCanary = baselineMilestone.canaries?.find(bc => bc.tag === c.tag || bc.id === c.id) || c;
+        const basePrompt = baseCanary.prompt || promptText;
+        const baseComp = baseCanary.completion || '';
+
+        card.innerHTML = `
+          <div class="canary-card-header">
+            <div class="canary-header-left">
+              <span class="canary-tag tag-purple">Comparison View</span>
+              <span class="canary-title-text">${escapeHtml(c.tag || 'Probe')} Qualitative Progression</span>
+            </div>
+            <div class="canary-header-right-tools">
+              <span class="canary-eval-badge eval-badge-purple">Baseline vs Current</span>
+              <button class="copy-btn" onclick="copyCanaryText(this, \`${escapeHtml(completionText).replace(/`/g, '\\`')}\`)">Copy Current</button>
+            </div>
+          </div>
+          <div class="canary-prompt-banner">
+            <span class="canary-prompt-label">Prompt:</span>
+            <span>${escapeHtml(promptText.replace(/\n/g, ' '))}</span>
+          </div>
+          <div class="canary-split-comparison">
+            <div class="compare-pane">
+              <div class="compare-pane-title">
+                <span>${escapeHtml(baselineMilestone.label || 'Early Baseline')}</span>
+                <span style="color: var(--amber);">Step ${baselineMilestone.step}</span>
               </div>
-              <div class="canary-header-right-tools">
-                <span class="canary-eval-badge eval-badge-purple">Comparison View</span>
-                <button class="copy-btn" onclick="copyCanaryText(this, \`${escapeHtml(completionText).replace(/`/g, '\\`')}\`)">Copy Current</button>
+              <div class="code-editor-box">
+                <div class="code-line"><span class="line-text" style="color: var(--text-dim);">${escapeHtml(baseComp)}</span></div>
               </div>
             </div>
-            <div class="canary-prompt-banner">
-              <span class="canary-prompt-label">Prompt:</span>
-              <span>${escapeHtml(promptText.replace(/\n/g, ' '))}</span>
-            </div>
-            <div class="canary-split-comparison">
-              <div class="compare-pane">
-                <div class="compare-pane-title">
-                  <span>${escapeHtml(baselineMilestone.label || 'Step 100 Baseline')}</span>
-                  <span style="color: var(--amber);">Early Weights</span>
-                </div>
-                <div class="code-editor-box">
-                  <div class="code-line"><span class="line-text" style="color: var(--text-dim);">${escapeHtml(baseComp)}</span></div>
-                </div>
+            <div class="compare-pane">
+              <div class="compare-pane-title">
+                <span>${escapeHtml(milestone.label || 'Current Milestone')}</span>
+                <span style="color: var(--emerald);">Step ${milestone.step}</span>
               </div>
-              <div class="compare-pane">
-                <div class="compare-pane-title">
-                  <span>${escapeHtml(milestone.label || 'Current Milestone')}</span>
-                  <span style="color: var(--emerald);">Active Weights</span>
-                </div>
-                <div class="code-editor-box">
-                  <div class="code-line"><span class="line-text">${escapeHtml(completionText)}</span></div>
-                </div>
+              <div class="code-editor-box">
+                <div class="code-line"><span class="line-text">${escapeHtml(completionText)}</span></div>
               </div>
             </div>
-          `;
-        }
+          </div>
+        `;
+      }
 
-        grid.appendChild(card);
-      });
+      grid.appendChild(card);
     }
 
     async function updateDashboard() {

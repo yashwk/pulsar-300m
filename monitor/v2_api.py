@@ -199,6 +199,12 @@ def downsample_records(
         bucket_size = max(1, len(records) // target_buckets)
 
         sampled_indices = {0, len(records) - 1}
+
+        # Always strictly preserve all evaluation records so validation curves are never broken
+        for i, r in enumerate(records):
+            if r.get("val_loss") is not None:
+                sampled_indices.add(i)
+
         for b_start in range(0, len(records), bucket_size):
             b_end = min(b_start + bucket_size, len(records))
             b_slice = records[b_start:b_end]

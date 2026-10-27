@@ -1505,9 +1505,9 @@
       </div>
       <div class="header-actions">
         <div class="theme-switch-group">
-          <button id="themeBtnLight" class="theme-btn" onclick="setTheme('light')" title="Bright Daylight Mode">☀️ Light</button>
-          <button id="themeBtnDark" class="theme-btn" onclick="setTheme('dark')" title="High-Contrast Slate Dark">🌙 Dark</button>
-          <button id="themeBtnOLED" class="theme-btn" onclick="setTheme('oled')" title="Midnight OLED">🖤 Midnight</button>
+          <button id="themeBtnLight" class="theme-btn" onclick="setTheme('light')" title="Bright Daylight Mode">Light</button>
+          <button id="themeBtnDark" class="theme-btn" onclick="setTheme('dark')" title="High-Contrast Slate Dark">Dark</button>
+          <button id="themeBtnOLED" class="theme-btn" onclick="setTheme('oled')" title="Midnight OLED">Midnight</button>
         </div>
         <div class="server-status-pill">
           <span id="liveStatusText">Streaming Telemetry</span>
@@ -2985,17 +2985,8 @@
         tabsContainer.innerHTML = canaries.map((c, idx) => {
           const isActive = (idx === selectedCanaryTabIdx);
           const rawTag = c.tag || c.category || `Probe ${idx + 1}`;
-          let icon = '📄';
-          const tLower = rawTag.toLowerCase();
-          if (tLower.includes('python')) icon = '🐍';
-          else if (tLower.includes('tool')) icon = '🛠️';
-          else if (tLower.includes('math')) icon = '📐';
-          else if (tLower.includes('bash') || tLower.includes('cli')) icon = '💻';
-          else if (tLower.includes('stem') || tLower.includes('knowledge') || tLower.includes('science')) icon = '🔬';
-          else if (tLower.includes('sql')) icon = '🗄️';
 
           return `<button class="canary-tab-btn ${isActive ? 'active' : ''}" onclick="selectCanaryTab(${idx})">
-            <span>${icon}</span>
             <span>${escapeHtml(rawTag)}</span>
           </button>`;
         }).join('');

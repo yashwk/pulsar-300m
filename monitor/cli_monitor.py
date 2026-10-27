@@ -128,7 +128,7 @@ def build_ui(data: dict | None, recent_losses: list[float]) -> Layout:
     )
 
     header_text = Text.assemble(
-        (" ⚡ PULSAR ⚡ ", "bold black on bright_cyan"),
+        (" PULSAR ", "bold black on bright_cyan"),
         ("  Recurrent MoE (K=3, 8L→24L) + 32k Hybrid Attention  ", "bold white on rgb(15,23,42)"),
         ("  201.8M Params (107M Active)  ", "bold bright_yellow on rgb(30,41,59)"),
         ("  ", ""),
@@ -200,7 +200,7 @@ def build_ui(data: dict | None, recent_losses: list[float]) -> Layout:
     val_ppl = data.get("val_ppl")
     best_val = data.get("best_val_loss")
     if val_loss is not None:
-        table_left.add_row("Val Loss", f"{val_loss:.4f} (PPL {val_ppl:4.1f}) ★ {best_val:.4f}")
+        table_left.add_row("Val Loss", f"{val_loss:.4f} (PPL {val_ppl:4.1f}) [best: {best_val:.4f}]")
     else:
         table_left.add_row("Val Loss", f"Evaluating (Best: {best_val if best_val else '--'})")
 

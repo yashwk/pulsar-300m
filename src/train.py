@@ -871,7 +871,7 @@ def train():
                 drop_str = f" | Drops: [{' '.join(rates)}] cap {int(moe_stats['capacity'])}"
                 overall = moe_stats["drop_rate"] * 100.0
                 if overall > args.drop_warn_pct:
-                    drop_str += f" ⚠ overall {overall:.2f}% > {args.drop_warn_pct}% -> consider --moe-capacity-factor 1.25"
+                    drop_str += f" [WARN] overall {overall:.2f}% > {args.drop_warn_pct}% -> consider --moe-capacity-factor 1.25"
         print(f"  ↳ MoE Experts: [{moe_str}] | Conf: {conf:4.2f} | MaxBias: {max_bias:5.3f}{drop_str}")
         print(f"  ↳ Pulses: {pulses_str} | λ: {mix_lambda:.3f}")
         print(

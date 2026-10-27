@@ -1466,11 +1466,11 @@
           <div class="brand-title">PULSAR</div>
         </div>
         <div class="badges-group" id="headerBadgesGroup">
-          <span class="spec-badge spec-badge-accent" id="hdrBadgeCore">Core: 8L → 24L (3 Pulses)</span>
-          <span class="spec-badge" id="hdrBadgeMoE">MoE: 1 Shared + 8 Routed (Top-2)</span>
-          <span class="spec-badge" id="hdrBadgeAttn">32k Hybrid Attention</span>
-          <span class="spec-badge" id="hdrBadgeParams">298.5M Total (147.5M Active)</span>
-          <span class="spec-badge" id="hdrBadgeDevice">NVIDIA GeForce RTX 4060</span>
+          <span class="spec-badge spec-badge-accent" id="hdrBadgeCore">Recurrent MoE Architecture</span>
+          <span class="spec-badge" id="hdrBadgeMoE">Auxiliary-Loss-Free Top-2 Routing</span>
+          <span class="spec-badge" id="hdrBadgeAttn">Hybrid Sliding-Window Attention</span>
+          <span class="spec-badge" id="hdrBadgeParams">Loading Model Config...</span>
+          <span class="spec-badge" id="hdrBadgeDevice">Detecting GPU...</span>
         </div>
       </div>
       <div class="header-actions">
@@ -1533,16 +1533,16 @@
       <!-- 2. Dynamic Dataset Horizon -->
       <div class="progress-box">
         <div class="progress-top-row">
-          <span class="progress-title-sub" id="datasetHorizonTitle">Dataset Horizon (2 Shards Concurrent Interleaved)</span>
+          <span class="progress-title-sub" id="datasetHorizonTitle">Dataset Horizon</span>
           <span class="progress-val-badge" id="valDatasetPct" style="color: var(--purple);">0.0%</span>
         </div>
         <div class="progress-track">
           <div id="datasetProgressBar" class="progress-fill-purple" style="width: 0%;"></div>
         </div>
         <div class="progress-meta-row">
-          <div><strong id="valTokensText" style="color: var(--white);">0.0M / 952.4M Tokens</strong></div>
-          <div>Sampling: <span id="valShardsText" style="color: var(--emerald);">Shards 1 & 2 Active</span></div>
-          <div>Batch: <span id="valBatchText" style="color: var(--text-secondary);">131,072 tok/step</span></div>
+          <div><strong id="valTokensText" style="color: var(--white);">0.0M Tokens</strong></div>
+          <div>Sampling: <span id="valShardsText" style="color: var(--emerald);">Detecting active shards...</span></div>
+          <div>Batch: <span id="valBatchText" style="color: var(--text-secondary);">-- tok/step</span></div>
         </div>
       </div>
     </div>
@@ -1948,8 +1948,8 @@
 
     <!-- Minimalist Footer -->
     <footer>
-      <div>Pulsar Telemetry • 146.8M Active / 299.7M Total (8L → 24L Recurrent MoE) • 32k Hybrid Attention • Port 7860</div>
-      <div>RTX 4060 Laptop (8GB) • PyTorch Fused CUDA • Muon + AdamW</div>
+      <div id="footerArchSummary">Pulsar Telemetry Monitor • Port 7860</div>
+      <div id="footerHwSummary">PyTorch Fused CUDA • Muon + AdamW</div>
     </footer>
 
   </div>
@@ -3099,10 +3099,19 @@
             const actM = mc.active_params ? `${(mc.active_params / 1e6).toFixed(1)}M Active` : '-- Active';
             bParams.innerText = `${totM} (${actM})`;
           }
+
+          const footArch = document.getElementById('footerArchSummary');
+          if (footArch) {
+            const totM = mc.total_params ? `${(mc.total_params / 1e6).toFixed(1)}M Total` : '';
+            const actM = mc.active_params ? `${(mc.active_params / 1e6).toFixed(1)}M Active` : '';
+            footArch.innerText = `Pulsar Telemetry • ${actM} / ${totM} (${nCore}L → ${effL}L Recurrent MoE) • Port 7860`;
+          }
         }
         if (data.device_name) {
           const bDev = document.getElementById('hdrBadgeDevice');
           if (bDev) bDev.innerText = data.device_name;
+          const footHw = document.getElementById('footerHwSummary');
+          if (footHw) footHw.innerText = `${data.device_name} • PyTorch Fused CUDA • Muon + AdamW`;
         }
 
         // 2. Dual Horizon Progress Bars
@@ -3136,22 +3145,43 @@
 
         const tokensSeen = data.tokens_seen || 0;
         const datasetTokens = data.train_dataset_tokens || 0;
-        const numShards = data.num_train_shards || 1;
+        const trainShards = Array.isArray(data.train_shards) ? data.train_shards : [];
+        const numShards = trainShards.length > 0 ? trainShards.length : (data.num_train_shards || 1);
         const datasetPct = datasetTokens > 0 ? Math.min(100, ((tokensSeen / datasetTokens) * 100)).toFixed(2) : '0.00';
         
         // Dynamic Concurrent Shard Traversal & Epoch Math
         const batchTokens = data.global_batch_tokens || 131072;
-        const totalEpochSteps = (datasetTokens > 0 && batchTokens > 0) ? Math.ceil(datasetTokens / batchTokens) : 7266;
+        const totalEpochSteps = (datasetTokens > 0 && batchTokens > 0) ? Math.ceil(datasetTokens / batchTokens) : 0;
         const epochNum = datasetTokens > 0 ? (Math.floor(tokensSeen / datasetTokens) + 1) : 1;
         const stepsInEpoch = totalEpochSteps > 0 ? (step % totalEpochSteps) : step;
         const stepsRemainingInEpoch = Math.max(0, totalEpochSteps - stepsInEpoch);
 
         const horizonTitleEl = document.getElementById('datasetHorizonTitle');
-        if (horizonTitleEl) horizonTitleEl.innerText = `Dataset Horizon (${numShards} Shards Concurrent Interleaved)`;
+        if (horizonTitleEl) {
+          horizonTitleEl.innerText = numShards > 1
+            ? `Dataset Horizon (${numShards} Shards Concurrent Interleaved)`
+            : `Dataset Horizon (Single Shard Streaming)`;
+        }
         
         const shardsTextEl = document.getElementById('valShardsText');
         if (shardsTextEl) {
-          shardsTextEl.innerText = `Shards 1..${numShards} Active (Concurrent Pinned Memmap)`;
+          if (trainShards.length > 0) {
+            const labels = trainShards.map(s => {
+              const m = s.match(/shard(\d+)/i);
+              return m ? `Shard ${m[1]}` : s.replace(/\.bin$/, '');
+            });
+            if (labels.length === 1) {
+              shardsTextEl.innerText = `${labels[0]} Active (Pinned Memmap)`;
+            } else if (labels.length === 2) {
+              shardsTextEl.innerText = `${labels[0]} & ${labels[1]} Active (Concurrent Pinned Memmap)`;
+            } else {
+              const last = labels[labels.length - 1];
+              const leading = labels.slice(0, -1).join(', ');
+              shardsTextEl.innerText = `${leading} & ${last} Active (Concurrent Pinned Memmap)`;
+            }
+          } else {
+            shardsTextEl.innerText = `${numShards} Shard${numShards > 1 ? 's' : ''} Active (Concurrent Pinned Memmap)`;
+          }
         }
 
         const batchEl = document.getElementById('valBatchText');
@@ -3178,6 +3208,12 @@
         if (card1Badge) card1Badge.innerText = `${effLayers}L`;
         const card1Title = document.getElementById('kpiValTitle');
         if (card1Title) card1Title.innerText = kPulses > 1 ? `Val Loss (Pulse ${kPulses})` : `Validation Loss`;
+
+        if (typeof chart1 !== 'undefined' && chart1 && chart1.data && chart1.data.datasets && chart1.data.datasets.length >= 5) {
+          chart1.data.datasets[2].label = `Val Pulse 1 [${nCore}L]`;
+          chart1.data.datasets[3].label = `Val Pulse 2 [${nCore * 2}L]`;
+          chart1.data.datasets[4].label = `Val Pulse 3 [${effLayers}L]`;
+        }
 
         const vpl = data.val_pulse_losses || [];
         const vppl = data.val_pulse_ppls || [];

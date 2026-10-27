@@ -669,6 +669,10 @@ def train():
         "seq_len": args.seq_len,
         "num_pulses": args.num_pulses,
         "lr_schedule": args.lr_schedule,
+        "train_shards": [os.path.basename(p) for p in train_paths],
+        "val_shards": [os.path.basename(p) for p in val_paths],
+        "num_train_shards": len(train_shards),
+        "train_dataset_tokens": train_loader.total_tokens,
     }
     run_cfg_path = os.path.join(args.checkpoint_dir, "run_config.json")
     try:
@@ -964,6 +968,7 @@ def train():
             "tokens_seen": tokens_seen,
             "train_dataset_tokens": train_loader.total_tokens,
             "num_train_shards": len(train_shards),
+            "train_shards": [os.path.basename(p) for p in train_paths],
             "global_batch_tokens": effective_global_batch_tokens,
             "micro_batch_size": args.micro_batch_size,
             "seq_len": args.seq_len,

@@ -342,6 +342,29 @@ def _run_config_value(name, default):
     return _RUN_CONFIG_CACHE["value"].get(name, default)
 
 
+def detect_active_train_shards():
+    # 1. Authoritative run_config.json
+    rc = get_run_config()
+    if rc.get("train_shards"):
+        return [os.path.basename(s) for s in rc["train_shards"]]
+
+    # 2. Inspect active running trainer process via /proc
+    for cmd_path in glob.glob("/proc/[0-9]*/cmdline"):
+        try:
+            with open(cmd_path, "rb") as f:
+                parts = f.read().split(b"\x00")
+                cmd = [p.decode("utf-8", errors="ignore") for p in parts if p]
+                if any("src/train.py" in arg for arg in cmd):
+                    for i, arg in enumerate(cmd):
+                        if arg == "--train-bin" and i + 1 < len(cmd):
+                            return [os.path.basename(s.strip()) for s in cmd[i + 1].split(",") if s.strip()]
+                        elif arg.startswith("--train-bin="):
+                            return [os.path.basename(s.strip()) for s in arg.split("=", 1)[1].split(",") if s.strip()]
+        except Exception:
+            pass
+    return None
+
+
 def enrich_status_payload(data):
     cooling_info = check_log_thermal_cooling()
     if cooling_info:
@@ -444,19 +467,25 @@ def enrich_status_payload(data):
     else:
         data["phase"] = "Stable Phase"
 
-    # Dynamic dataset tokens & shard count from live metrics or disk inspection
-    data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
-    train_shards = sorted(glob.glob(os.path.join(data_dir, "train*.bin")))
-    train_shards = [s for s in train_shards if not s.endswith(".tmp")]
-    disk_shards_count = len(train_shards) if train_shards else 1
-    disk_dataset_tokens = sum(os.path.getsize(p) // 2 for p in train_shards) if train_shards else 0
-
-    curr_shards = data.get("num_train_shards")
-    if not curr_shards or curr_shards < disk_shards_count:
-        data["num_train_shards"] = disk_shards_count
-        data["train_dataset_tokens"] = disk_dataset_tokens
-    elif not data.get("train_dataset_tokens"):
-        data["train_dataset_tokens"] = disk_dataset_tokens
+    # Dynamic active train shards
+    active_shards = detect_active_train_shards()
+    if active_shards:
+        data["train_shards"] = active_shards
+        data["num_train_shards"] = len(active_shards)
+        if not data.get("train_dataset_tokens"):
+            data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+            data["train_dataset_tokens"] = sum(
+                os.path.getsize(os.path.join(data_dir, s)) // 2
+                for s in active_shards
+                if os.path.exists(os.path.join(data_dir, s))
+            )
+    elif not data.get("num_train_shards") or not data.get("train_dataset_tokens"):
+        data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+        disk_shards = sorted(glob.glob(os.path.join(data_dir, "train*.bin")))
+        disk_shards = [s for s in disk_shards if not s.endswith(".tmp")]
+        data["train_shards"] = [os.path.basename(s) for s in disk_shards]
+        data["num_train_shards"] = len(disk_shards) if disk_shards else 1
+        data["train_dataset_tokens"] = sum(os.path.getsize(p) // 2 for p in disk_shards) if disk_shards else 0
 
     # Dynamic model configuration summary (cached; never rebuilds the model per request)
     if not data.get("model_config"):

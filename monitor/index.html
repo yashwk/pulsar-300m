@@ -1533,15 +1533,15 @@
       <!-- 2. Dynamic Dataset Horizon -->
       <div class="progress-box">
         <div class="progress-top-row">
-          <span class="progress-title-sub" id="datasetHorizonTitle">Dataset Horizon (2 Shards Zero-Copy)</span>
+          <span class="progress-title-sub" id="datasetHorizonTitle">Dataset Horizon (2 Shards Concurrent Interleaved)</span>
           <span class="progress-val-badge" id="valDatasetPct" style="color: var(--purple);">0.0%</span>
         </div>
         <div class="progress-track">
           <div id="datasetProgressBar" class="progress-fill-purple" style="width: 0%;"></div>
         </div>
         <div class="progress-meta-row">
-          <div><strong id="valTokensText" style="color: var(--white);">0.0M / 950.4M Tokens</strong></div>
-          <div>Active: <span id="valShardsText" style="color: var(--emerald);">Shard 1/2</span></div>
+          <div><strong id="valTokensText" style="color: var(--white);">0.0M / 952.4M Tokens</strong></div>
+          <div>Sampling: <span id="valShardsText" style="color: var(--emerald);">Shards 1 & 2 Active</span></div>
           <div>Batch: <span id="valBatchText" style="color: var(--text-secondary);">131,072 tok/step</span></div>
         </div>
       </div>
@@ -3139,41 +3139,34 @@
         const numShards = data.num_train_shards || 1;
         const datasetPct = datasetTokens > 0 ? Math.min(100, ((tokensSeen / datasetTokens) * 100)).toFixed(2) : '0.00';
         
-        // Dynamic Shard Traversal & Epoch Math
-        const shardSize = (datasetTokens > 0 && numShards > 0) ? (datasetTokens / numShards) : 0;
-        const currentShardIdx = shardSize > 0 ? Math.min(numShards, Math.floor(tokensSeen / shardSize) + 1) : 1;
-        const tokensInCurrentShard = shardSize > 0 ? (tokensSeen % shardSize) : 0;
-        const shardPct = shardSize > 0 ? ((tokensInCurrentShard / shardSize) * 100).toFixed(1) : '0.0';
-        const tokensRemainingInShard = Math.max(0, shardSize - tokensInCurrentShard);
-        const batchTokens = data.global_batch_tokens || 0;
-        const stepsToNextShard = (batchTokens > 0 && tokensRemainingInShard > 0) ? Math.ceil(tokensRemainingInShard / batchTokens) : 0;
-        const totalEpochSteps = batchTokens > 0 ? Math.ceil(datasetTokens / batchTokens) : 0;
+        // Dynamic Concurrent Shard Traversal & Epoch Math
+        const batchTokens = data.global_batch_tokens || 131072;
+        const totalEpochSteps = (datasetTokens > 0 && batchTokens > 0) ? Math.ceil(datasetTokens / batchTokens) : 7266;
+        const epochNum = datasetTokens > 0 ? (Math.floor(tokensSeen / datasetTokens) + 1) : 1;
+        const stepsInEpoch = totalEpochSteps > 0 ? (step % totalEpochSteps) : step;
+        const stepsRemainingInEpoch = Math.max(0, totalEpochSteps - stepsInEpoch);
 
         const horizonTitleEl = document.getElementById('datasetHorizonTitle');
-        if (horizonTitleEl) horizonTitleEl.innerText = `Dataset Horizon (${numShards} Shards Zero-Copy)`;
+        if (horizonTitleEl) horizonTitleEl.innerText = `Dataset Horizon (${numShards} Shards Concurrent Interleaved)`;
         
         const shardsTextEl = document.getElementById('valShardsText');
         if (shardsTextEl) {
-          if (shardSize > 0) {
-            shardsTextEl.innerText = `Shard ${currentShardIdx}/${numShards} (${(tokensInCurrentShard / 1e6).toFixed(1)}M / ${(shardSize / 1e6).toFixed(1)}M • ${shardPct}%)`;
-          } else {
-            shardsTextEl.innerText = `Shard ${currentShardIdx}/${numShards}`;
-          }
+          shardsTextEl.innerText = `Shards 1..${numShards} Active (Concurrent Pinned Memmap)`;
         }
 
         const batchEl = document.getElementById('valBatchText');
         if (batchEl) {
           if (batchTokens > 0) {
-            batchEl.innerText = `${batchTokens.toLocaleString()} tok/step (~${stepsToNextShard.toLocaleString()} steps to Shard ${currentShardIdx < numShards ? currentShardIdx + 1 : 1})`;
+            batchEl.innerText = `${batchTokens.toLocaleString()} tok/step (~${stepsRemainingInEpoch.toLocaleString()} steps to Epoch ${epochNum + 1})`;
           } else {
             batchEl.innerText = `-- tok/step`;
           }
         }
 
         document.getElementById('valTokensText').innerText = datasetTokens > 0
-          ? `${(tokensSeen / 1e6).toFixed(2)}M / ${(datasetTokens / 1e6).toFixed(1)}M Total Tokens (${totalEpochSteps.toLocaleString()} steps / epoch)`
+          ? `${(tokensSeen / 1e6).toFixed(2)}M / ${(datasetTokens / 1e6).toFixed(1)}M Tokens (Epoch ${epochNum} • ${totalEpochSteps.toLocaleString()} steps / epoch)`
           : `${(tokensSeen / 1e6).toFixed(2)}M Total Tokens`;
-        document.getElementById('valDatasetPct').innerText = `${datasetPct}%`;
+        document.getElementById('valDatasetPct').innerText = `${datasetPct}% (Ep ${epochNum})`;
         document.getElementById('datasetProgressBar').style.width = `${Math.min(100, datasetPct)}%`;
 
         // 3. Top 6 High-Signal KPI Stat Cards

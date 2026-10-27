@@ -35,6 +35,7 @@ import hashlib
 import io
 import json
 import random
+import re
 import shutil
 import sys
 import tarfile
@@ -54,16 +55,17 @@ MANIFEST_PATH = "data/shards_manifest.json"
 # Sub-stream Specification & Target Quotas
 # ==============================================================================
 
+# Stage 1 Upgraded Mix (Shards 3+): Progressive Reasoning Ramp (32% CoT / 44% Total Reasoning & Agentic)
 SUBSTREAM_CONFIG = {
-    "1A": {"name": "1A. Clean Code (Direct)", "weight": 22.0, "pillar": "Pillar 1: Code"},
-    "1B": {"name": "1B. Competitive Code (CoT)", "weight": 8.0, "pillar": "Pillar 1: Code"},
-    "2A": {"name": "2A. Math Textbooks (Direct)", "weight": 17.0, "pillar": "Pillar 2: Mathematics"},
-    "2B": {"name": "2B. Math Reasoning (CoT)", "weight": 8.0, "pillar": "Pillar 2: Mathematics"},
-    "3A": {"name": "3A. Agentic MCP Tools", "weight": 10.0, "pillar": "Pillar 3: Agentic MCP"},
+    "1A": {"name": "1A. Clean Code (Direct)", "weight": 16.0, "pillar": "Pillar 1: Code"},
+    "1B": {"name": "1B. Competitive Code (CoT)", "weight": 16.0, "pillar": "Pillar 1: Code"},
+    "2A": {"name": "2A. Math Textbooks (Direct)", "weight": 15.0, "pillar": "Pillar 2: Mathematics"},
+    "2B": {"name": "2B. Math Reasoning (CoT)", "weight": 16.0, "pillar": "Pillar 2: Mathematics"},
+    "3A": {"name": "3A. Agentic MCP Tools", "weight": 12.0, "pillar": "Pillar 3: Agentic MCP"},
     "3B": {"name": "3B. Structured Schemas & Tasks", "weight": 5.0, "pillar": "Pillar 3: Agentic MCP"},
-    "4A": {"name": "4A. Encyclopedic FineWiki", "weight": 10.0, "pillar": "Pillar 4: STEM & Knowledge"},
-    "4B": {"name": "4B. Educational STEM Web", "weight": 12.0, "pillar": "Pillar 4: STEM & Knowledge"},
-    "5A": {"name": "5A. Multi-Turn Assistant Chat", "weight": 8.0, "pillar": "Pillar 5: Multi-Turn Chat"},
+    "4A": {"name": "4A. Encyclopedic FineWiki", "weight": 6.0, "pillar": "Pillar 4: STEM & Knowledge"},
+    "4B": {"name": "4B. Educational STEM Web", "weight": 10.0, "pillar": "Pillar 4: STEM & Knowledge"},
+    "5A": {"name": "5A. Multi-Turn Assistant Chat", "weight": 4.0, "pillar": "Pillar 5: Multi-Turn Chat"},
 }
 
 # Stage 2 Mix: High-Density Reasoning & Niche Upsample (35% Code, 30% Math, 20% Agentic, 10% STEM, 5% CoT Dialogue)
@@ -96,7 +98,7 @@ SUBSTREAM_CONFIG_LONG = {
 }
 
 # Reasoning share (1B + 2B + 3A + 5B) of each mix
-STAGE1_REASONING_WEIGHT = 8.0 + 8.0 + 10.0   # 26.0% (18% CoT + agentic 3A)
+STAGE1_REASONING_WEIGHT = 16.0 + 16.0 + 12.0   # 44.0% (32% CoT + 12% agentic 3A)
 STAGE2_REASONING_WEIGHT = 25.0 + 20.0 + 15.0 + 5.0  # 65.0%
 LONG_REASONING_WEIGHT = 15.0 + 15.0 + 12.0   # 42.0%
 
@@ -104,7 +106,7 @@ LONG_REASONING_WEIGHT = 15.0 + 15.0 + 12.0   # 42.0%
 def substream_config_for_stage(stage: int) -> dict:
     """Return the sub-stream mix for a curriculum stage.
 
-    Stage 1: Foundation 80/20 mix (26% reasoning/agentic).
+    Stage 1: Foundation upgraded mix (44% reasoning/agentic, 32% CoT, T=1024).
     Stage 2: High-Density Reasoning & Niche Upsample (65% reasoning/agentic, T=2048).
     Stage 3: Long-Context 32k Cooldown (reasoning-heavy full trace mix).
     """
@@ -627,7 +629,7 @@ def make_substream_stream(
                             formatted = code
 
                     elif substream_id == "1B":
-                        if stage >= 2 and row.get("is_correct") is False:
+                        if row.get("is_correct") is False:
                             continue
                         inp = str(row.get("input") or row.get("problem") or "").strip()
                         out = str(row.get("output") or row.get("generated_solution") or "").strip()
@@ -640,7 +642,7 @@ def make_substream_stream(
                             formatted = txt
 
                     elif substream_id == "2B":
-                        if stage >= 2 and row.get("is_correct") is False:
+                        if row.get("is_correct") is False:
                             continue
                         p = str(row.get("problem") or "").strip()
                         s = str(row.get("generated_solution") or row.get("cot") or "").strip()
@@ -649,7 +651,7 @@ def make_substream_stream(
 
                     elif substream_id == "3A":
                         msgs = row.get("messages") or row.get("conversations")
-                        formatted = format_toucan_messages(msgs, style_seed=stream_rng.random(), native_only=(stage >= 2))
+                        formatted = format_toucan_messages(msgs, style_seed=stream_rng.random(), native_only=True)
 
                     elif substream_id == "3B":
                         formatted = format_tasktrove_row(row)
@@ -660,8 +662,8 @@ def make_substream_stream(
                             formatted = txt
 
                     elif substream_id == "4B":
-                        # Educational STEM web: require high educational score (>= 3.5 in Stage 2+ for high-density academic STEM)
-                        min_score = 3.5 if stage >= 2 else 2.5
+                        # Educational STEM web: require high educational score (>= 3.5 in Stage 2, >= 3.2 in Stage 1 upgraded)
+                        min_score = 3.5 if stage >= 2 else 3.2
                         score = row.get("score") or row.get("int_score") or 0
                         if float(score) >= min_score:
                             txt = str(row.get("text") or "").strip()
@@ -671,7 +673,7 @@ def make_substream_stream(
                     elif substream_id == "5A":
                         msgs = row.get("messages") or row.get("conversations")
                         if msgs:
-                            formatted = format_toucan_messages(msgs, style_seed=stream_rng.random(), native_only=(stage >= 2))
+                            formatted = format_toucan_messages(msgs, style_seed=stream_rng.random(), native_only=True)
 
                     elif substream_id == "5B":
                         convs = row.get("conversations")
@@ -791,7 +793,7 @@ def build_shard(
     stage_desc = (
         'Stage 3 Long-Context 32k Cooldown' if stage >= 3
         else ('Stage 2 High-Density Reasoning (65% CoT/Agentic, T=2048)' if stage == 2
-        else 'Stage 1 Foundation (80/20 Direct/CoT, T=1024)')
+        else 'Stage 1 Foundation Upgraded (32% CoT / 44% Reasoning, T=1024)')
     )
     print(f"   Stage {stage} | Target: {total_tokens:,} tokens | Mix: {stage_desc}")
     print(f"   Traces: un-elided (cap {MAX_TRACE_CHARS:,} chars) | Seed: {base_seed} + per-stream sha256")

@@ -1009,6 +1009,8 @@ class PulsarMoEMLP(nn.Module):
             counts = self.expert_pulse_counts[:k]
             avg = counts.mean(dim=1, keepdim=True)
             self.expert_bias[:k].add_(bias_lr * torch.sign(avg - counts))
+            # Zero-center across expert dimension to prevent DC drift saturation
+            self.expert_bias[:k].sub_(self.expert_bias[:k].mean(dim=1, keepdim=True))
             self.expert_bias[:k].clamp_(-1.0, 1.0)
             self.expert_pulse_counts[:k].zero_()
             # Reset even though it is not accumulated in this mode, so a model that
@@ -1017,6 +1019,7 @@ class PulsarMoEMLP(nn.Module):
         else:
             avg_count = self.expert_counts_accum.mean()
             self.expert_bias.add_(bias_lr * torch.sign(avg_count - self.expert_counts_accum))
+            self.expert_bias.sub_(self.expert_bias.mean())
             self.expert_bias.clamp_(-1.0, 1.0)
             self.expert_counts_accum.zero_()
 
@@ -1192,14 +1195,17 @@ class PulsarForCausalLM(nn.Module):
             if not name.endswith("expert_bias"):
                 continue
             cur = migrated.get(name)
-            if cur is not None and cur.shape == buf.shape:
-                continue
-            src = cur if cur is not None else default_bias
-            if src.shape == (self.cfg.n_routed_experts,):
+            if cur is None:
                 migrated[name] = (
-                    src.to(torch.float32).unsqueeze(0).expand(self.cfg.max_pulses, -1).clone()
+                    default_bias.unsqueeze(0).expand(self.cfg.max_pulses, -1).clone()
                 )
+                continue
+            if cur.shape == (self.cfg.n_routed_experts,):
+                cur = cur.to(torch.float32).unsqueeze(0).expand(self.cfg.max_pulses, -1).clone()
                 print(f"[migrate] {name}: [E] -> [max_pulses, E] by broadcast")
+            # Zero-center across expert dimension to remove historical DC drift
+            b = cur.float()
+            migrated[name] = (b - b.mean(dim=-1, keepdim=True)).to(cur.dtype)
         return migrated
 
     def _migrate_counters(self, state_dict: dict) -> dict:

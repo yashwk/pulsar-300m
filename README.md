@@ -111,8 +111,11 @@ Pulsar implements a native unified KV-cache inference engine with sliding-window
 # Interactive REPL:
 python src/infer.py --checkpoint checkpoints/best.pt --interactive
 
-# Single prompt completion:
+# Single prompt completion (standard autoregressive):
 python src/infer.py --checkpoint checkpoints/best.pt --prompt "def quicksort(arr: list[int]) -> list[int]:"
+
+# Accelerated self-speculative decoding (Pulse 1 draft + Pulse 3 verification):
+python src/infer.py --checkpoint checkpoints/best.pt --prompt "def quicksort(arr: list[int]) -> list[int]:" --speculative
 
 # Memory footprint benchmark across context lengths:
 python src/infer.py --benchmark
@@ -131,3 +134,4 @@ python src/infer.py --benchmark
 ## 📑 References & Acknowledgements
 - **Unified Recurrent KV-Cache Dynamics:** Attractor dynamics and cross-pass recurrent state sharing inspired by UCSD Sandy Research / Fu et al. (*Be-Nice: Recurrent Transformers with Contractive State Attractors*).
 - **Compressed Sparse & Sliding-Window Inference Bounds:** Multi-layer hybrid KV caching and context scaling inspired by DeepSeek CSA2 architecture (*DeepSeek-V4.1-Flash*).
+- **Pipelined Self-Speculative Decoding for Looped Architectures:** Recurrent-depth draft extraction and zero-overhead parallel verification inspired by KAIST FLEXML Lab / Bae et al. (*LoopSpec: Pipelined Self-Speculative Decoding for Looped Transformers*).

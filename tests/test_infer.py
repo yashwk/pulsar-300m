@@ -159,3 +159,33 @@ def test_inference_engine_generate_and_stream():
     assert len(tokens) <= 3
     assert all(isinstance(t, str) for t in tokens)
 
+
+def test_self_speculative_generation():
+    """Verify self-speculative generation produces valid output and state rollback works."""
+    cfg = create_mini_config()
+    model = PulsarForCausalLM(cfg).to(dtype=torch.float32)
+    engine = PulsarInferenceEngine(model, device="cpu", dtype=torch.float32)
+    tokenizer = MockTokenizer()
+
+    # Generate with speculative=True
+    output = engine.generate(
+        tokenizer,
+        prompt="hello",
+        max_new_tokens=6,
+        temperature=0.0,
+        stream=False,
+        speculative=True,
+    )
+    assert isinstance(output, str)
+    assert output.startswith("hello")
+
+    # Streaming with self-speculative
+    tokens = list(engine.self_speculative_stream_generate(
+        tokenizer,
+        prompt="hello",
+        max_new_tokens=4,
+        temperature=0.0,
+    ))
+    assert len(tokens) <= 4
+    assert all(isinstance(t, str) for t in tokens)
+

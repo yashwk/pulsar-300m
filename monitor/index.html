@@ -1970,6 +1970,80 @@
       </div>
     </div>
 
+    <!-- GRPO RLVR Reasoning Alignment Bay (Branched Verification) -->
+    <div class="canary-section" id="grpoSection" style="margin-top: 0.75rem;">
+      <div class="canary-header-bar">
+        <div class="canary-title" style="color: var(--cyan);">
+          GRPO RLVR REASONING ALIGNMENT BAY
+          <span class="spec-badge spec-badge-accent" style="margin-left: 0.5rem; font-size: 0.65rem;">Branched Verification</span>
+        </div>
+        <div class="canary-header-right">
+          <span class="spec-badge" id="grpoSnapshotBadge" style="border-color: rgba(6, 182, 212, 0.4); color: var(--cyan);">Base Snapshot: milestone_step_4000.pt</span>
+          <span class="spec-badge spec-badge-emerald" id="grpoSafetyBadge">Trunk Isolated & Safe</span>
+          <span class="spec-badge" id="grpoStatusBadge">Status: Idle</span>
+        </div>
+      </div>
+
+      <!-- GRPO Live Telemetry Cards -->
+      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 0.6rem;">
+        <div class="metric-card" style="padding: 0.6rem 0.8rem;">
+          <div class="metric-title">GRPO Step</div>
+          <div class="metric-value-row">
+            <span class="metric-num" id="grpoValStep" style="font-size: 1.15rem; color: var(--text-main);">-- / --</span>
+          </div>
+          <div class="metric-sub" id="grpoSubStep">Horizon: 50 Steps</div>
+        </div>
+        <div class="metric-card" style="padding: 0.6rem 0.8rem;">
+          <div class="metric-title">Mean Reward</div>
+          <div class="metric-value-row">
+            <span class="metric-num" id="grpoValMeanR" style="font-size: 1.15rem; color: var(--cyan);">--</span>
+          </div>
+          <div class="metric-sub">Max: <span id="grpoValMaxR" style="color: var(--emerald);">--</span></div>
+        </div>
+        <div class="metric-card" style="padding: 0.6rem 0.8rem;">
+          <div class="metric-title">Math Accuracy</div>
+          <div class="metric-value-row">
+            <span class="metric-num" id="grpoValMathAcc" style="font-size: 1.15rem; color: var(--amber);">--%</span>
+          </div>
+          <div class="metric-sub">Verifiable Boxed & Numerical</div>
+        </div>
+        <div class="metric-card" style="padding: 0.6rem 0.8rem;">
+          <div class="metric-title">Python AST Validity</div>
+          <div class="metric-value-row">
+            <span class="metric-num" id="grpoValCodeAST" style="font-size: 1.15rem; color: var(--emerald);">--%</span>
+          </div>
+          <div class="metric-sub">Executable Syntax</div>
+        </div>
+        <div class="metric-card" style="padding: 0.6rem 0.8rem;">
+          <div class="metric-title">CoT Structure</div>
+          <div class="metric-value-row">
+            <span class="metric-num" id="grpoValCoTFormat" style="font-size: 1.15rem; color: var(--purple);">--%</span>
+          </div>
+          <div class="metric-sub">&lt;|think|&gt; ... &lt;|/think|&gt;</div>
+        </div>
+        <div class="metric-card" style="padding: 0.6rem 0.8rem;">
+          <div class="metric-title">Policy Loss</div>
+          <div class="metric-value-row">
+            <span class="metric-num" id="grpoValLoss" style="font-size: 1.15rem; color: var(--text-secondary);">--</span>
+          </div>
+          <div class="metric-sub">Advantage Surrogate</div>
+        </div>
+      </div>
+
+      <!-- Active Prompt & Rollouts Inspector -->
+      <div id="grpoRolloutsContainer" style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 4px; padding: 0.75rem; font-family: var(--font-mono); font-size: 0.78rem;">
+        <div style="display: flex; justify-content: space-between; margin-bottom: 0.4rem; color: var(--text-secondary);">
+          <span>Active RLVR Task: <strong id="grpoActiveTask" style="color: var(--cyan);">Standby / Ready</strong></span>
+          <span id="grpoRolloutsCount">Group Size: G=4 Rollouts</span>
+        </div>
+        <div id="grpoRolloutsList" style="display: flex; flex-direction: column; gap: 0.4rem; max-height: 240px; overflow-y: auto;">
+          <div style="color: var(--text-dim); font-style: italic; padding: 0.5rem;">
+            No active GRPO session currently running. Pretraining trunk at Step 4,000 is preserved and safe.
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Minimalist Footer -->
     <footer>
       <div id="footerArchSummary">Pulsar Telemetry Monitor • Port 7860</div>
@@ -3572,6 +3646,64 @@
         if (data.val_loss !== null && data.val_loss !== undefined && data.step !== lastCanaryEvalStep) {
           lastCanaryEvalStep = data.step;
           fetchCanaryMilestones();
+        }
+
+        // Update GRPO Reasoning Alignment Section
+        if (data.grpo) {
+          const g = data.grpo;
+          const statusBadge = document.getElementById('grpoStatusBadge');
+          if (statusBadge) {
+            statusBadge.innerText = `Status: ${g.status === 'running' ? 'Active Running' : (g.status === 'completed' ? 'Completed' : 'Idle')}`;
+            statusBadge.className = g.status === 'running' ? 'spec-badge spec-badge-accent' : (g.status === 'completed' ? 'spec-badge spec-badge-emerald' : 'spec-badge');
+          }
+          const elStep = document.getElementById('grpoValStep');
+          if (elStep) elStep.innerText = `${g.step || 0} / ${g.max_steps || 50}`;
+          const elMean = document.getElementById('grpoValMeanR');
+          if (elMean) elMean.innerText = g.mean_reward !== undefined ? g.mean_reward.toFixed(2) : '--';
+          const elMax = document.getElementById('grpoValMaxR');
+          if (elMax) elMax.innerText = g.max_reward !== undefined ? g.max_reward.toFixed(2) : '--';
+          const elMath = document.getElementById('grpoValMathAcc');
+          if (elMath) elMath.innerText = g.accuracy !== undefined ? `${(g.accuracy * 100).toFixed(1)}%` : '--%';
+          const elCode = document.getElementById('grpoValCodeAST');
+          if (elCode) elCode.innerText = g.accuracy !== undefined ? `${(g.accuracy * 100).toFixed(1)}%` : '--%';
+          const elFormat = document.getElementById('grpoValCoTFormat');
+          if (elFormat) elFormat.innerText = g.format !== undefined ? `${(g.format * 100).toFixed(1)}%` : '--%';
+          const elLoss = document.getElementById('grpoValLoss');
+          if (elLoss) elLoss.innerText = g.policy_loss !== undefined ? g.policy_loss.toFixed(4) : '--';
+
+          const elTask = document.getElementById('grpoActiveTask');
+          if (elTask && g.recent_task) elTask.innerText = g.recent_task;
+
+          if (Array.isArray(g.rollouts) && g.rollouts.length > 0) {
+            const listEl = document.getElementById('grpoRolloutsList');
+            if (listEl) {
+              listEl.innerHTML = '';
+              g.rollouts.forEach((r, idx) => {
+                const row = document.createElement('div');
+                row.style.background = 'var(--bg-surface)';
+                row.style.border = '1px solid var(--border)';
+                row.style.borderRadius = '4px';
+                row.style.padding = '0.4rem 0.6rem';
+                row.style.display = 'flex';
+                row.style.justifyContent = 'space-between';
+                row.style.alignItems = 'center';
+                row.style.gap = '0.5rem';
+
+                const advCol = r.advantage >= 0 ? 'var(--emerald)' : 'var(--rose)';
+                row.innerHTML = `
+                  <div style="flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                    <span style="color: var(--cyan); font-weight: 600;">#${r.id || idx + 1}:</span>
+                    <span style="color: var(--text-main); margin-left: 0.3rem;">${r.completion || ''}</span>
+                  </div>
+                  <div style="display: flex; gap: 0.6rem; font-size: 0.72rem; flex-shrink: 0;">
+                    <span>Rew: <strong style="color: var(--amber);">${r.reward}</strong></span>
+                    <span>Adv: <strong style="color: ${advCol};">${r.advantage > 0 ? '+' : ''}${r.advantage}</strong></span>
+                  </div>
+                `;
+                listEl.appendChild(row);
+              });
+            }
+          }
         }
       } catch (err) {
         console.warn('Dashboard poll error', err);

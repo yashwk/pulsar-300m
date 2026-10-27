@@ -45,6 +45,8 @@ NOTES_FILE = os.path.join(MONITOR_DIR, "notes.jsonl")
 CHECKPOINT_DIR = "checkpoints"
 LIVE_STATUS_FILE = os.path.join(CHECKPOINT_DIR, "live_status.json")
 METRICS_JSONL_FILE = os.path.join(CHECKPOINT_DIR, "metrics.jsonl")
+GRPO_STATUS_FILE = os.path.join(CHECKPOINT_DIR, "grpo_status.json")
+GRPO_METRICS_FILE = os.path.join(CHECKPOINT_DIR, "grpo_metrics.jsonl")
 STATIC_HTML_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
 _v2_incremental_reader = IncrementalMetricsReader(METRICS_JSONL_FILE)
 
@@ -522,6 +524,16 @@ def enrich_status_payload(data):
             c["tag"] = t
             c["category"] = cat
 
+    # Check if a branched GRPO session exists
+    if os.path.exists(GRPO_STATUS_FILE):
+        try:
+            with open(GRPO_STATUS_FILE, "r", encoding="utf-8") as f:
+                data["grpo"] = json.load(f)
+        except Exception:
+            data["grpo"] = None
+    else:
+        data["grpo"] = None
+
     return data
 
 
@@ -567,6 +579,10 @@ class PulsarMonitorHandler(SimpleHTTPRequestHandler):
             self.serve_stream()
         elif path == "/api/canaries":
             self.serve_canaries()
+        elif path == "/api/grpo/status":
+            self.serve_grpo_status()
+        elif path == "/api/grpo/history":
+            self.serve_grpo_history()
         elif path == "/api/history":
             last_n = None
             max_points = 2000
@@ -812,6 +828,44 @@ class PulsarMonitorHandler(SimpleHTTPRequestHandler):
                     c["category"] = cat
 
         payload = json.dumps({"count": len(milestones), "milestones": milestones}).encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def serve_grpo_status(self):
+        if not os.path.exists(GRPO_STATUS_FILE):
+            payload = json.dumps({"active": False, "status": "idle"}).encode("utf-8")
+        else:
+            try:
+                with open(GRPO_STATUS_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                payload = json.dumps(data).encode("utf-8")
+            except Exception as e:
+                payload = json.dumps({"status": "error", "error": str(e)}).encode("utf-8")
+
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def serve_grpo_history(self):
+        records = []
+        if os.path.exists(GRPO_METRICS_FILE):
+            try:
+                with open(GRPO_METRICS_FILE, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            try:
+                                records.append(json.loads(line))
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+        payload = json.dumps({"count": len(records), "records": records}).encode("utf-8")
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))

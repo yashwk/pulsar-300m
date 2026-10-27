@@ -549,12 +549,14 @@ class PulsarMonitorHandler(SimpleHTTPRequestHandler):
         path = parsed.path
         query = parse_qs(parsed.query)
 
-        if path == "/" or path == "/index.html":
-            self.serve_dashboard()
-        elif path in ("/v2", "/v2/", "/v2/index.html"):
+        if path in ("/", "/index.html", "/v2", "/v2/", "/v2/index.html"):
             self.serve_v2_dashboard()
+        elif path in ("/v1", "/v1/", "/v1/index.html", "/legacy", "/legacy/"):
+            self.serve_dashboard()
         elif path.startswith("/v2/"):
             self.serve_v2_static(path[4:])
+        elif path in ("/style.css", "/app.js", "/charts.js", "/health.js") or path.startswith("/vendor/"):
+            self.serve_v2_static(path)
         elif path == "/favicon.ico":
             self.send_response(HTTPStatus.NO_CONTENT)
             self.end_headers()

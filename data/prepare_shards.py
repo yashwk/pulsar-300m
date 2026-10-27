@@ -983,7 +983,6 @@ def build_shard(
             substream_docs=substream_docs,
             stream_seeds=stream_seeds,
             base_seed=base_seed,
-            stage=stage,
         )
 
 

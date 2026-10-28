@@ -213,6 +213,7 @@ All shards are stored as memory-mapped flat binary files of 16-bit unsigned inte
 | Shard Index | Stage & Focus | Train Tokens | Val Tokens | Total Tokens | Sub-Stream Delta | Audit Status |
 | :---: | :--- | :---: | :---: | :---: | :---: | :---: |
 | **Pre-Flight Test** | 10M Test Verification | 9,500,000 | 500,000 | 10,000,000 | $\le \pm 0.06\%$ | **100% Passed** |
+| **Shard 0** | Stage 1 Foundation (Nemotron 5-Pillar) | ~476,000,000 | ~24,000,000 | 500,000,000 | TBD | *Pending Local Build (`--shard-idx 0`)* |
 | **Shard 1** | Stage 1 Foundation (Nemotron 5-Pillar) | 476,102,464 | 23,915,490 | 500,017,954 | $0.00\%$ | **100% Passed** (Local & Cloud) |
 | **Shard 2** | Stage 1 Foundation (Nemotron 5-Pillar) | 476,333,688 | 23,690,781 | 500,024,469 | $0.00\%$ | **100% Passed** (Local & Cloud) |
 | **Shard 3** | Stage 1 Foundation (Nemotron 5-Pillar) | 476,211,040 | 23,802,110 | 500,013,150 | $0.00\%$ | **100% Passed** (Cloud Staged) |
@@ -220,7 +221,7 @@ All shards are stored as memory-mapped flat binary files of 16-bit unsigned inte
 | **Shard 5** | Stage 1 Foundation (Nemotron 5-Pillar) | 476,189,450 | 23,840,550 | 500,030,000 | $0.00\%$ | **100% Passed** (Cloud Staged) |
 | **Shard 6** | Stage 1 Foundation (Nemotron 5-Pillar) | 476,301,200 | 23,710,400 | 500,011,600 | $0.00\%$ | **100% Passed** (Cloud Staged) |
 | **Shard 7** | Stage 1 Foundation (Nemotron 5-Pillar) | 476,539,090 | 23,506,003 | 500,045,093 | $0.00\%$ | **100% Passed** (Cloud Staged) |
-| **Stage 1 Total** | **Completed Foundation Corpus** | **3,334,127,044** | **166,036,226** | **3,500,163,270** | **0.00%** | **3.50 Billion Tokens Ready** |
+| **Stage 1 Total** | **Foundation Corpus (Shards 0–7)** | **~3,810,000,000** | **~190,000,000** | **4,000,000,000** | **0.00%** | **4.00 Billion Tokens Target** |
 | **Shards 8–10** | Stage 2 Reasoning ($T=2048$) | ~1,428,000,000 | ~72,000,000 | 1,500,000,000 | TBD | *Pending Local Build (Zero Cloud Cost)* |
 | **Shard 11** | Stage 3 Long-Context ($T=32\text{k}$) | ~476,000,000 | ~24,000,000 | 500,000,000 | TBD | *Pending Local Build (Zero Cloud Cost)* |
 
@@ -270,3 +271,42 @@ All shards are stored as memory-mapped flat binary files of 16-bit unsigned inte
 | **Validation Interval** | `Every 50 steps` | Evaluates loss across held-out validation shards and logs generation canaries |
 | **Checkpoint Cadence** | `Every 50 steps` | Atomically writes `latest.pt` and tracks running `best.pt` validation records |
 | **Checkpoint Storage** | `checkpoints/` | Single flat directory for all runs, milestones (`milestone_step_<step>.pt`), and telemetry; never use separate folders |
+
+---
+
+## 6. Post-Training Specification: Stage 4 (SFT Cold-Start) & Stage 5 (RLVR / GRPO)
+
+Post-training is strictly decoupled from base pretraining shards to enforce token loss masking and prevent distribution collapse.
+
+```mermaid
+flowchart LR
+    M_BASE["Pretrained Trunk\n(Stages 1-3 Base)"] --> M_ANNEAL["Annealed Checkpoint\n(1% LR Cooldown)"]
+    M_ANNEAL --> S4["Stage 4: SFT Cold-Start\n(2k-10k Curated Traces)"]
+    S4 --> S5["Stage 5: RLVR / GRPO\n(Verifiable Rewards)"]
+```
+
+### Stage 4: SFT Cold-Start (Instruction & Latent Reasoning Alignment)
+- **Target Corpus:** 5,000 carefully curated instruction-response pairs:
+  - 40% Code SWE & Algorithmic solutions with explicit unit tests (`nvidia/OpenCodeReasoning`, `HuggingFaceTB/smoltalk`).
+  - 35% Mathematical derivations with `<|think|>...<|/think|>` step verification (`nvidia/OpenMathReasoning`).
+  - 25% Multi-turn agentic MCP tool calling in 100% Native Fast JSON (`Agent-Ark/Toucan-1.5M`).
+- **Loss Masking Invariant:**
+  Cross-entropy loss is computed strictly on assistant generation tokens:
+  $$\mathcal{L}_{\text{SFT}} = -\frac{1}{\sum m_t} \sum_{t=1}^T m_t \log P(x_t \mid x_{<t})$$
+  where mask $m_t = 1$ if token $t$ is inside `<|im_start|>assistant ... <|im_end|>`, and $m_t = 0$ for system/user prompts.
+- **Optimizer Profile:** AdamW (`lr = 2e-5`, linear warmup 50 steps, cosine decay to zero, weight decay `0.01`).
+- **Batching & Context:** Global batch size 16 sequences, packed context $T = 2,048$, 3 epochs.
+
+### Stage 5: RLVR / GRPO Policy Optimization (Verifiable Self-Correction)
+- **Base Checkpoint:** Checkpoint trained via Stage 4 SFT Cold-Start.
+- **Algorithm:** Group Relative Policy Optimization (GRPO) without an auxiliary value/critic network:
+  - Generates $G = 4$ independent rollout trajectories $\{y_1, y_2, y_3, y_4\}$ per prompt $x$ at temperature $\tau = 0.7$.
+  - Evaluates rule-based deterministic rewards $\{r_1, r_2, r_3, r_4\}$.
+  - Computes normalized group advantage:
+    $$\hat{A}_i = \frac{r_i - \text{mean}(r)}{\text{std}(r) + \epsilon}$$
+  - Optimizes clipped surrogate objective with KL penalty against the reference model $\pi_{\text{ref}}$ ($\beta = 0.04$, clip $\epsilon = 0.20$).
+- **Deterministic Domain Verifiers:**
+  1. **Python AST & Unit Tests:** +0.20 for valid AST, +0.80 for unit tests passing.
+  2. **Mathematical Equivalence:** +1.00 for exact numerical/algebraic match via SymPy.
+  3. **Agentic Tool Schema:** +0.30 for valid JSON parser extraction, +0.70 for exact tool argument schema compliance.
+

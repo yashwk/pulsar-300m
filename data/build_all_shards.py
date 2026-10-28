@@ -1,13 +1,12 @@
 """Pulsar Multi-Shard Curriculum Pipeline Runner (Turbo Multi-Threaded Edition).
 
-Sequentially builds Shards 1 through 11 (5.5 Billion tokens) with high-speed optimizations:
+Sequentially builds Shards 0 through 11 (6.0 Billion tokens) with high-speed optimizations:
   - Rust-accelerated hf-transfer for multi-gigabit Parquet downloads.
   - Background asynchronous prefetching of next-shard Parquets during active tokenization.
   - Rust AutoTokenizer batch size 2048 with Rayon multi-threaded saturation.
   - Vectorized domain sampling reducing Python loop overhead by 99.9%.
-  - Preserves Shard 0 (data/train.bin, 475M tokens, Stage 1).
-  - Shards 1..7: Stage 1 Foundation Mix (T=1024, 500M tokens each).
-  - Shards 8..10: Stage 2 Niche & Reasoning Upsampled Mix (T=2048, 500M tokens each).
+  - Shards 0..7: Stage 1 Foundation Mix (T=1024, 500M tokens each, total 4.0B tokens).
+  - Shards 8..10: Stage 2 Niche & Reasoning Upsampled Mix (T=2048, 500M tokens each, total 1.5B tokens).
   - Shard 11: Stage 3 Long-Context 32k Cooldown Mix (T in [2k..32k], 500M tokens).
   - Automatic cleanup of temporary parquet files after each shard to keep NVMe disk headroom >= 18 GB.
   - Maintains data/shards_manifest.json with live status, token counts, and disk footprints.
@@ -57,7 +56,7 @@ def load_manifest():
         except Exception:
             pass
 
-    # Initialize with Shard 0 if data/train.bin exists
+    # Initialize with Shard 0 if data/train_shard0.bin exists
     manifest = {
         "curriculum_version": "2.0-NVIDIA-Nemotron-Refined",
         "total_target_tokens": 6_000_000_000,
@@ -65,20 +64,22 @@ def load_manifest():
         "shards": []
     }
 
-    if os.path.exists("data/train.bin"):
-        train_bytes = os.path.getsize("data/train.bin")
-        val_bytes = os.path.getsize("data/val.bin") if os.path.exists("data/val.bin") else 0
+    shard0_train = "data/train_shard0.bin" if os.path.exists("data/train_shard0.bin") else ("data/train.bin" if os.path.exists("data/train.bin") else None)
+    if shard0_train:
+        train_bytes = os.path.getsize(shard0_train)
+        val_path = shard0_train.replace("train", "val")
+        val_bytes = os.path.getsize(val_path) if os.path.exists(val_path) else 0
         manifest["shards"].append({
             "shard_idx": 0,
             "stage": 1,
             "stage_name": "Stage 1 Foundation (T=1024)",
-            "train_path": "data/train.bin",
-            "val_path": "data/val.bin",
+            "train_path": shard0_train,
+            "val_path": val_path if os.path.exists(val_path) else "",
             "train_tokens": train_bytes // 2,
             "val_tokens": val_bytes // 2,
             "total_tokens": (train_bytes + val_bytes) // 2,
             "status": "completed",
-            "completed_at": datetime.datetime.fromtimestamp(os.path.getmtime("data/train.bin")).isoformat()
+            "completed_at": datetime.datetime.fromtimestamp(os.path.getmtime(shard0_train)).isoformat()
         })
 
     return manifest
@@ -222,7 +223,7 @@ def run_shard_build(shard_idx: int, num_shards: int, total_tokens: int, cleanup_
 
 def main():
     parser = argparse.ArgumentParser(description="Pulsar Multi-Shard Curriculum Pipeline Runner (Turbo Edition)")
-    parser.add_argument("--start-shard", type=int, default=1, help="Shard index to start from (default: 1, preserves Shard 0)")
+    parser.add_argument("--start-shard", type=int, default=0, help="Shard index to start from (default: 0)")
     parser.add_argument("--end-shard", type=int, default=11, help="Shard index to end at (inclusive, default: 11)")
     parser.add_argument("--num-shards", type=int, default=12, help="Total curriculum shards (default: 12)")
     parser.add_argument("--tokens-per-shard", type=int, default=500_000_000, help="Tokens per shard (default: 500M)")

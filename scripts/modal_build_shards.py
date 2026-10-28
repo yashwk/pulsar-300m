@@ -60,7 +60,7 @@ def generate_shards_job(start_shard: int = 1, end_shard: int = 1, stage: int = N
         current_stage = stage if stage is not None else (1 if shard_idx <= 7 else (2 if shard_idx <= 10 else 3))
 
         print(f"\n{'='*70}")
-        print(f"🚀 [Modal Worker] Generating Shard {shard_idx} (Stage {current_stage})")
+        print(f"[Modal Worker] Generating Shard {shard_idx} (Stage {current_stage})")
         print(f"   Target Tokens: {total_tokens:,} | Batch Size: {batch_size}")
         print(f"   Output: /root/data/train_shard{shard_idx}.bin & /root/data/val_shard{shard_idx}.bin")
         print(f"{'='*70}\n")
@@ -83,15 +83,23 @@ def generate_shards_job(start_shard: int = 1, end_shard: int = 1, stage: int = N
 
         # Commit volume after each shard completes so data is immediately safe
         data_vol.commit()
-        print(f"\n✅ Shard {shard_idx} successfully built and committed to volume 'pulsar-data'!")
+        print(f"\n[Modal Volume] Shard {shard_idx} successfully built and committed to volume 'pulsar-data'.")
 
-    print(f"\n🎉 All requested shards ({start_shard}..{end_shard}) completed and saved permanently!")
+    print(f"\n[Modal Pipeline] All requested shards ({start_shard}..{end_shard}) completed and saved permanently.")
 
 
 @app.local_entrypoint()
 def main(shard_idx: int = 1, end_shard: int = None, stage: int = None, total_tokens: int = 500_000_000, batch_size: int = 2048, hf_token: str = None):
+    import os
     if end_shard is None:
         end_shard = shard_idx
+    if not hf_token:
+        token_path = os.path.expanduser("~/.cache/huggingface/token")
+        if os.path.exists(token_path):
+            with open(token_path, "r", encoding="utf-8") as f:
+                hf_token = f.read().strip()
+                print("[Modal Shard Builder] Successfully loaded HF_TOKEN from ~/.cache/huggingface/token")
+
     generate_shards_job.remote(
         start_shard=shard_idx,
         end_shard=end_shard,

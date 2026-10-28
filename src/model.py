@@ -1377,6 +1377,17 @@ class PulsarForCausalLM(nn.Module):
         n_valid = (tgt_flat != -100).sum().clamp_min(1)
         return total / n_valid
 
+    def _compute_pulse_weights(self, K: int) -> list[float]:
+        w_first = self.cfg.aux_loss_weight_1
+        w_mid = self.cfg.aux_loss_weight_2
+        w_final = self.cfg.final_loss_weight
+        if K == 1:
+            raw = [w_final]
+        else:
+            raw = [w_first] + [w_mid] * (K - 2) + [w_final]
+        w_sum = sum(raw)
+        return [w / w_sum for w in raw]
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1411,21 +1422,8 @@ class PulsarForCausalLM(nn.Module):
         total_z_loss = torch.zeros((), device=input_ids.device, dtype=torch.float32)
 
         # Deep-supervision weights, normalised over the K ACTIVE pulses so they always
-        # sum to 1.0. The configured 0.15/0.25/0.60 already sum to 1 at K=3, but at
-        # K=1 the single pulse would have carried 0.60 and the reported loss would be
-        # 60% of the true CE; at K=2 the pair would sum to 0.75.
-        # Weights are (w_first, w_mid x (K-2), w_final): K-2 middle pulses, not K-1.
-        # Using (K-1) counted a middle pulse that does not exist, so at K=3 the sum was
-        # 0.80 and the loss was reported 20% too small.
-        w_first = self.cfg.aux_loss_weight_1
-        w_mid = self.cfg.aux_loss_weight_2
-        w_final = self.cfg.final_loss_weight
-        if K == 1:
-            raw = [w_final]
-        else:
-            raw = [w_first] + [w_mid] * (K - 2) + [w_final]
-        w_sum = sum(raw)
-        pulse_weights = [w / w_sum for w in raw]
+        # sum to 1.0.
+        pulse_weights = self._compute_pulse_weights(K)
 
         pulse_losses: list[torch.Tensor] = []
         pulse_deltas: list[torch.Tensor] = []

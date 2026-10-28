@@ -270,23 +270,60 @@ def test_softcap_ce_forward_and_backward():
 
 @needs_gpu
 @needs_cuda_ext
-def test_router_topk_and_weight_normalization():
+@pytest.mark.parametrize("E,K", [(8, 2), (16, 4)])
+def test_router_topk_and_weight_normalization(E, K):
     """MoE router top-k selects top experts and normalizes weights strictly to 1.0."""
     import pulsar_cuda
 
-    N, E = 64, 8
+    N = 64
     logits = _bf16(N, E, seed=13)
     bias = torch.randn(E, device="cuda", dtype=torch.float32) * 0.1
 
-    idx, weights, z = pulsar_cuda.moe_router_topk_forward(logits, bias, 1e-4)
-    scores = torch.sigmoid(logits.float())
+    idx, weights, z = pulsar_cuda.moe_router_topk_forward(logits, bias, K, 1e-4)
+    centered = logits.float() - logits.float().mean(dim=-1, keepdim=True)
+    scores = torch.sigmoid(centered)
     biased = scores + bias.float()
-    idx_ref = torch.topk(biased, k=2, dim=-1).indices
+    idx_ref = torch.topk(biased, k=K, dim=-1).indices
     raw = torch.gather(scores, -1, idx_ref)
     weights_ref = raw / (raw.sum(-1, keepdim=True) + 1e-6)
 
     assert_close(weights, weights_ref, atol=2e-3)
     assert torch.allclose(weights.float().sum(-1), torch.ones(N, device="cuda"), atol=2e-3)
+
+
+@needs_gpu
+@needs_cuda_ext
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_fused_moe_router_parity_e16_topk4(dtype):
+    """_FusedMoERouterFunction matches PyTorch reference for E=16, top_k=4 forward and backward."""
+    from src.model import _FusedMoERouterFunction
+    torch.manual_seed(42)
+    N, E, K = 32, 16, 4
+
+    logits_ref = torch.randn(N, E, device="cuda", dtype=dtype, requires_grad=True)
+    bias = torch.randn(E, device="cuda", dtype=torch.float32) * 0.1
+
+    # Reference PyTorch path:
+    centered_ref = logits_ref - logits_ref.mean(dim=-1, keepdim=True)
+    scores_ref = torch.sigmoid(centered_ref.float())
+    biased_scores_ref = scores_ref + bias
+    _, idx_ref = torch.topk(biased_scores_ref, k=K, dim=-1)
+    raw_ref = torch.gather(scores_ref, -1, idx_ref)
+    weights_ref = (raw_ref / (raw_ref.sum(dim=-1, keepdim=True) + 1e-6)).to(dtype)
+
+    d_weights = torch.randn_like(weights_ref)
+    weights_ref.backward(d_weights)
+    grad_ref = logits_ref.grad.clone()
+
+    # CUDA path: _FusedMoERouterFunction
+    logits_cuda = logits_ref.detach().clone().requires_grad_(True)
+    idx_cuda, weights_cuda = _FusedMoERouterFunction.apply(logits_cuda, bias, K)
+    weights_cuda.backward(d_weights)
+    grad_cuda = logits_cuda.grad.clone()
+
+    assert torch.equal(idx_ref, idx_cuda)
+    assert_close(weights_cuda, weights_ref, atol=2e-3)
+    assert_close(grad_cuda, grad_ref, atol=5e-3)
 
 
 @pytest.mark.parametrize("routing", [

@@ -678,7 +678,7 @@ class _FusedMoECombineFunction(torch.autograd.Function):
         routed_out = pulsar_cuda.moe_combine_forward(
             expert_outputs.contiguous(),
             topk_idx.contiguous(),
-            topk_weights.contiguous(),
+            topk_weights.to(torch.bfloat16).contiguous(),
             token_to_slot.contiguous(),
             sh,
         )
@@ -690,14 +690,14 @@ class _FusedMoECombineFunction(torch.autograd.Function):
     def backward(ctx, d_routed_out: torch.Tensor):
         expert_outputs, topk_idx, topk_weights, token_to_slot = ctx.saved_tensors
         d_expert_outputs, d_topk_weights = pulsar_cuda.moe_combine_backward(
-            d_routed_out.contiguous(), expert_outputs, topk_idx, topk_weights, token_to_slot
+            d_routed_out.contiguous(), expert_outputs, topk_idx, topk_weights.to(torch.bfloat16).contiguous(), token_to_slot
         )
         d_shared_out = d_routed_out if ctx.has_shared else None
         return d_expert_outputs, None, d_topk_weights, None, d_shared_out
 
 
 class _FusedMoERouterFunction(torch.autograd.Function):
-    """Fused router top-2 selection and weight normalisation.
+    """Fused router top-k selection and weight normalisation.
 
     Z-loss is deliberately NOT computed here. The kernel's z-term assumed an upstream
     gradient of 1, but the real scale is 1/24 (averaging over 8 blocks x 3 pulses) times
@@ -705,14 +705,14 @@ class _FusedMoERouterFunction(torch.autograd.Function):
     The backward also ignored the incoming _d_z_loss entirely. Z-loss is now computed
     in PyTorch from the router logits so autograd applies the correct chain rule.
 
-    The kernel is called with z_loss_weight=0, so it only produces the top-2 weight
+    The kernel is called with z_loss_weight=0, so it only produces the top-k weight
     normalisation gradient.
     """
 
     @staticmethod
-    def forward(ctx, logits: torch.Tensor, expert_bias: torch.Tensor):
+    def forward(ctx, logits: torch.Tensor, expert_bias: torch.Tensor, top_k: int = 2):
         topk_idx, topk_weights, _z_loss_unused = pulsar_cuda.moe_router_topk_forward(
-            logits.contiguous(), expert_bias.float().contiguous(), 0.0
+            logits.contiguous(), expert_bias.float().contiguous(), top_k, 0.0
         )
         ctx.save_for_backward(logits, topk_idx)
         return topk_idx, topk_weights
@@ -720,10 +720,11 @@ class _FusedMoERouterFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, _d_topk_idx, d_topk_weights: torch.Tensor):
         logits, topk_idx = ctx.saved_tensors
+        d_topk_weights_bf16 = d_topk_weights.to(torch.bfloat16).contiguous()
         d_logits = pulsar_cuda.moe_router_topk_backward(
-            d_topk_weights.contiguous(), logits.contiguous(), topk_idx, 0.0
+            d_topk_weights_bf16, logits.contiguous(), topk_idx, 0.0
         )
-        return d_logits, None
+        return d_logits.to(logits.dtype), None, None
 
 
 class SwiGLUMLP(nn.Module):
@@ -844,10 +845,12 @@ class PulsarMoEMLP(nn.Module):
         if (HAS_PULSAR_CUDA and logits.is_cuda
                 and not torch.compiler.is_compiling()
                 and hasattr(pulsar_cuda, "moe_router_topk_forward")
-                and self.cfg.n_routed_experts == 8
-                and self.cfg.top_k == 2):
+                and ((self.cfg.n_routed_experts == 8 and self.cfg.top_k == 2)
+                     or (self.cfg.n_routed_experts == 16 and self.cfg.top_k == 4)
+                     or (self.cfg.n_routed_experts <= 32 and self.cfg.top_k <= 8))):
             bias = self.expert_bias[pulse_idx] if self.cfg.per_pulse_bias else self.expert_bias
-            topk_idx, topk_weights = _FusedMoERouterFunction.apply(logits, bias)
+            topk_idx, topk_weights = _FusedMoERouterFunction.apply(logits, bias, self.cfg.top_k)
+            topk_weights = topk_weights.to(x.dtype)
         else:
             scores = torch.sigmoid(logits.float())
             bias = self.expert_bias[pulse_idx] if self.cfg.per_pulse_bias else self.expert_bias

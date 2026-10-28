@@ -525,7 +525,7 @@ class PackedBatchLoader:
             torch.from_numpy(np.stack(ys)).to(self.device),
         )
 
-    def routing_mask(self, x: torch.Tensor) -> torch.Tensor | None:
+    def routing_mask(self, x: torch.Tensor) -> torch.Tensor:
         """Boolean mask of positions that may enter MoE routing and expert counts.
 
         Padding must be excluded: a run of identical pad tokens would all route to the
@@ -534,12 +534,10 @@ class PackedBatchLoader:
         same id - so the mask comes from the plan's content lengths recorded by the last
         :meth:`get_batch` call.
         """
-        if not self._last_n_real:
-            return None
         rows = x.shape[0]
+        if not self._last_n_real or all(n == self.seq_len for n in self._last_n_real[-rows:]):
+            return torch.ones_like(x, dtype=torch.bool)
         n_real = self._last_n_real[-rows:]
-        if all(n == self.seq_len for n in n_real):
-            return None
         mask = torch.zeros_like(x, dtype=torch.bool)
         for r, n in enumerate(n_real):
             mask[r, :n] = True

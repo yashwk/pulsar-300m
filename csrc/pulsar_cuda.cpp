@@ -90,14 +90,15 @@ torch::Tensor fused_softcap_ce_backward_dev_cuda(
 std::vector<torch::Tensor> moe_router_topk_forward_cuda(
     torch::Tensor logits,
     torch::Tensor expert_bias,
-    float z_loss_weight
+    int64_t top_k = 2,
+    float z_loss_weight = 1e-4f
 );
 
 torch::Tensor moe_router_topk_backward_cuda(
     torch::Tensor d_topk_weights,
     torch::Tensor logits,
     torch::Tensor topk_idx,
-    float z_loss_weight
+    float z_loss_weight = 1e-4f
 );
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -124,8 +125,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Fused Softcap Cross-Entropy Backward with a device-side grad scale (no host sync)",
           py::arg("logits"), py::arg("targets"), py::arg("lse"), py::arg("softcap") = 30.0f,
           py::arg("grad_scale_dev"), py::arg("ignore_index") = -100);
-    m.def("moe_router_topk_forward", &moe_router_topk_forward_cuda, "Fused MoE Router Top-2 Forward (CUDA)",
+    m.def("moe_router_topk_forward",
+          [](torch::Tensor logits, torch::Tensor expert_bias, int64_t top_k, float z_loss_weight) {
+              return moe_router_topk_forward_cuda(logits, expert_bias, top_k, z_loss_weight);
+          },
+          "Fused MoE Router Top-K Forward (CUDA)",
+          py::arg("logits"), py::arg("expert_bias"), py::arg("top_k") = 2, py::arg("z_loss_weight") = 1e-4f);
+    m.def("moe_router_topk_forward",
+          [](torch::Tensor logits, torch::Tensor expert_bias, float z_loss_weight) {
+              return moe_router_topk_forward_cuda(logits, expert_bias, 2, z_loss_weight);
+          },
+          "Fused MoE Router Top-K Forward (CUDA) with default top_k=2",
           py::arg("logits"), py::arg("expert_bias"), py::arg("z_loss_weight") = 1e-4f);
-    m.def("moe_router_topk_backward", &moe_router_topk_backward_cuda, "Fused MoE Router Top-2 Backward (CUDA)",
+    m.def("moe_router_topk_backward", &moe_router_topk_backward_cuda, "Fused MoE Router Top-K Backward (CUDA)",
           py::arg("d_topk_weights"), py::arg("logits"), py::arg("topk_idx"), py::arg("z_loss_weight") = 1e-4f);
 }

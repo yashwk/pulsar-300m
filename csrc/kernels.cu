@@ -1696,165 +1696,307 @@ template <typename logit_t> __device__ __forceinline__ logit_t store_logit(float
 template <> __device__ __forceinline__ __nv_bfloat16 store_logit<__nv_bfloat16>(float v) { return __float2bfloat16(v); }
 template <> __device__ __forceinline__ float store_logit<float>(float v) { return v; }
 
-template <typename logit_t>
+template <typename logit_t, int E_CONST, int K_CONST>
 __global__ void moe_router_topk_forward_kernel(
-    const logit_t* __restrict__ logits,            // [N, 8], fp32 or bf16
-    const float* __restrict__ expert_bias,         // [8]
-    int64_t* __restrict__ topk_idx,                // [N, 2]
-    __nv_bfloat16* __restrict__ topk_weights,      // [N, 2]
+    const logit_t* __restrict__ logits,            // [N, E], fp32 or bf16
+    const float* __restrict__ expert_bias,         // [E]
+    int64_t* __restrict__ topk_idx,                // [N, K]
+    __nv_bfloat16* __restrict__ topk_weights,      // [N, K]
     float* __restrict__ z_loss_out,                // [N]
     float z_loss_weight,
-    int N
+    int N,
+    int E_DYN = 0,
+    int K_DYN = 0
 ) {
     int tok = blockIdx.x * blockDim.x + threadIdx.x;
     if (tok >= N) return;
 
-    const logit_t* l_tok = logits + tok * 8;
-    float l[8];
-    float s[8];
-    float b[8];
-    float max_l = -1e20f;
+    const int E = (E_CONST > 0) ? E_CONST : E_DYN;
+    const int K = (K_CONST > 0) ? K_CONST : K_DYN;
 
+    const logit_t* l_tok = logits + tok * E;
+    float l[32];
+    float s[32];
+    float b[32];
+
+    // 1. Load logits and compute per-token mean
+    float sum_l = 0.0f;
     #pragma unroll
-    for (int e = 0; e < 8; ++e) {
+    for (int e = 0; e < (E_CONST > 0 ? E_CONST : 32); ++e) {
+        if (E_CONST == 0 && e >= E) break;
         float val = load_logit(l_tok[e]);
         l[e] = val;
-        max_l = fmaxf(max_l, val);
-        float sig = 1.0f / (1.0f + __expf(-val));
+        sum_l += val;
+    }
+    float mean_l = sum_l / (float)E;
+
+    // 2. Mean-center logits, compute sigmoid scores and biased scores
+    float max_l = -1e20f;
+    #pragma unroll
+    for (int e = 0; e < (E_CONST > 0 ? E_CONST : 32); ++e) {
+        if (E_CONST == 0 && e >= E) break;
+        float centered = l[e] - mean_l;
+        l[e] = centered;
+        max_l = fmaxf(max_l, centered);
+        float sig = 1.0f / (1.0f + __expf(-centered));
         s[e] = sig;
         b[e] = sig + expert_bias[e];
     }
 
-    // Top-2 selection in registers
-    int e0 = 0, e1 = 1;
-    float max0 = b[0], max1 = b[1];
-    if (max1 > max0) {
-        max0 = b[1]; max1 = b[0];
-        e0 = 1; e1 = 0;
-    }
+    // 3. Top-K selection in registers (insertion sort over K elements)
+    int best_idx[8];
+    float best_val[8];
     #pragma unroll
-    for (int e = 2; e < 8; ++e) {
+    for (int k = 0; k < (K_CONST > 0 ? K_CONST : 8); ++k) {
+        if (K_CONST == 0 && k >= K) break;
+        best_idx[k] = -1;
+        best_val[k] = -1e30f;
+    }
+
+    #pragma unroll
+    for (int e = 0; e < (E_CONST > 0 ? E_CONST : 32); ++e) {
+        if (E_CONST == 0 && e >= E) break;
         float val = b[e];
-        if (val > max0) {
-            max1 = max0;
-            e1 = e0;
-            max0 = val;
-            e0 = e;
-        } else if (val > max1) {
-            max1 = val;
-            e1 = e;
+        if (val > best_val[K - 1]) {
+            int pos = K - 1;
+            while (pos > 0 && val > best_val[pos - 1]) {
+                best_val[pos] = best_val[pos - 1];
+                best_idx[pos] = best_idx[pos - 1];
+                pos--;
+            }
+            best_val[pos] = val;
+            best_idx[pos] = e;
         }
     }
 
-    // Unbiased normalized Top-2 gating weights
-    float u0 = s[e0];
-    float u1 = s[e1];
-    float sum_u = u0 + u1 + 1e-6f;
-    float w0 = u0 / sum_u;
-    float w1 = u1 / sum_u;
-
-    topk_idx[tok * 2] = e0;
-    topk_idx[tok * 2 + 1] = e1;
-    topk_weights[tok * 2] = __float2bfloat16(w0);
-    topk_weights[tok * 2 + 1] = __float2bfloat16(w1);
-
-    // Row LogSumExp for z-loss
-    float sum_exp = 0.0f;
+    // 4. Normalized Top-K gating weights
+    float sum_u = 1e-6f;
     #pragma unroll
-    for (int e = 0; e < 8; ++e) {
-        sum_exp += __expf(l[e] - max_l);
+    for (int k = 0; k < (K_CONST > 0 ? K_CONST : 8); ++k) {
+        if (K_CONST == 0 && k >= K) break;
+        int e_k = best_idx[k];
+        topk_idx[tok * K + k] = e_k;
+        sum_u += s[e_k];
     }
-    float lse = max_l + logf(fmaxf(sum_exp, 1e-20f));
-    z_loss_out[tok] = z_loss_weight * (lse * lse);
+    float inv_sum_u = 1.0f / sum_u;
+    #pragma unroll
+    for (int k = 0; k < (K_CONST > 0 ? K_CONST : 8); ++k) {
+        if (K_CONST == 0 && k >= K) break;
+        int e_k = best_idx[k];
+        float w_k = s[e_k] * inv_sum_u;
+        topk_weights[tok * K + k] = __float2bfloat16(w_k);
+    }
+
+    // 5. Row LogSumExp for z-loss
+    if (z_loss_weight > 0.0f) {
+        float sum_exp = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < (E_CONST > 0 ? E_CONST : 32); ++e) {
+            if (E_CONST == 0 && e >= E) break;
+            sum_exp += __expf(l[e] - max_l);
+        }
+        float lse = max_l + logf(fmaxf(sum_exp, 1e-20f));
+        z_loss_out[tok] = z_loss_weight * (lse * lse);
+    } else {
+        z_loss_out[tok] = 0.0f;
+    }
 }
 
-template <typename logit_t>
+template <typename logit_t, int E_CONST, int K_CONST>
 __global__ void moe_router_topk_backward_kernel(
-    const __nv_bfloat16* __restrict__ d_topk_weights, // [N, 2]
-    const logit_t* __restrict__ logits,               // [N, 8]
-    const int64_t* __restrict__ topk_idx,             // [N, 2]
-    logit_t* __restrict__ d_logits,                   // [N, 8]
+    const __nv_bfloat16* __restrict__ d_topk_weights, // [N, K]
+    const logit_t* __restrict__ logits,               // [N, E]
+    const int64_t* __restrict__ topk_idx,             // [N, K]
+    logit_t* __restrict__ d_logits,                   // [N, E]
     float z_loss_weight,
-    int N
+    int N,
+    int E_DYN = 0,
+    int K_DYN = 0
 ) {
     int tok = blockIdx.x * blockDim.x + threadIdx.x;
     if (tok >= N) return;
 
-    const logit_t* l_tok = logits + tok * 8;
-    logit_t* dl_tok = d_logits + tok * 8;
+    const int E = (E_CONST > 0) ? E_CONST : E_DYN;
+    const int K = (K_CONST > 0) ? K_CONST : K_DYN;
 
-    float l[8];
-    float s[8];
-    float max_l = -1e20f;
+    const logit_t* l_tok = logits + tok * E;
+    logit_t* dl_tok = d_logits + tok * E;
+
+    float l[32];
+    float s[32];
+
+    // 1. Load logits and compute per-token mean
+    float sum_l = 0.0f;
     #pragma unroll
-    for (int e = 0; e < 8; ++e) {
+    for (int e = 0; e < (E_CONST > 0 ? E_CONST : 32); ++e) {
+        if (E_CONST == 0 && e >= E) break;
         float val = load_logit(l_tok[e]);
         l[e] = val;
-        max_l = fmaxf(max_l, val);
-        s[e] = 1.0f / (1.0f + __expf(-val));
+        sum_l += val;
+    }
+    float mean_l = sum_l / (float)E;
+
+    // 2. Mean-center logits, compute sigmoid
+    float max_l = -1e20f;
+    #pragma unroll
+    for (int e = 0; e < (E_CONST > 0 ? E_CONST : 32); ++e) {
+        if (E_CONST == 0 && e >= E) break;
+        float centered = l[e] - mean_l;
+        l[e] = centered;
+        max_l = fmaxf(max_l, centered);
+        s[e] = 1.0f / (1.0f + __expf(-centered));
     }
 
-    // 1. Z-loss gradient
-    float sum_exp = 0.0f;
-    #pragma unroll
-    for (int e = 0; e < 8; ++e) {
-        sum_exp += __expf(l[e] - max_l);
+    // 3. Z-loss gradient
+    float z_factor = 0.0f;
+    float inv_sum_exp = 0.0f;
+    if (z_loss_weight > 0.0f) {
+        float sum_exp = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < (E_CONST > 0 ? E_CONST : 32); ++e) {
+            if (E_CONST == 0 && e >= E) break;
+            sum_exp += __expf(l[e] - max_l);
+        }
+        inv_sum_exp = 1.0f / fmaxf(sum_exp, 1e-20f);
+        float lse = max_l + logf(fmaxf(sum_exp, 1e-20f));
+        z_factor = (2.0f * z_loss_weight / (float)N) * lse;
     }
-    float inv_sum_exp = 1.0f / fmaxf(sum_exp, 1e-20f);
-    float lse = max_l + logf(fmaxf(sum_exp, 1e-20f));
-    float z_factor = (2.0f * z_loss_weight / (float)N) * lse;
 
-    int e0 = (int)topk_idx[tok * 2];
-    int e1 = (int)topk_idx[tok * 2 + 1];
-
-    float u0 = s[e0];
-    float u1 = s[e1];
-    float D = u0 + u1 + 1e-6f;
-    float inv_D2 = 1.0f / (D * D);
-
-    float d0 = __bfloat162float(d_topk_weights[tok * 2]);
-    float d1 = __bfloat162float(d_topk_weights[tok * 2 + 1]);
-
-    float du0 = (d0 - d1) * u1 * inv_D2 * u0 * (1.0f - u0);
-    float du1 = (d1 - d0) * u0 * inv_D2 * u1 * (1.0f - u1);
+    // 4. Weight normalization gradient for chosen K experts
+    int e_k[8];
+    float u[8];
+    float d[8];
+    float sum_u = 1e-6f;
+    float sum_du = 0.0f;
 
     #pragma unroll
-    for (int e = 0; e < 8; ++e) {
-        float p_e = __expf(l[e] - max_l) * inv_sum_exp;
-        float g = z_factor * p_e;
-        if (e == e0) g += du0;
-        if (e == e1) g += du1;
-        dl_tok[e] = store_logit<logit_t>(g);
+    for (int k = 0; k < (K_CONST > 0 ? K_CONST : 8); ++k) {
+        if (K_CONST == 0 && k >= K) break;
+        int idx = (int)topk_idx[tok * K + k];
+        e_k[k] = idx;
+        float u_k = s[idx];
+        u[k] = u_k;
+        sum_u += u_k;
+        float d_k = __bfloat162float(d_topk_weights[tok * K + k]);
+        d[k] = d_k;
+        sum_du += d_k * u_k;
+    }
+
+    float inv_D = 1.0f / sum_u;
+    float d_bar = sum_du * inv_D;
+
+    float du[8];
+    #pragma unroll
+    for (int k = 0; k < (K_CONST > 0 ? K_CONST : 8); ++k) {
+        if (K_CONST == 0 && k >= K) break;
+        du[k] = (d[k] - d_bar) * inv_D * u[k] * (1.0f - u[k]);
+    }
+
+    // 5. Accumulate expert gradients
+    float g[32];
+    #pragma unroll
+    for (int e = 0; e < (E_CONST > 0 ? E_CONST : 32); ++e) {
+        if (E_CONST == 0 && e >= E) break;
+        if (z_factor != 0.0f) {
+            float p_e = __expf(l[e] - max_l) * inv_sum_exp;
+            g[e] = z_factor * p_e;
+        } else {
+            g[e] = 0.0f;
+        }
+    }
+    #pragma unroll
+    for (int k = 0; k < (K_CONST > 0 ? K_CONST : 8); ++k) {
+        if (K_CONST == 0 && k >= K) break;
+        int idx = e_k[k];
+        if (idx >= 0 && idx < E) {
+            g[idx] += du[k];
+        }
+    }
+
+    // 6. Mean-centering adjoint: d(l - mean(l)) / d(l) = g_e - mean(g)
+    float sum_g = 0.0f;
+    #pragma unroll
+    for (int e = 0; e < (E_CONST > 0 ? E_CONST : 32); ++e) {
+        if (E_CONST == 0 && e >= E) break;
+        sum_g += g[e];
+    }
+    float mean_g = sum_g / (float)E;
+
+    #pragma unroll
+    for (int e = 0; e < (E_CONST > 0 ? E_CONST : 32); ++e) {
+        if (E_CONST == 0 && e >= E) break;
+        dl_tok[e] = store_logit<logit_t>(g[e] - mean_g);
     }
 }
 
 std::vector<torch::Tensor> moe_router_topk_forward_cuda(
     torch::Tensor logits,
     torch::Tensor expert_bias,
+    int64_t top_k,
     float z_loss_weight
 ) {
+    TORCH_CHECK(logits.is_cuda(), "logits must be a CUDA tensor");
+    TORCH_CHECK(expert_bias.is_cuda(), "expert_bias must be a CUDA tensor");
+    TORCH_CHECK(logits.is_contiguous(), "logits must be contiguous");
+    TORCH_CHECK(expert_bias.is_contiguous(), "expert_bias must be contiguous");
+    TORCH_CHECK(logits.dim() == 2, "logits must be 2D [N, E]");
     int N = logits.size(0);
-    auto topk_idx = torch::empty({N, 2}, torch::TensorOptions().dtype(torch::kInt64).device(logits.device()));
-    // Weights are always bf16 for the combine kernel, regardless of logits dtype.
+    int E = logits.size(1);
+    TORCH_CHECK(E <= 32, "moe_router_topk_forward_cuda supports E <= 32, got ", E);
+    TORCH_CHECK(top_k > 0 && top_k <= 8 && top_k <= E, "top_k must be in [1, min(8, E)], got ", top_k);
+    TORCH_CHECK(expert_bias.size(0) == E, "expert_bias size must match E");
+    TORCH_CHECK(logits.scalar_type() == torch::kFloat32 || logits.scalar_type() == torch::kBFloat16,
+                "logits must be float32 or bfloat16");
+    TORCH_CHECK(expert_bias.scalar_type() == torch::kFloat32, "expert_bias must be float32");
+
+    auto topk_idx = torch::empty({N, top_k}, torch::TensorOptions().dtype(torch::kInt64).device(logits.device()));
     auto topk_weights = torch::empty(
-        {N, 2}, torch::TensorOptions().dtype(torch::kBFloat16).device(logits.device()));
+        {N, top_k}, torch::TensorOptions().dtype(torch::kBFloat16).device(logits.device()));
     auto z_loss_per_token = torch::empty({N}, torch::TensorOptions().dtype(torch::kFloat32).device(logits.device()));
 
     if (N > 0) {
         int threads = 128;
         int blocks = (N + threads - 1) / threads;
         auto* tkw = reinterpret_cast<__nv_bfloat16*>(topk_weights.data_ptr<c10::BFloat16>());
-        if (logits.scalar_type() == torch::kFloat32) {
-            moe_router_topk_forward_kernel<float><<<blocks, threads>>>(
-                logits.data_ptr<float>(), expert_bias.data_ptr<float>(),
-                topk_idx.data_ptr<int64_t>(), tkw,
-                z_loss_per_token.data_ptr<float>(), z_loss_weight, N);
+        if (E == 16 && top_k == 4) {
+            if (logits.scalar_type() == torch::kFloat32) {
+                moe_router_topk_forward_kernel<float, 16, 4><<<blocks, threads>>>(
+                    logits.data_ptr<float>(), expert_bias.data_ptr<float>(),
+                    topk_idx.data_ptr<int64_t>(), tkw,
+                    z_loss_per_token.data_ptr<float>(), z_loss_weight, N);
+            } else {
+                moe_router_topk_forward_kernel<__nv_bfloat16, 16, 4><<<blocks, threads>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(logits.data_ptr<c10::BFloat16>()),
+                    expert_bias.data_ptr<float>(),
+                    topk_idx.data_ptr<int64_t>(), tkw,
+                    z_loss_per_token.data_ptr<float>(), z_loss_weight, N);
+            }
+        } else if (E == 8 && top_k == 2) {
+            if (logits.scalar_type() == torch::kFloat32) {
+                moe_router_topk_forward_kernel<float, 8, 2><<<blocks, threads>>>(
+                    logits.data_ptr<float>(), expert_bias.data_ptr<float>(),
+                    topk_idx.data_ptr<int64_t>(), tkw,
+                    z_loss_per_token.data_ptr<float>(), z_loss_weight, N);
+            } else {
+                moe_router_topk_forward_kernel<__nv_bfloat16, 8, 2><<<blocks, threads>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(logits.data_ptr<c10::BFloat16>()),
+                    expert_bias.data_ptr<float>(),
+                    topk_idx.data_ptr<int64_t>(), tkw,
+                    z_loss_per_token.data_ptr<float>(), z_loss_weight, N);
+            }
         } else {
-            moe_router_topk_forward_kernel<__nv_bfloat16><<<blocks, threads>>>(
-                reinterpret_cast<const __nv_bfloat16*>(logits.data_ptr<c10::BFloat16>()),
-                expert_bias.data_ptr<float>(),
-                topk_idx.data_ptr<int64_t>(), tkw,
-                z_loss_per_token.data_ptr<float>(), z_loss_weight, N);
+            if (logits.scalar_type() == torch::kFloat32) {
+                moe_router_topk_forward_kernel<float, 0, 0><<<blocks, threads>>>(
+                    logits.data_ptr<float>(), expert_bias.data_ptr<float>(),
+                    topk_idx.data_ptr<int64_t>(), tkw,
+                    z_loss_per_token.data_ptr<float>(), z_loss_weight, N, E, (int)top_k);
+            } else {
+                moe_router_topk_forward_kernel<__nv_bfloat16, 0, 0><<<blocks, threads>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(logits.data_ptr<c10::BFloat16>()),
+                    expert_bias.data_ptr<float>(),
+                    topk_idx.data_ptr<int64_t>(), tkw,
+                    z_loss_per_token.data_ptr<float>(), z_loss_weight, N, E, (int)top_k);
+            }
         }
     }
     auto z_loss = z_loss_per_token.sum() / (float)std::max(1, N);
@@ -1867,23 +2009,65 @@ torch::Tensor moe_router_topk_backward_cuda(
     torch::Tensor topk_idx,
     float z_loss_weight
 ) {
+    TORCH_CHECK(d_topk_weights.is_cuda(), "d_topk_weights must be a CUDA tensor");
+    TORCH_CHECK(logits.is_cuda(), "logits must be a CUDA tensor");
+    TORCH_CHECK(topk_idx.is_cuda(), "topk_idx must be a CUDA tensor");
+    TORCH_CHECK(d_topk_weights.is_contiguous(), "d_topk_weights must be contiguous");
+    TORCH_CHECK(logits.is_contiguous(), "logits must be contiguous");
+    TORCH_CHECK(topk_idx.is_contiguous(), "topk_idx must be contiguous");
+    TORCH_CHECK(d_topk_weights.scalar_type() == torch::kBFloat16, "d_topk_weights must be bfloat16");
+    TORCH_CHECK(topk_idx.scalar_type() == torch::kInt64, "topk_idx must be int64");
     int N = logits.size(0);
+    int E = logits.size(1);
+    int K = topk_idx.size(1);
+    TORCH_CHECK(E <= 32, "moe_router_topk_backward_cuda supports E <= 32, got ", E);
+    TORCH_CHECK(K > 0 && K <= 8 && K <= E, "top_k must be in [1, min(8, E)], got ", K);
+    TORCH_CHECK(d_topk_weights.size(0) == N && d_topk_weights.size(1) == K, "d_topk_weights shape mismatch");
+
     auto d_logits = torch::empty_like(logits);
     if (N > 0) {
         int threads = 128;
         int blocks = (N + threads - 1) / threads;
         auto* dtw = reinterpret_cast<const __nv_bfloat16*>(d_topk_weights.data_ptr<c10::BFloat16>());
-        if (logits.scalar_type() == torch::kFloat32) {
-            moe_router_topk_backward_kernel<float><<<blocks, threads>>>(
-                dtw, logits.data_ptr<float>(), topk_idx.data_ptr<int64_t>(),
-                d_logits.data_ptr<float>(), z_loss_weight, N);
+        if (E == 16 && K == 4) {
+            if (logits.scalar_type() == torch::kFloat32) {
+                moe_router_topk_backward_kernel<float, 16, 4><<<blocks, threads>>>(
+                    dtw, logits.data_ptr<float>(), topk_idx.data_ptr<int64_t>(),
+                    d_logits.data_ptr<float>(), z_loss_weight, N);
+            } else {
+                moe_router_topk_backward_kernel<__nv_bfloat16, 16, 4><<<blocks, threads>>>(
+                    dtw,
+                    reinterpret_cast<const __nv_bfloat16*>(logits.data_ptr<c10::BFloat16>()),
+                    topk_idx.data_ptr<int64_t>(),
+                    reinterpret_cast<__nv_bfloat16*>(d_logits.data_ptr<c10::BFloat16>()),
+                    z_loss_weight, N);
+            }
+        } else if (E == 8 && K == 2) {
+            if (logits.scalar_type() == torch::kFloat32) {
+                moe_router_topk_backward_kernel<float, 8, 2><<<blocks, threads>>>(
+                    dtw, logits.data_ptr<float>(), topk_idx.data_ptr<int64_t>(),
+                    d_logits.data_ptr<float>(), z_loss_weight, N);
+            } else {
+                moe_router_topk_backward_kernel<__nv_bfloat16, 8, 2><<<blocks, threads>>>(
+                    dtw,
+                    reinterpret_cast<const __nv_bfloat16*>(logits.data_ptr<c10::BFloat16>()),
+                    topk_idx.data_ptr<int64_t>(),
+                    reinterpret_cast<__nv_bfloat16*>(d_logits.data_ptr<c10::BFloat16>()),
+                    z_loss_weight, N);
+            }
         } else {
-            moe_router_topk_backward_kernel<__nv_bfloat16><<<blocks, threads>>>(
-                dtw,
-                reinterpret_cast<const __nv_bfloat16*>(logits.data_ptr<c10::BFloat16>()),
-                topk_idx.data_ptr<int64_t>(),
-                reinterpret_cast<__nv_bfloat16*>(d_logits.data_ptr<c10::BFloat16>()),
-                z_loss_weight, N);
+            if (logits.scalar_type() == torch::kFloat32) {
+                moe_router_topk_backward_kernel<float, 0, 0><<<blocks, threads>>>(
+                    dtw, logits.data_ptr<float>(), topk_idx.data_ptr<int64_t>(),
+                    d_logits.data_ptr<float>(), z_loss_weight, N, E, K);
+            } else {
+                moe_router_topk_backward_kernel<__nv_bfloat16, 0, 0><<<blocks, threads>>>(
+                    dtw,
+                    reinterpret_cast<const __nv_bfloat16*>(logits.data_ptr<c10::BFloat16>()),
+                    topk_idx.data_ptr<int64_t>(),
+                    reinterpret_cast<__nv_bfloat16*>(d_logits.data_ptr<c10::BFloat16>()),
+                    z_loss_weight, N, E, K);
+            }
         }
     }
     return d_logits;

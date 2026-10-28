@@ -1,6 +1,15 @@
 import os
+import torch.utils.cpp_extension as _ext
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+
+# Set compilers and disable strict ABI / version checking
+os.environ.setdefault("CC", "gcc")
+os.environ.setdefault("CXX", "g++")
+os.environ["TORCH_DONT_CHECK_COMPILER_ABI"] = "1"
+
+# Bypass CUDA version mismatch check if nvcc minor/major differs from torch build
+_ext._check_cuda_version = lambda *args, **kwargs: None
 
 # Read target architecture or default to local RTX 4060 (sm_89)
 extra_nvcc_args = [

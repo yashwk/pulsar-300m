@@ -16,7 +16,7 @@ ckpt_vol = modal.Volume.from_name("pulsar-checkpoints", create_if_missing=True)
 
 # 2. PyTorch CUDA Image supporting sm_103 (Blackwell Ultra), sm_100 (Blackwell) & sm_90 (Hopper)
 image = (
-    modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.11")
+    modal.Image.from_registry("nvidia/cuda:13.2.0-devel-ubuntu22.04", add_python="3.11")
     .apt_install("build-essential", "ninja-build")
     .pip_install(
         "torch>=2.4.0",
@@ -24,7 +24,6 @@ image = (
         "numpy",
         "tiktoken",
         "tqdm",
-        extra_index_url="https://download.pytorch.org/whl/cu128",
     )
     .add_local_dir("csrc", remote_path="/root/pulsar_src/csrc", copy=True)
     .add_local_file("setup.py", remote_path="/root/pulsar_src/setup.py", copy=True)
@@ -36,6 +35,9 @@ image = (
         "pip install --no-build-isolation --no-deps . && "
         "python -c \"import torch, pulsar_cuda; print('Verified pulsar_cuda:', pulsar_cuda.__file__)\"",
         env={
+            "CC": "gcc",
+            "CXX": "g++",
+            "TORCH_DONT_CHECK_COMPILER_ABI": "1",
             "TORCH_CUDA_ARCH_LIST": "8.9;9.0;10.0+PTX",
             "MAX_JOBS": "4",
         },

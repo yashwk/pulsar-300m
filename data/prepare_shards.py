@@ -355,7 +355,9 @@ def format_single_tool_call(call: dict, style: str) -> str:
         return f"<|tool_call|>\n{c_str}\n<|/tool_call|>"
 
 
-def format_toucan_messages(messages, style_seed: float | None = None, native_only: bool = False) -> str:
+def format_toucan_messages(
+    messages, style_seed: float | None = None, native_only: bool = False, inject_tool_hint: bool = True
+) -> str:
     """Format multi-turn agentic conversations with native JSON or multi-harness randomization."""
     if isinstance(messages, str):
         try:
@@ -392,7 +394,10 @@ def format_toucan_messages(messages, style_seed: float | None = None, native_onl
 
         if role in ("system",):
             has_system = True
-            content_with_hint = f"{content}\n\n[Tool Calling Convention]\n{harness_prompt_hint}" if content else f"[Tool Calling Convention]\n{harness_prompt_hint}"
+            if inject_tool_hint:
+                content_with_hint = f"{content}\n\n[Tool Calling Convention]\n{harness_prompt_hint}" if content else f"[Tool Calling Convention]\n{harness_prompt_hint}"
+            else:
+                content_with_hint = content
             turns.append(f"<|im_start|>system\n{content_with_hint}<|im_end|>")
         elif role in ("human", "user"):
             turns.append(f"<|im_start|>user\n{content}<|im_end|>")
@@ -421,7 +426,7 @@ def format_toucan_messages(messages, style_seed: float | None = None, native_onl
                 full_assist = f"{full_assist}\n{content}" if full_assist else content
             turns.append(f"<|im_start|>assistant\n{full_assist.strip()}<|im_end|>")
 
-    if not has_system and turns:
+    if not has_system and turns and inject_tool_hint:
         # Prepend system instruction if missing
         turns.insert(0, f"<|im_start|>system\n[Tool Calling Convention]\n{harness_prompt_hint}<|im_end|>")
 
@@ -684,7 +689,7 @@ def make_substream_stream(
                     elif substream_id == "5A":
                         msgs = row.get("messages") or row.get("conversations")
                         if msgs:
-                            formatted = format_toucan_messages(msgs, style_seed=stream_rng.random(), native_only=True)
+                            formatted = format_toucan_messages(msgs, style_seed=stream_rng.random(), native_only=True, inject_tool_hint=False)
 
                     elif substream_id == "5B":
                         convs = row.get("conversations")
@@ -697,6 +702,18 @@ def make_substream_stream(
 
                 del pydict
                 gc.collect()
+
+            # Clean up consumed parquet file from container cache to prevent disk exhaustion
+            del pf
+            if not use_row_partition and fpath:
+                try:
+                    real_blob = os.path.realpath(fpath)
+                    if os.path.exists(real_blob):
+                        os.unlink(real_blob)
+                    if os.path.exists(fpath):
+                        os.unlink(fpath)
+                except Exception:
+                    pass
 
 
 # ==============================================================================

@@ -208,3 +208,51 @@ def test_fine_grained_moe_e16_top4_vectorized_forward_backward():
     assert mlp.shared_expert.w_down.weight.grad is not None
     assert not torch.isnan(mlp.shared_expert.w_down.weight.grad).any()
 
+
+def test_padded_positions_not_competing_in_moe():
+    """Padded positions in routing_mask must not compete for capacity or count as dropped."""
+    from src.model import PulsarConfig, PulsarMoEMLP
+
+    cfg = PulsarConfig(
+        vocab_size=1024,
+        d_model=128,
+        d_expert=64,
+        d_shared=128,
+        n_routed_experts=16,
+        top_k=4,
+        max_pulses=2,
+    )
+    torch.manual_seed(42)
+    mlp = PulsarMoEMLP(cfg).float()
+    mlp.train()
+
+    B, T, D = 2, 16, 128
+    x = torch.randn(B, T, D, requires_grad=True)
+    mask = torch.ones(B, T, dtype=torch.bool)
+    mask[0, 8:] = False
+    mask[1, 12:] = False
+
+    out, z_loss, _, _ = mlp(x, pulse_idx=0, routing_mask=mask)
+    assert out.shape == (B, T, D)
+    assert not torch.isnan(out).any()
+
+    # Backprop should propagate cleanly
+    loss = out.sum() + z_loss
+    loss.backward()
+    assert x.grad is not None
+    assert not torch.isnan(x.grad).any()
+
+
+def test_smoltalk_no_tool_convention_injection():
+    """Substream 5A (SmolTalk) should not have [Tool Calling Convention] injected."""
+    from data.prepare_shards import format_toucan_messages
+
+    sample_msgs = [
+        {"role": "user", "content": "What is the capital of France?"},
+        {"role": "assistant", "content": "The capital of France is Paris."},
+    ]
+    formatted = format_toucan_messages(sample_msgs, native_only=True, inject_tool_hint=False)
+    assert "[Tool Calling Convention]" not in formatted
+    assert "<|im_start|>user\nWhat is the capital of France?<|im_end|>" in formatted
+    assert "<|im_start|>assistant\nThe capital of France is Paris.<|im_end|>" in formatted
+

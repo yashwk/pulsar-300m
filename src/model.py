@@ -826,6 +826,10 @@ class PulsarMoEMLP(nn.Module):
             topk_raw = torch.gather(scores, -1, topk_idx)
             topk_weights = (topk_raw / (topk_raw.sum(dim=-1, keepdim=True) + 1e-6)).to(x.dtype)
 
+        # Invalidate padded positions so they do not compete for expert capacity slots
+        if valid is not None:
+            topk_weights = topk_weights * valid.unsqueeze(-1).to(topk_weights.dtype)
+
         # 3. Shared expert projection
         shared_out = self.shared_expert(x_flat)
 
@@ -851,6 +855,8 @@ class PulsarMoEMLP(nn.Module):
         token_to_slot = compute_token_slots(
             topk_idx, topk_weights, self.cfg.n_routed_experts, capacity
         )
+        if valid is not None:
+            token_to_slot = torch.where(valid.unsqueeze(-1), token_to_slot, torch.full_like(token_to_slot, -1))
 
         with torch.no_grad():
             bincounts = torch.zeros(self.cfg.n_routed_experts, device=x.device, dtype=torch.float32)
@@ -880,9 +886,13 @@ class PulsarMoEMLP(nn.Module):
                 # Drop accounting stays on the GPU; drained by pop_moe_stats().
                 # Tracked per pulse as well as in total: drops are a per-pulse
                 # phenomenon, so a single global rate would hide the case that matters.
-                # Drops measured from the ACTUAL slot assignment.
-                dropped = (token_to_slot < 0).sum().to(torch.float32)
-                assigned = torch.full_like(dropped, float(token_to_slot.numel()))
+                # Drops measured from the ACTUAL slot assignment (only counting valid tokens).
+                if valid is not None:
+                    dropped = ((token_to_slot < 0) & valid.unsqueeze(-1)).sum().to(torch.float32)
+                    assigned = (valid.sum() * self.cfg.top_k).to(torch.float32)
+                else:
+                    dropped = (token_to_slot < 0).sum().to(torch.float32)
+                    assigned = torch.full_like(dropped, float(token_to_slot.numel()))
                 # demand_over_capacity is kept for comparison: it is what the old code
                 # reported, and the two disagree whenever the slot logic is wrong.
                 self.demand_over_capacity_accum.add_(
@@ -927,7 +937,7 @@ class PulsarMoEMLP(nn.Module):
             clamped_slot = flat_slots.clamp(min=0).long()
             dest_idx = flat_expert_ids * C + clamped_slot
 
-            valid_tokens = torch.where(valid_mask.unsqueeze(-1), x_flat[flat_token_idx], torch.zeros_like(x_flat[flat_token_idx]))
+            valid_tokens = x_flat[flat_token_idx] * valid_mask.unsqueeze(-1).to(x.dtype)
             expert_inputs_flat = torch.zeros(E * C, D, device=x.device, dtype=x.dtype)
             expert_inputs_flat.index_add_(0, dest_idx, valid_tokens)
             expert_inputs = expert_inputs_flat.view(E, C, D).to(self.routed_gate_up.dtype)
@@ -939,7 +949,7 @@ class PulsarMoEMLP(nn.Module):
 
             # Vectorized gather
             expert_out_flat = expert_out.view(E * C, D)
-            w = torch.where(valid_mask.unsqueeze(-1), flat_weights.unsqueeze(-1), torch.zeros_like(flat_weights.unsqueeze(-1)))
+            w = (flat_weights * valid_mask.to(flat_weights.dtype)).unsqueeze(-1)
             contrib = (w * expert_out_flat[dest_idx]).to(x.dtype)
 
             routed_out = torch.zeros(N, D, device=x.device, dtype=x.dtype)

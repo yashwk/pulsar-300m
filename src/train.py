@@ -165,7 +165,7 @@ def generate_canary(
     model: torch.nn.Module,
     tokenizer: AutoTokenizer,
     prompt: str,
-    max_new_tokens: int = 512,
+    max_new_tokens: int = 64,
     temperature: float = 0.7,
     device: str = "cuda",
     repetition_penalty: float = 1.15,
@@ -341,6 +341,7 @@ def train():
     parser.add_argument("--min-lr-ratio", type=float, default=0.01, help="Minimum LR ratio during cooldown (docs specify 1 percent)")
     parser.add_argument("--eval-every", type=int, default=25, help="Steps between validation and canary generation")
     parser.add_argument("--eval-iters", type=int, default=10, help="Batches evaluated during validation")
+    parser.add_argument("--canary-tokens", type=int, default=64, help="Maximum new tokens generated per canary prompt during evaluation")
     parser.add_argument(
         "--router-diag", action=argparse.BooleanOptionalAction, default=True,
         help="Sample router diagnostics (shared-mean fraction, bias override rate) on one "
@@ -732,7 +733,7 @@ def train():
             rmask = train_loader.routing_mask(x) if hasattr(train_loader, "routing_mask") else None
             _, loss, metrics = model(
                 x, labels=y, num_pulses=args.num_pulses,
-                subsample_offset=micro_step, routing_mask=rmask,
+                subsample_offset=(step * grad_accum + micro_step), routing_mask=rmask,
                 # Sampled, not continuous: one micro-batch per log window keeps the cost
                 # at a no-grad matmul per (block, pulse) instead of every step.
                 router_diag=(args.router_diag and is_log_step and micro_step == 0),
@@ -969,7 +970,7 @@ def train():
                 category = canary_meta["category"]
                 try:
                     generation = generate_canary(
-                        model, tokenizer, prompt, max_new_tokens=512, temperature=0.7, device=device
+                        model, tokenizer, prompt, max_new_tokens=args.canary_tokens, temperature=0.7, device=device
                     )
                     generation_clean = generation.strip()
                     print(f"  [{tag}] {generation_clean.replace(chr(10), ' ')[:140]}...")

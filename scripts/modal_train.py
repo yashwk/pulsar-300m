@@ -17,6 +17,7 @@ ckpt_vol = modal.Volume.from_name("pulsar-checkpoints", create_if_missing=True)
 # 2. PyTorch CUDA Image supporting sm_103 (Blackwell Ultra), sm_100 (Blackwell) & sm_90 (Hopper)
 image = (
     modal.Image.debian_slim(python_version="3.11")
+    .apt_install("build-essential")
     .pip_install(
         "torch>=2.4.0",
         "transformers",
@@ -54,6 +55,7 @@ def execute_training(
     resume: str = None,
     compile: bool = True,
     output_ckpt: str = None,
+    max_steps: int = None,
 ):
     """Core training harness with background volume sync."""
     ckpt_vol.reload()
@@ -77,6 +79,8 @@ def execute_training(
     committer_thread = threading.Thread(target=periodic_commit, daemon=True)
     committer_thread.start()
 
+    effective_max_steps = max_steps if max_steps is not None else max(1, 3_800_000_000 // global_batch_tokens)
+
     cmd = [
         "python", "-u", "/root/src/train.py",
         "--train-bin", train_shards,
@@ -85,7 +89,7 @@ def execute_training(
         "--seq-len", str(seq_len),
         "--micro-batch-size", str(micro_batch_size),
         "--global-batch-tokens", str(global_batch_tokens),
-        "--max-steps", "30517",
+        "--max-steps", str(effective_max_steps),
         "--target-step", str(target_step),
         "--warmup-steps", "150",
         "--cooldown-steps", "0",
@@ -124,7 +128,7 @@ def execute_training(
 @app.function(
     image=image,
     gpu="B300",
-    timeout=60 * 60 * 4,
+    timeout=60 * 60 * 8,
     volumes={"/root/data": data_vol, "/checkpoints": ckpt_vol},
 )
 def train_remote_b300(**kwargs):
@@ -134,7 +138,7 @@ def train_remote_b300(**kwargs):
 @app.function(
     image=image,
     gpu="B200",
-    timeout=60 * 60 * 4,
+    timeout=60 * 60 * 8,
     volumes={"/root/data": data_vol, "/checkpoints": ckpt_vol},
 )
 def train_remote_b200(**kwargs):
@@ -144,7 +148,7 @@ def train_remote_b200(**kwargs):
 @app.function(
     image=image,
     gpu="H200",
-    timeout=60 * 60 * 4,
+    timeout=60 * 60 * 8,
     volumes={"/root/data": data_vol, "/checkpoints": ckpt_vol},
 )
 def train_remote_h200(**kwargs):
@@ -154,7 +158,7 @@ def train_remote_h200(**kwargs):
 @app.function(
     image=image,
     gpu="H100",
-    timeout=60 * 60 * 4,
+    timeout=60 * 60 * 8,
     volumes={"/root/data": data_vol, "/checkpoints": ckpt_vol},
 )
 def train_remote_h100(**kwargs):
@@ -167,6 +171,7 @@ def main(
     train_shards: str = ALL_TRAIN_SHARDS,
     val_shards: str = ALL_VAL_SHARDS,
     target_step: int = 30,
+    max_steps: int = None,
     mbs: int = 64,
     global_batch_tokens: int = 131072,
     seq_len: int = 1024,
@@ -182,6 +187,7 @@ def main(
         "train_shards": train_shards,
         "val_shards": val_shards,
         "target_step": target_step,
+        "max_steps": max_steps,
         "micro_batch_size": mbs,
         "global_batch_tokens": global_batch_tokens,
         "seq_len": seq_len,

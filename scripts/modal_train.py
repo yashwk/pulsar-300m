@@ -41,6 +41,22 @@ ALL_TRAIN_SHARDS = ",".join([f"/root/data/train_shard{i}.bin" for i in range(8)]
 ALL_VAL_SHARDS = ",".join([f"/root/data/val_shard{i}.bin" for i in range(8)])
 
 
+def parse_tokens(val: str | int | float | None) -> int | None:
+    """Parse human token representations like '3.8B', '4M', '131k', '131072'."""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return int(val)
+    s = str(val).strip().upper()
+    if s.endswith("B"):
+        return int(float(s[:-1]) * 1_000_000_000)
+    elif s.endswith("M"):
+        return int(float(s[:-1]) * 1_000_000)
+    elif s.endswith("K"):
+        return int(float(s[:-1]) * 1_000)
+    return int(float(s))
+
+
 def execute_training(
     train_shards: str,
     val_shards: str,
@@ -181,12 +197,15 @@ def main(
     gpu: str = "B300",
     train_shards: str = ALL_TRAIN_SHARDS,
     val_shards: str = ALL_VAL_SHARDS,
-    target_step: int = 30,
+    target_step: int = None,
+    target_tokens: str = None,
     max_steps: int = None,
+    max_tokens: str = None,
     mbs: int = 128,
     global_batch_tokens: int = 131072,
     seq_len: int = 1024,
-    warmup_steps: int = 300,
+    warmup_steps: int = None,
+    warmup_tokens: str = None,
     sampler: str = "bestfit",
     num_pulses: int = 3,
     moe_capacity_factor: float = 1.25,
@@ -200,15 +219,59 @@ def main(
     compile: bool = True,
     output_ckpt: str = None,
 ):
+    # Calculate invariant hardware-agnostic batch dynamics
+    tokens_per_micro = mbs * seq_len
+    grad_accum = max(1, (global_batch_tokens + tokens_per_micro - 1) // tokens_per_micro)
+    effective_gbt = grad_accum * tokens_per_micro
+
+    # 1. Resolve total curriculum steps from max_tokens or default 3.8B curriculum
+    if max_steps is None:
+        total_tok = parse_tokens(max_tokens) if max_tokens else 3_800_000_000
+        effective_max_steps = max(1, total_tok // effective_gbt)
+    else:
+        effective_max_steps = max_steps
+
+    # 2. Resolve target_step from target_tokens if provided, else default to step 30
+    if target_tokens is not None:
+        target_tok_val = parse_tokens(target_tokens)
+        effective_target_step = max(1, (target_tok_val + effective_gbt - 1) // effective_gbt)
+    elif target_step is not None:
+        effective_target_step = target_step
+    else:
+        effective_target_step = 30
+
+    # 3. Resolve warmup_steps from warmup_tokens or 1% curriculum default
+    if warmup_tokens is not None:
+        effective_warmup_steps = max(1, parse_tokens(warmup_tokens) // effective_gbt)
+    elif warmup_steps is not None:
+        effective_warmup_steps = warmup_steps
+    else:
+        effective_warmup_steps = max(1, int(round(effective_max_steps * 0.01)))
+
+    tokens_targeted = effective_target_step * effective_gbt
+    total_curriculum_tokens = effective_max_steps * effective_gbt
+
+    print("\n" + "=" * 70)
+    print(" [Modal Orchestrator] Pulsar-300M Curriculum & Batch Dynamics")
+    print("=" * 70)
+    print(f" Target GPU:                 NVIDIA {gpu.upper()}")
+    print(f" Micro-Batch Size (MBS):     {mbs} (tokens/micro: {tokens_per_micro:,})")
+    print(f" Gradient Accumulation:      GAS = {grad_accum}")
+    print(f" Global Batch Tokens:        {effective_gbt:,} tokens/step")
+    print(f" Total Curriculum Horizon:   {effective_max_steps:,} steps ({total_curriculum_tokens:,} tokens)")
+    print(f" Warmup Schedule:            {effective_warmup_steps:,} steps ({effective_warmup_steps * effective_gbt:,} tokens)")
+    print(f" Active Session Target:      Step {effective_target_step:,} ({tokens_targeted:,} tokens)")
+    print("=" * 70 + "\n")
+
     kwargs = {
         "train_shards": train_shards,
         "val_shards": val_shards,
-        "target_step": target_step,
-        "max_steps": max_steps,
+        "target_step": effective_target_step,
+        "max_steps": effective_max_steps,
         "micro_batch_size": mbs,
-        "global_batch_tokens": global_batch_tokens,
+        "global_batch_tokens": effective_gbt,
         "seq_len": seq_len,
-        "warmup_steps": warmup_steps,
+        "warmup_steps": effective_warmup_steps,
         "sampler": sampler,
         "num_pulses": num_pulses,
         "moe_capacity_factor": moe_capacity_factor,

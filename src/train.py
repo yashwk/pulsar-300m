@@ -173,6 +173,7 @@ def generate_canary(
     """Autoregressively decode tokens using full recurrent depth until EOS or end token."""
     was_training = model.training
     model.eval()
+    raw_model = getattr(model, "_orig_mod", model)
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
 
     # Dynamic end-of-sequence termination tokens
@@ -187,28 +188,30 @@ def generate_canary(
         except Exception:
             pass
 
+    disable_ctx = torch._dynamo.disable() if hasattr(torch, "_dynamo") else contextlib.nullcontext()
     with torch.no_grad():
-        for _ in range(max_new_tokens):
-            context_window = input_ids[:, -1024:]
-            logits, _, _ = model(context_window, labels=None)
-            next_token_logits = logits[:, -1, :].clone()
+        with disable_ctx:
+            for _ in range(max_new_tokens):
+                context_window = input_ids[:, -1024:]
+                logits, _, _ = raw_model(context_window, labels=None)
+                next_token_logits = logits[:, -1, :].clone()
 
-            if repetition_penalty != 1.0:
-                seen_tokens = set(input_ids[0].tolist())
-                for tok_id in seen_tokens:
-                    val = next_token_logits[0, tok_id]
-                    if val > 0:
-                        next_token_logits[0, tok_id] = val / repetition_penalty
-                    else:
-                        next_token_logits[0, tok_id] = val * repetition_penalty
+                if repetition_penalty != 1.0:
+                    seen_tokens = set(input_ids[0].tolist())
+                    for tok_id in seen_tokens:
+                        val = next_token_logits[0, tok_id]
+                        if val > 0:
+                            next_token_logits[0, tok_id] = val / repetition_penalty
+                        else:
+                            next_token_logits[0, tok_id] = val * repetition_penalty
 
-            scaled_logits = next_token_logits / max(1e-4, temperature)
-            probs = F.softmax(scaled_logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
-            input_ids = torch.cat([input_ids, next_token], dim=1)
+                scaled_logits = next_token_logits / max(1e-4, temperature)
+                probs = F.softmax(scaled_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+                input_ids = torch.cat([input_ids, next_token], dim=1)
 
-            if next_token.item() in stop_token_ids:
-                break
+                if next_token.item() in stop_token_ids:
+                    break
 
     if was_training:
         model.train()
@@ -601,7 +604,7 @@ def train():
                 torch._dynamo.config.allow_unspec_int_on_nn_module = True
         raw_model = getattr(model, "_orig_mod", model)
         for i in range(len(raw_model.core)):
-            raw_model.core[i] = torch.compile(raw_model.core[i], dynamic=True)
+            raw_model.core[i] = torch.compile(raw_model.core[i], dynamic=False)
 
     # Graceful shutdown handler
     interrupted = False

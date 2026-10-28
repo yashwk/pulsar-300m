@@ -192,6 +192,28 @@ class _FusedSoftcapCrossEntropyFunction(torch.autograd.Function):
         return d_logits, None, None, None, None
 
 
+def _softcap_cross_entropy(
+    raw_logits: torch.Tensor,
+    targets: torch.Tensor,
+    softcap: float,
+    reduction: str = "sum",
+    ignore_index: int = -100,
+) -> torch.Tensor:
+    """Fused softcap + cross-entropy helper.
+
+    When compiled by TorchInductor, fuses softcap tanh and log_softmax into a single Triton
+    kernel, avoiding materialization of [N, V] softcapped logits in HBM.
+    """
+    sc = softcap * torch.tanh(raw_logits.float() / softcap)
+    return F.cross_entropy(sc, targets, ignore_index=ignore_index, reduction=reduction)
+
+
+try:
+    _compiled_softcap_ce = torch.compile(_softcap_cross_entropy)
+except Exception:
+    _compiled_softcap_ce = _softcap_cross_entropy
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6, max_pulses: int | None = None):
         super().__init__()
@@ -598,8 +620,12 @@ def compute_token_slots(
         # sort, but that .item() forced a device sync 24x per forward. Measured cost of
         # the branch itself was 0.10 ms/call, so the sync was the only reason to have it.
         flat_w = topk_weights.reshape(-1).float()
-        order = torch.argsort(flat_w, descending=True, stable=True)
-        order = order[torch.argsort(flat_e[order], stable=True)]
+        # Single composite key sort: flat_e in [0, E), flat_w >= 0.
+        # (expert asc, weight desc) is mapped to ascending order of sort_key in one 32-bit sort:
+        # w / (1.0 + w) strictly preserves monotonic ordering for any w in [0, inf) and maps into [0, 1):
+        w_norm = flat_w.clamp_min(0.0) / (1.0 + flat_w.clamp_min(0.0))
+        sort_key = flat_e.to(torch.float32) - w_norm * 0.5
+        order = torch.argsort(sort_key, stable=True)
         e_sorted = flat_e[order]
         counts_sorted = torch.zeros(num_experts, device=device, dtype=torch.long)
         counts_sorted.index_add_(0, e_sorted, torch.ones(M, device=device, dtype=torch.long))
@@ -732,14 +758,18 @@ class PulsarMoEMLP(nn.Module):
         # dominates the MLP update and is the likely cause of the |dh| >> |h_in|
         # blow-up that harmonic damping was added to mask.
         residual_std = 0.02 / math.sqrt(2 * cfg.n_core * cfg.default_pulses)
+        # LeCun fan-in + top-k variance matching:
+        # Matches routed combined output variance to shared expert down-projection output variance.
+        routed_down_std = residual_std * math.sqrt((cfg.d_shared / cfg.d_expert) * cfg.top_k)
         self.routed_gate_up = nn.Parameter(torch.empty(cfg.n_routed_experts, cfg.d_model, 2 * cfg.d_expert))
         self.routed_down = nn.Parameter(torch.empty(cfg.n_routed_experts, cfg.d_expert, cfg.d_model))
         nn.init.normal_(self.routed_gate_up, std=0.02)
-        nn.init.normal_(self.routed_down, std=residual_std)
+        nn.init.normal_(self.routed_down, std=routed_down_std)
 
         # Pulse-Indexed Router [max_pulses, n_routed_experts, d_model]
+        # std=0.002 yields initial logits std ≈ 0.064 across 16 experts for near-uniform initial exploration
         self.router_weight = nn.Parameter(torch.empty(cfg.max_pulses, cfg.n_routed_experts, cfg.d_model, dtype=torch.float32))
-        nn.init.normal_(self.router_weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.router_weight, mean=0.0, std=0.002)
 
         # Per-Pulse Routed-Expert Scale [max_pulses, d_model]
         self.routed_scale = nn.Parameter(torch.ones(cfg.max_pulses, cfg.d_model, dtype=torch.float32))
@@ -1200,7 +1230,9 @@ class PulsarForCausalLM(nn.Module):
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            # std=0.006 eliminates tied-embedding self-logit boost (+20.48 spike at std=0.02),
+            # stabilizing initial Step 0 loss near ln(vocab_size)
+            nn.init.normal_(module.weight, mean=0.0, std=0.006)
 
     def update_expert_biases(self, bias_lr: float = 0.001, num_pulses: int | None = None):
         """Update auxiliary-loss-free routing biases globally across all blocks."""
@@ -1335,8 +1367,7 @@ class PulsarForCausalLM(nn.Module):
                     and hasattr(pulsar_cuda, "fused_softcap_ce_forward")):
                 part = _FusedSoftcapCrossEntropyFunction.apply(raw, tc, self.cfg.logit_softcap, "sum", -100)
             else:
-                sc = self.cfg.logit_softcap * torch.tanh(raw / self.cfg.logit_softcap)
-                part = F.cross_entropy(sc, tc, ignore_index=-100, reduction="sum")
+                part = _compiled_softcap_ce(raw, tc, self.cfg.logit_softcap, "sum", -100)
             total = total + part
         # Divide by VALID tokens, not the total: ignored (-100) positions contribute
         # zero to the sum, so dividing by all tokens deflates the loss (and its
@@ -1490,8 +1521,13 @@ class PulsarForCausalLM(nn.Module):
                                 -100,
                             )
                         else:
-                            logits_sub = self.cfg.logit_softcap * torch.tanh(raw_logits_sub / self.cfg.logit_softcap)
-                            loss_sub = F.cross_entropy(logits_sub.view(-1, self.cfg.vocab_size), lbl_sub.view(-1), ignore_index=-100)
+                            loss_sub = _compiled_softcap_ce(
+                                raw_logits_sub.view(-1, self.cfg.vocab_size),
+                                lbl_sub.view(-1),
+                                self.cfg.logit_softcap,
+                                "mean",
+                                -100,
+                            )
 
                     total_loss = total_loss + (pulse_weights[k] * loss_sub)
                     pulse_losses.append(loss_sub)

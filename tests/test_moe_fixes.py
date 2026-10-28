@@ -256,3 +256,87 @@ def test_smoltalk_no_tool_convention_injection():
     assert "<|im_start|>user\nWhat is the capital of France?<|im_end|>" in formatted
     assert "<|im_start|>assistant\nThe capital of France is Paris.<|im_end|>" in formatted
 
+
+def test_composite_sort_matches_two_sort_reference():
+    """Single composite-key argsort in compute_token_slots must match two-sort reference exactly."""
+    from src.model import compute_token_slots
+
+    def reference_two_sort_slots(topk_idx, topk_weights, num_experts, capacity):
+        N, K = topk_idx.shape
+        device = topk_idx.device
+        flat_e = topk_idx.reshape(-1).long()
+        flat_w = topk_weights.reshape(-1).float()
+        M = flat_e.numel()
+        order = torch.argsort(flat_w, descending=True, stable=True)
+        order = order[torch.argsort(flat_e[order], stable=True)]
+        e_sorted = flat_e[order]
+        counts_sorted = torch.zeros(num_experts, device=device, dtype=torch.long)
+        counts_sorted.index_add_(0, e_sorted, torch.ones(M, device=device, dtype=torch.long))
+        start_sorted = counts_sorted.cumsum(0) - counts_sorted
+        rank_sorted = torch.arange(M, device=device) - start_sorted[e_sorted]
+        slot_sorted = torch.where(rank_sorted < capacity, rank_sorted, torch.full_like(rank_sorted, -1))
+        slots = torch.empty(M, dtype=torch.int32, device=device)
+        slots[order] = slot_sorted.to(torch.int32)
+        return slots.view(N, K)
+
+    torch.manual_seed(123)
+    N, K, E, C = 256, 4, 16, 32
+    topk_idx = torch.randint(0, E, (N, K))
+    topk_weights = torch.rand(N, K)
+    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+    got = compute_token_slots(topk_idx, topk_weights, E, C)
+    expected = reference_two_sort_slots(topk_idx, topk_weights, E, C)
+
+    assert torch.equal(got, expected), "Single composite-key argsort output mismatch with reference"
+
+
+def test_step0_loss_and_variance_matching():
+    """Step 0 loss must be near ln(vocab_size) (< 11.5) and routed/shared RMS matched within 2x."""
+    from src.model import PulsarConfig, PulsarForCausalLM
+
+    cfg = PulsarConfig(
+        vocab_size=32768,
+        d_model=1024,
+        d_expert=512,
+        d_shared=1024,
+        n_routed_experts=16,
+        top_k=4,
+        n_core=2,
+        default_pulses=3,
+    )
+    torch.manual_seed(42)
+    model = PulsarForCausalLM(cfg).float()
+    model.eval()
+
+    # 1. Forward loss test at step 0 on random input tokens
+    B, T = 2, 64
+    x = torch.randint(0, cfg.vocab_size, (B, T))
+    y = torch.randint(0, cfg.vocab_size, (B, T))
+    with torch.no_grad():
+        _, loss, _ = model(x, labels=y)
+
+    ln_v = math.log(cfg.vocab_size)  # ln(32768) ≈ 10.3969
+    assert loss.item() < 11.5, f"Step 0 loss is {loss.item():.4f}; expected < 11.5 (near ln(vocab)={ln_v:.4f})"
+
+    # 2. Variance matching between shared_expert and routed branch
+    mlp = model.core[0].mlp
+    N = 128
+    x_test = torch.randn(1, N, cfg.d_model) * 0.5
+    xf = x_test.view(N, cfg.d_model)
+
+    with torch.no_grad():
+        shared = mlp.shared_expert(xf)
+        out, _, _, _ = mlp(x_test, pulse_idx=0)
+        routed = out.view(N, cfg.d_model) - shared
+
+    def rms(t):
+        return t.float().pow(2).mean().sqrt().item()
+
+    rs, rr = rms(shared), rms(routed)
+    ratio = rr / max(rs, 1e-12)
+    assert 0.5 <= ratio <= 2.0, (
+        f"routed/shared RMS ratio at init is {ratio:.2f} "
+        f"(shared {rs:.5f}, routed {rr:.5f}); expected within [0.5, 2.0]"
+    )
+

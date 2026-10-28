@@ -25,8 +25,8 @@ Universal Schema Formatter:
 """
 
 import os
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
-os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
+# Disable experimental xet chunk downloader to prevent unhandled socket deadlocks
+os.environ.pop("HF_XET_HIGH_PERFORMANCE", None)
 
 import argparse
 import datetime
@@ -55,17 +55,17 @@ MANIFEST_PATH = "data/shards_manifest.json"
 # Sub-stream Specification & Target Quotas
 # ==============================================================================
 
-# Stage 1 Upgraded Mix (Shards 3+): Progressive Reasoning Ramp (32% CoT / 44% Total Reasoning & Agentic)
+# Stage 1 2026 Refined Mix (Shards 0..7): High-Density Reasoning & Agentic Grounding (34% CoT / 51% Total Reasoning & Agentic)
 SUBSTREAM_CONFIG = {
-    "1A": {"name": "1A. Clean Code (Direct)", "weight": 16.0, "pillar": "Pillar 1: Code"},
-    "1B": {"name": "1B. Competitive Code (CoT)", "weight": 16.0, "pillar": "Pillar 1: Code"},
-    "2A": {"name": "2A. Math Textbooks (Direct)", "weight": 15.0, "pillar": "Pillar 2: Mathematics"},
-    "2B": {"name": "2B. Math Reasoning (CoT)", "weight": 16.0, "pillar": "Pillar 2: Mathematics"},
+    "1A": {"name": "1A. Clean Code (Direct)", "weight": 15.0, "pillar": "Pillar 1: Code"},
+    "1B": {"name": "1B. Competitive Code (CoT)", "weight": 17.0, "pillar": "Pillar 1: Code"},
+    "2A": {"name": "2A. Math Textbooks (Direct)", "weight": 14.0, "pillar": "Pillar 2: Mathematics"},
+    "2B": {"name": "2B. Math Reasoning (CoT)", "weight": 17.0, "pillar": "Pillar 2: Mathematics"},
     "3A": {"name": "3A. Agentic MCP Tools", "weight": 12.0, "pillar": "Pillar 3: Agentic MCP"},
     "3B": {"name": "3B. Structured Schemas & Tasks", "weight": 5.0, "pillar": "Pillar 3: Agentic MCP"},
-    "4A": {"name": "4A. Encyclopedic FineWiki", "weight": 6.0, "pillar": "Pillar 4: STEM & Knowledge"},
-    "4B": {"name": "4B. Educational STEM Web", "weight": 10.0, "pillar": "Pillar 4: STEM & Knowledge"},
-    "5A": {"name": "5A. Multi-Turn Assistant Chat", "weight": 4.0, "pillar": "Pillar 5: Multi-Turn Chat"},
+    "4A": {"name": "4A. Encyclopedic FineWiki", "weight": 4.0, "pillar": "Pillar 4: STEM & Knowledge"},
+    "4B": {"name": "4B. Educational STEM Web", "weight": 13.0, "pillar": "Pillar 4: STEM & Knowledge"},
+    "5A": {"name": "5A. Multi-Turn Assistant Chat", "weight": 3.0, "pillar": "Pillar 5: Multi-Turn Chat"},
 }
 
 # Stage 2 Mix: High-Density Reasoning & Niche Upsample (35% Code, 30% Math, 20% Agentic, 10% STEM, 5% CoT Dialogue)
@@ -97,8 +97,8 @@ SUBSTREAM_CONFIG_LONG = {
     "5A": {"name": "5A. Multi-Turn Assistant Chat", "weight": 6.0, "pillar": "Pillar 5: Multi-Turn Chat"},
 }
 
-# Reasoning share (1B + 2B + 3A + 5B) of each mix
-STAGE1_REASONING_WEIGHT = 16.0 + 16.0 + 12.0   # 44.0% (32% CoT + 12% agentic 3A)
+# Reasoning share (1B + 2B + 3A + 3B) of each mix
+STAGE1_REASONING_WEIGHT = 17.0 + 17.0 + 12.0 + 5.0   # 51.0% (34% CoT + 17% Agentic & Schemas)
 STAGE2_REASONING_WEIGHT = 25.0 + 20.0 + 15.0 + 5.0  # 65.0%
 LONG_REASONING_WEIGHT = 15.0 + 15.0 + 12.0   # 42.0%
 
@@ -106,7 +106,7 @@ LONG_REASONING_WEIGHT = 15.0 + 15.0 + 12.0   # 42.0%
 def substream_config_for_stage(stage: int) -> dict:
     """Return the sub-stream mix for a curriculum stage.
 
-    Stage 1: Foundation upgraded mix (44% reasoning/agentic, 32% CoT, T=1024).
+    Stage 1: Foundation 2026 refined mix (51% reasoning/agentic, 34% CoT, T=1024).
     Stage 2: High-Density Reasoning & Niche Upsample (65% reasoning/agentic, T=2048).
     Stage 3: Long-Context 32k Cooldown (reasoning-heavy full trace mix).
     """
@@ -599,9 +599,20 @@ def make_substream_stream(
     while True:
         for f_idx in assigned_indices:
             fname = all_files[f_idx]
-            # Download or reuse cached parquet file directly
-            fpath = hf_hub_download(repo_id=repo_id, filename=fname, repo_type="dataset")
+            print(f"[{substream_id}] Downloading/loading parquet file ({f_idx + 1}/{len(assigned_indices)}): {fname}...", flush=True)
+            # Download or reuse cached parquet file with resilient retry
+            fpath = None
+            for attempt in range(5):
+                try:
+                    fpath = hf_hub_download(repo_id=repo_id, filename=fname, repo_type="dataset")
+                    break
+                except Exception as e:
+                    if attempt == 4:
+                        raise e
+                    print(f"[Warning] hf_hub_download failed for {fname} (attempt {attempt+1}/5): {e}. Retrying...", flush=True)
+                    time.sleep(2 * (attempt + 1))
             pf = pq.ParquetFile(fpath)
+            print(f"[{substream_id}] Opened {fname} ({pf.metadata.num_rows:,} rows, {pf.metadata.serialized_size / 1e6:.1f} MB)", flush=True)
             doc_counter = 0
 
             for batch in pf.iter_batches(batch_size=batch_size):
@@ -793,7 +804,7 @@ def build_shard(
     stage_desc = (
         'Stage 3 Long-Context 32k Cooldown' if stage >= 3
         else ('Stage 2 High-Density Reasoning (65% CoT/Agentic, T=2048)' if stage == 2
-        else 'Stage 1 Foundation Upgraded (32% CoT / 44% Reasoning, T=1024)')
+        else 'Stage 1 Foundation Refined (34% CoT / 51% Reasoning & Agentic, T=1024)')
     )
     print(f"   Stage {stage} | Target: {total_tokens:,} tokens | Mix: {stage_desc}")
     print(f"   Traces: un-elided (cap {MAX_TRACE_CHARS:,} chars) | Seed: {base_seed} + per-stream sha256")
@@ -802,6 +813,7 @@ def build_shard(
     print(f"[Resource Guard] Available Disk: {free_gb:.2f} GB | Available RAM: {avail_ram:.1f} MB (PASS)")
 
     tok = AutoTokenizer.from_pretrained(tokenizer_path)
+    assert len(tok) == 32768, f"Tokenizer vocab must be strictly 32768, got {len(tok)}"
     eos_id = tok.eos_token_id if tok.eos_token_id is not None else 0
     print(f"[Tokenizer] Vocab size: {len(tok):,}, EOS id: {eos_id}")
 
@@ -955,6 +967,21 @@ def build_shard(
     os.replace(train_tmp, train_path)
     if val_tmp:
         os.replace(val_tmp, val_path)
+
+    # Strict token ID bounds verification (< 32,768)
+    train_arr = np.memmap(train_path, dtype=np.uint16, mode="r")
+    assert len(train_arr) > 0, f"Train shard {train_path} is empty!"
+    max_train_id = int(train_arr.max())
+    assert max_train_id < 32768, f"Train token ID {max_train_id} exceeds 32,768 vocab limit!"
+
+    if val_tmp and os.path.exists(val_path):
+        val_arr = np.memmap(val_path, dtype=np.uint16, mode="r")
+        assert len(val_arr) > 0, f"Val shard {val_path} is empty!"
+        max_val_id = int(val_arr.max())
+        assert max_val_id < 32768, f"Val token ID {max_val_id} exceeds 32,768 vocab limit!"
+        print(f"[Verification] Shard {shard_idx} verified: max train token ID = {max_train_id}, max val token ID = {max_val_id} (< 32,768)")
+    else:
+        print(f"[Verification] Shard {shard_idx} verified: max train token ID = {max_train_id} (< 32,768)")
 
     total_done = train_tokens + val_tokens
     elapsed_total = time.time() - t_start

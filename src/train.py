@@ -402,8 +402,10 @@ def train():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cuda":
+        torch.set_float32_matmul_precision("high")
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
 
     print("=======================================================")
     print("      PULSAR-MoE: RECURRENT SPARSE MIXTURE-OF-EXPERTS  ")
@@ -484,6 +486,8 @@ def train():
     # Initialize Tokenizer for canary prompt decoding
     print(f"[Pulsar] Loading tokenizer '{args.tokenizer}'...")
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+    assert len(tokenizer) == 32768, f"Expected 32768 vocab, got {len(tokenizer)}"
+    print(f"[Pulsar] Verified tokenizer vocabulary size: {len(tokenizer):,} tokens")
 
     # Initialize Model
     cfg = PulsarConfig(
@@ -701,6 +705,15 @@ def train():
         t_fwd_total = 0.0
         t_bwd_total = 0.0
 
+        # CUDA event timing for zero-overhead nanosecond hardware profiling
+        use_cuda_events = torch.cuda.is_available()
+        if use_cuda_events:
+            ev_start = torch.cuda.Event(enable_timing=True)
+            ev_fwd = torch.cuda.Event(enable_timing=True)
+            ev_bwd = torch.cuda.Event(enable_timing=True)
+            ev_opt = torch.cuda.Event(enable_timing=True)
+            ev_start.record()
+
         # Accumulate gradients across micro-batches
         accum_loss_tensor = torch.zeros((), device=device, dtype=torch.float32)
         metric_accum: dict = {}
@@ -725,9 +738,14 @@ def train():
                 router_diag=(args.router_diag and is_log_step and micro_step == 0),
             )
             t1 = time.time()
+            if use_cuda_events and micro_step == grad_accum - 1:
+                ev_fwd.record()
+
             scaled_loss = loss / grad_accum
             scaled_loss.backward()
             t2 = time.time()
+            if use_cuda_events and micro_step == grad_accum - 1:
+                ev_bwd.record()
 
             t_fwd_total += (t1 - t0)
             t_bwd_total += (t2 - t1)
@@ -789,6 +807,23 @@ def train():
         raw_model = getattr(model, "_orig_mod", model)
         raw_model.update_expert_biases(bias_lr=args.bias_lr, num_pulses=args.num_pulses)
         t_opt_total = time.time() - t_opt_start
+        if use_cuda_events:
+            ev_opt.record()
+            ev_opt.synchronize()
+            gpu_step_ms = ev_start.elapsed_time(ev_opt)
+            gpu_fwd_ms = ev_start.elapsed_time(ev_fwd)
+            gpu_bwd_ms = ev_fwd.elapsed_time(ev_bwd)
+            gpu_opt_ms = ev_bwd.elapsed_time(ev_opt)
+        else:
+            gpu_step_ms = (t_fwd_total + t_bwd_total + t_opt_total) * 1000.0
+            gpu_fwd_ms = t_fwd_total * 1000.0
+            gpu_bwd_ms = t_bwd_total * 1000.0
+            gpu_opt_ms = t_opt_total * 1000.0
+
+        time_per_token_us = (gpu_step_ms * 1000.0) / max(1, effective_global_batch_tokens)
+        fwd_pct = (gpu_fwd_ms / max(1e-3, gpu_step_ms)) * 100.0
+        bwd_pct = (gpu_bwd_ms / max(1e-3, gpu_step_ms)) * 100.0
+        opt_pct = (gpu_opt_ms / max(1e-3, gpu_step_ms)) * 100.0
 
         # Step timing, speed and hardware utilization
         t_step_now = time.time()
@@ -802,7 +837,20 @@ def train():
         # 2-pulse run is not reported as if it did K=3 work.
         flops_per_tok = 2.05e-3 * (args.num_pulses / 3.0)   # GFLOPs per token
         achieved_tflops = tok_per_sec * flops_per_tok
-        mfu_pct = (achieved_tflops / 60.0) * 100.0  # 60 TFLOPs dense BF16 baseline (RTX 4060 Laptop)
+
+        # Dynamic GPU detection for peak dense BF16 TFLOPS and physical VRAM
+        dev_name = torch.cuda.get_device_name(0).upper() if torch.cuda.is_available() else ""
+        if "B300" in dev_name or "B200" in dev_name:
+            peak_tflops = 2250.0
+        elif "H200" in dev_name or "H100" in dev_name:
+            peak_tflops = 989.0
+        elif "A100" in dev_name:
+            peak_tflops = 312.0
+        elif "4060" in dev_name:
+            peak_tflops = 60.0
+        else:
+            peak_tflops = 100.0
+        mfu_pct = (achieved_tflops / peak_tflops) * 100.0
 
         # Loss delta, elapsed time & ETA calculation
         loss_delta = (accum_loss - prev_train_loss) if prev_train_loss is not None else 0.0
@@ -811,6 +859,7 @@ def train():
 
         vram_reserved = torch.cuda.memory_reserved() / 1e9 if torch.cuda.is_available() else 0.0
         vram_peak = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
+        total_vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9 if torch.cuda.is_available() else 0.0
 
         def to_val(v, default=0.0):
             if v is None:
@@ -875,9 +924,9 @@ def train():
         print(f"  ↳ MoE Experts: [{moe_str}] | Conf: {conf:4.2f} | MaxBias: {max_bias:5.3f}{drop_str}")
         print(f"  ↳ Pulses: {pulses_str} | λ: {mix_lambda:.3f}")
         print(
-            f"  ↳ Gradients: Total: {total_grad_norm:5.2f} (Muon: {muon_grad_norm:4.2f}, Adam: {adam_grad_norm:4.2f})\n"
-            f"  ↳ Learning Rates: [Muon: {current_muon_lr:7.5f}, Adam: {current_adam_lr:.1e}]\n"
-            f"  ↳ Performance: {tok_per_sec/1e3:4.1f}k tok/s ({mfu_pct:4.1f}% MFU) | Step: {step_dt:4.2f}s (fwd: {t_fwd_total:4.2f}s, bwd: {t_bwd_total:4.2f}s, opt: {t_opt_total:4.2f}s) | VRAM: {vram_peak:3.1f}GB / 8.0GB"
+            f"  ↳ Gradients: Total: {total_grad_norm:5.2f} (Muon: {muon_grad_norm:4.2f}, Adam: {adam_grad_norm:4.2f}) | LR: [Muon: {current_muon_lr:7.5f}, Adam: {current_adam_lr:.1e}]\n"
+            f"  ↳ Profiling: GPU: {gpu_step_ms:5.1f}ms ({tok_per_sec/1e3:4.1f}k tok/s | {time_per_token_us:4.2f}µs/tok) [Fwd: {gpu_fwd_ms:5.1f}ms ({fwd_pct:2.0f}%), Bwd: {gpu_bwd_ms:5.1f}ms ({bwd_pct:2.0f}%), Opt: {gpu_opt_ms:4.1f}ms ({opt_pct:2.0f}%)]\n"
+            f"  ↳ Hardware:  VRAM: {vram_peak:4.1f}GB / {total_vram_gb:4.1f}GB ({vram_peak/max(1e-2, total_vram_gb)*100:4.1f}% util, Reserved: {vram_reserved:4.1f}GB) | Compute: {achieved_tflops:5.1f} TF ({mfu_pct:4.1f}% MFU / {peak_tflops:.0f} TF peak)"
         )
 
         val_loss = None
@@ -1003,7 +1052,15 @@ def train():
             "lr_adam": round(current_adam_lr, 6),
             "tok_per_sec": round(tok_per_sec, 1),
             "mfu_pct": round(mfu_pct, 1),
+            "achieved_tflops": round(achieved_tflops, 1),
+            "gpu_step_ms": round(gpu_step_ms, 2),
+            "gpu_fwd_ms": round(gpu_fwd_ms, 2),
+            "gpu_bwd_ms": round(gpu_bwd_ms, 2),
+            "gpu_opt_ms": round(gpu_opt_ms, 2),
+            "time_per_token_us": round(time_per_token_us, 2),
             "vram_peak": round(vram_peak, 2),
+            "vram_reserved": round(vram_reserved, 2),
+            "total_vram_gb": round(total_vram_gb, 2),
             "router_confidence": round(conf, 4),
             "router_max_bias": round(max_bias, 4),
             "expert_pcts": [round(x, 2) for x in e_pcts],
@@ -1049,12 +1106,14 @@ def train():
         # Write to CSV
         csv_file = os.path.join(args.checkpoint_dir, "metrics.csv")
         csv_exists = os.path.exists(csv_file)
+        e_cols = [f"e{i}" for i in range(cfg.n_routed_experts)]
+        e_vals = [round(e_pcts[i], 2) if i < len(e_pcts) else 0.0 for i in range(cfg.n_routed_experts)]
         with open(csv_file, "a", encoding="utf-8") as f:
             if not csv_exists:
                 header = [
                     "step", "tokens_seen", "train_loss", "loss_delta", "train_ppl", "val_loss",
                     "pulse_l1", "pulse_l2", "pulse_l3", "delta_h1", "delta_h2", "delta_h3",
-                    "e0", "e1", "e2", "e3", "e4", "e5", "e6", "e7", "router_conf", "max_bias", "mix_lambda",
+                    *e_cols, "router_conf", "max_bias", "mix_lambda",
                     "grad_total", "grad_muon", "grad_adam",
                     "lr_muon", "lr_adam", "tok_per_sec", "mfu_pct", "vram_peak",
                 ]
@@ -1066,14 +1125,7 @@ def train():
                 round(val_loss, 4) if val_loss is not None else "",
                 *l_row,
                 *d_row,
-                round(e_pcts[0], 2) if len(e_pcts) > 0 else 0.0,
-                round(e_pcts[1], 2) if len(e_pcts) > 1 else 0.0,
-                round(e_pcts[2], 2) if len(e_pcts) > 2 else 0.0,
-                round(e_pcts[3], 2) if len(e_pcts) > 3 else 0.0,
-                round(e_pcts[4], 2) if len(e_pcts) > 4 else 0.0,
-                round(e_pcts[5], 2) if len(e_pcts) > 5 else 0.0,
-                round(e_pcts[6], 2) if len(e_pcts) > 6 else 0.0,
-                round(e_pcts[7], 2) if len(e_pcts) > 7 else 0.0,
+                *e_vals,
                 round(conf, 4), round(max_bias, 4), round(mix_lambda, 4),
                 round(total_grad_norm, 2), round(muon_grad_norm, 2), round(adam_grad_norm, 2),
                 round(current_muon_lr, 6), round(current_adam_lr, 6),

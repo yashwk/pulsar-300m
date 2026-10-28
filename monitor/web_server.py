@@ -892,6 +892,17 @@ def run_server(port: int = 7860, host: str = "127.0.0.1"):
         httpd.server_close()
 
 
+def set_checkpoint_dir(new_dir: str):
+    global CHECKPOINT_DIR, LIVE_STATUS_FILE, METRICS_JSONL_FILE, GRPO_STATUS_FILE, GRPO_METRICS_FILE, RUN_CONFIG_FILE, _v2_incremental_reader
+    CHECKPOINT_DIR = new_dir
+    LIVE_STATUS_FILE = os.path.join(CHECKPOINT_DIR, "live_status.json")
+    METRICS_JSONL_FILE = os.path.join(CHECKPOINT_DIR, "metrics.jsonl")
+    GRPO_STATUS_FILE = os.path.join(CHECKPOINT_DIR, "grpo_status.json")
+    GRPO_METRICS_FILE = os.path.join(CHECKPOINT_DIR, "grpo_metrics.jsonl")
+    RUN_CONFIG_FILE = os.path.join(CHECKPOINT_DIR, "run_config.json")
+    _v2_incremental_reader = IncrementalMetricsReader(METRICS_JSONL_FILE)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Pulsar Web Dashboard Server")
     parser.add_argument("--port", type=int, default=7860, help="Server port (default: 7860)")
@@ -913,15 +924,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.checkpoint_dir:
-        CHECKPOINT_DIR = args.checkpoint_dir
-        LIVE_STATUS_FILE = os.path.join(CHECKPOINT_DIR, "live_status.json")
+        set_checkpoint_dir(args.checkpoint_dir)
 
     _OVERRIDES.clear()
     if args.warmup_steps is not None:
         _OVERRIDES["warmup_steps"] = args.warmup_steps
     if args.cooldown_steps is not None:
         _OVERRIDES["cooldown_steps"] = args.cooldown_steps
-
-    METRICS_JSONL_FILE = os.path.join(CHECKPOINT_DIR, "metrics.jsonl")
 
     run_server(port=args.port, host=args.host)

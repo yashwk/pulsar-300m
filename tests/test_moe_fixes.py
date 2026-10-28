@@ -139,3 +139,72 @@ def test_zloss_scales_with_loss_division():
     g43 = grad_after(43)
     ratio = (g43.norm() / g1.norm()).item()
     assert abs(ratio - 1 / 43) < 0.02 * (1 / 43), f"expected 1/43 scaling, got {ratio:.5f}"
+
+
+# ---------------------------------------------------------------------------
+# DeepSeekMoE decoupled shared expert and vectorized E=16, top_k=4 routing
+# ---------------------------------------------------------------------------
+
+def test_decoupled_shared_expert_summary():
+    """Shared expert width must be decoupled from d_expert in configuration and summary."""
+    from src.model import PulsarConfig, PulsarForCausalLM
+
+    cfg = PulsarConfig(
+        vocab_size=32768,
+        d_model=1024,
+        d_expert=512,
+        d_shared=1024,
+        n_routed_experts=16,
+        top_k=4,
+    )
+    model = PulsarForCausalLM(cfg)
+    summary = model.get_model_summary()
+
+    assert summary["d_shared"] == 1024
+    assert summary["d_expert"] == 512
+    assert summary["n_routed_experts"] == 16
+    assert summary["top_k"] == 4
+    # active_ffn_dim = d_shared + top_k * d_expert = 1024 + 4 * 512 = 3072
+    assert summary["active_ffn_dim"] == 3072
+    assert model.core[0].mlp.shared_expert.d_ff == 1024
+    assert model.core[0].mlp.routed_gate_up.shape == (16, 1024, 1024)
+    assert model.core[0].mlp.routed_down.shape == (16, 512, 1024)
+
+
+def test_fine_grained_moe_e16_top4_vectorized_forward_backward():
+    """PulsarMoEMLP with E=16, top_k=4 must route dynamically and propagate clean gradients."""
+    from src.model import PulsarConfig, PulsarMoEMLP
+
+    cfg = PulsarConfig(
+        vocab_size=1024,
+        d_model=128,
+        d_expert=64,
+        d_shared=128,
+        n_routed_experts=16,
+        top_k=4,
+        max_pulses=2,
+    )
+    torch.manual_seed(42)
+    mlp = PulsarMoEMLP(cfg).float()
+
+    B, T, D = 2, 16, 128
+    x = torch.randn(B, T, D, requires_grad=True)
+    out, z_loss, mean_max_weight, bincounts = mlp(x, pulse_idx=0)
+
+    assert out.shape == (B, T, D)
+    assert not torch.isnan(out).any()
+    assert bincounts.shape == (16,)
+    assert 0.0 < mean_max_weight <= 1.0
+
+    loss = out.sum() + z_loss
+    loss.backward()
+
+    assert x.grad is not None
+    assert not torch.isnan(x.grad).any()
+    assert mlp.routed_gate_up.grad is not None
+    assert not torch.isnan(mlp.routed_gate_up.grad).any()
+    assert mlp.routed_down.grad is not None
+    assert not torch.isnan(mlp.routed_down.grad).any()
+    assert mlp.shared_expert.w_down.weight.grad is not None
+    assert not torch.isnan(mlp.shared_expert.w_down.weight.grad).any()
+

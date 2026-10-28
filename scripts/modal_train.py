@@ -14,7 +14,7 @@ import modal
 data_vol = modal.Volume.from_name("pulsar-data", create_if_missing=True)
 ckpt_vol = modal.Volume.from_name("pulsar-checkpoints", create_if_missing=True)
 
-# 2. PyTorch CUDA Image supporting sm_100 (Blackwell) & sm_90 (Hopper)
+# 2. PyTorch CUDA Image supporting sm_103 (Blackwell Ultra), sm_100 (Blackwell) & sm_90 (Hopper)
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
@@ -24,6 +24,12 @@ image = (
         "tiktoken",
         "tqdm",
     )
+    .env({
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        "TORCHINDUCTOR_CACHE_DIR": "/root/.inductor_cache",
+        "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+        "PYTHONUNBUFFERED": "1",
+    })
     .add_local_dir("src", remote_path="/root/src")
     .add_local_dir("data/pulsar_tokenizer", remote_path="/root/pulsar_tokenizer")
 )
@@ -52,6 +58,11 @@ def execute_training(
     """Core training harness with background volume sync."""
     ckpt_vol.reload()
     data_vol.reload()
+
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained("/root/pulsar_tokenizer")
+    assert len(tok) == 32768, f"Modal container tokenizer vocab size mismatch: expected 32768, got {len(tok)}"
+    print(f"[Modal Trainer] Verified container tokenizer vocabulary size: {len(tok):,} tokens")
 
     # Launch periodic volume committer so telemetry streams live
     stop_event = threading.Event()
@@ -83,7 +94,7 @@ def execute_training(
         "--adam-lr", str(adam_lr),
         "--bias-lr", "0.01",
         "--muon-momentum-fp32",
-        "--moe-capacity-factor", "1.50",
+        "--moe-capacity-factor", "1.25",
         "--sampler", "flat",
         "--eval-every", str(eval_every),
         "--eval-iters", "10",
@@ -108,6 +119,16 @@ def execute_training(
         stop_event.set()
         ckpt_vol.commit()
         print("\n[Modal Checkpoints] Training session finished. Checkpoints successfully committed to 'pulsar-checkpoints' volume.")
+
+
+@app.function(
+    image=image,
+    gpu="B300",
+    timeout=60 * 60 * 4,
+    volumes={"/root/data": data_vol, "/checkpoints": ckpt_vol},
+)
+def train_remote_b300(**kwargs):
+    execute_training(**kwargs)
 
 
 @app.function(
@@ -142,11 +163,11 @@ def train_remote_h100(**kwargs):
 
 @app.local_entrypoint()
 def main(
-    gpu: str = "B200",
+    gpu: str = "B300",
     train_shards: str = ALL_TRAIN_SHARDS,
     val_shards: str = ALL_VAL_SHARDS,
     target_step: int = 30,
-    mbs: int = 8,
+    mbs: int = 64,
     global_batch_tokens: int = 131072,
     seq_len: int = 1024,
     muon_lr: float = 0.02,
@@ -176,24 +197,17 @@ def main(
     selected_gpu = gpu.upper()
     print(f"\n[Modal Orchestrator] Target GPU: {selected_gpu} | Target Step: {target_step} | MBS: {mbs}")
 
-    if selected_gpu == "B200":
-        try:
-            print("[Modal Orchestrator] Attempting to provision Priority 1: NVIDIA B200 (Blackwell)...")
-            train_remote_b200.remote(**kwargs)
-            return
-        except Exception as e:
-            print(f"[Modal Orchestrator] B200 allocation unavailable ({e}). Falling back to Priority 2: H200...")
-            selected_gpu = "H200"
-
-    if selected_gpu == "H200":
-        try:
-            print("[Modal Orchestrator] Attempting to provision Priority 2: NVIDIA H200...")
-            train_remote_h200.remote(**kwargs)
-            return
-        except Exception as e:
-            print(f"[Modal Orchestrator] H200 allocation unavailable ({e}). Falling back to Priority 3: H100...")
-            selected_gpu = "H100"
-
-    if selected_gpu == "H100":
-        print("[Modal Orchestrator] Provisioning Priority 3: NVIDIA H100...")
+    if selected_gpu == "B300":
+        print("[Modal Orchestrator] Provisioning NVIDIA B300 SXM6 (Blackwell Ultra)...")
+        train_remote_b300.remote(**kwargs)
+    elif selected_gpu == "B200":
+        print("[Modal Orchestrator] Provisioning NVIDIA B200 (Blackwell)...")
+        train_remote_b200.remote(**kwargs)
+    elif selected_gpu == "H200":
+        print("[Modal Orchestrator] Provisioning NVIDIA H200...")
+        train_remote_h200.remote(**kwargs)
+    elif selected_gpu == "H100":
+        print("[Modal Orchestrator] Provisioning NVIDIA H100...")
         train_remote_h100.remote(**kwargs)
+    else:
+        raise ValueError(f"Unsupported GPU selection: {selected_gpu}")

@@ -48,6 +48,7 @@ def make_cfg(**overrides) -> PulsarConfig:
         n_kv_heads=2,
         head_dim=32,
         d_expert=128,
+        d_shared=128,
         n_core=2,
         max_pulses=4,
         default_pulses=3,

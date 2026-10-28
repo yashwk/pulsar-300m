@@ -264,13 +264,13 @@ def train_pulsar_tokenizer(save_dir: str = "data/pulsar_tokenizer"):
     tok.decoder = decoders.ByteLevel()
 
     trainer = BpeTrainer(
-        vocab_size=49152,
+        vocab_size=32768,
         special_tokens=SPECIAL_TOKENS,
         initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
         show_progress=True,
     )
 
-    print(f"[Pulsar-Tokenizer] Training Rust Byte-Level BPE from '{corpus_file}' (Vocab: 49,152)...")
+    print(f"[Pulsar-Tokenizer] Training Rust Byte-Level BPE from '{corpus_file}' (Vocab: 32,768)...")
     tok.train(files=[corpus_file], trainer=trainer)
     t_train = time.time() - t0
     print(f"[Pulsar-Tokenizer] Training completed in {t_train:.1f}s!")

@@ -11,12 +11,13 @@ import torch.nn.functional as F
 
 @dataclass
 class PulsarConfig:
-    vocab_size: int = 49152
+    vocab_size: int = 32768
     d_model: int = 1024
     n_heads: int = 16
     n_kv_heads: int = 4
     head_dim: int = 64
-    d_expert: int = 1024
+    d_expert: int = 512
+    d_shared: int | None = None
     n_core: int = 8  # 8 core layers recurrently looped K times
     max_pulses: int = 8
     default_pulses: int = 3
@@ -30,8 +31,8 @@ class PulsarConfig:
     # and is only sane for small T - it is kept as the reference implementation for
     # tests, not for production long context.
     local_attn_impl: str = "auto"
-    n_routed_experts: int = 8
-    top_k: int = 2
+    n_routed_experts: int = 16
+    top_k: int = 4
     eos_token_id: int = 0
     rms_eps: float = 1e-6
     ce_chunk_size: int = 4096
@@ -48,7 +49,7 @@ class PulsarConfig:
     # drops were common and invisible. 1.12 with 32-alignment gives 864 slots at
     # N=3072 (vs 832 at 1.08/64). Capacity is a runtime setting: it changes no
     # checkpoint format, so it can be raised mid-run if the logged drop rate is high.
-    moe_capacity_factor: float = 1.12
+    moe_capacity_factor: float = 1.25
     moe_capacity_align: int = 32
     # Per-pulse balancing bias. Drops are a per-pulse phenomenon (early pulses route
     # differently from late ones), so a single across-pulse bias can leave one pulse
@@ -59,6 +60,10 @@ class PulsarConfig:
     # single global bias vector is diluted by whichever pulse needs no correction.
     # Migration for old [E] checkpoints is handled in _migrate_checkpoint_bias().
     per_pulse_bias: bool = True
+
+    def __post_init__(self):
+        if self.d_shared is None:
+            self.d_shared = 1024 if self.d_model >= 1024 else self.d_expert
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -713,7 +718,8 @@ class PulsarMoEMLP(nn.Module):
     def __init__(self, cfg: PulsarConfig):
         super().__init__()
         self.cfg = cfg
-        self.shared_expert = SwiGLUMLP(cfg.d_model, cfg.d_expert)
+        d_shared = cfg.d_shared if cfg.d_shared is not None else cfg.d_expert
+        self.shared_expert = SwiGLUMLP(cfg.d_model, d_shared)
 
         # 3D Contiguous Expert Parameters: [n_routed_experts, d_in, d_out]
         # Eliminates torch.stack overhead entirely (saving ~36 ms per micro-batch)
@@ -807,14 +813,16 @@ class PulsarMoEMLP(nn.Module):
             z_loss = self.cfg.router_z_loss_weight * lse_sq.mean()
         if (HAS_PULSAR_CUDA and logits.is_cuda
                 and not torch.compiler.is_compiling()
-                and hasattr(pulsar_cuda, "moe_router_topk_forward")):
+                and hasattr(pulsar_cuda, "moe_router_topk_forward")
+                and self.cfg.n_routed_experts == 8
+                and self.cfg.top_k == 2):
             bias = self.expert_bias[pulse_idx] if self.cfg.per_pulse_bias else self.expert_bias
             topk_idx, topk_weights = _FusedMoERouterFunction.apply(logits, bias)
         else:
             scores = torch.sigmoid(logits.float())
             bias = self.expert_bias[pulse_idx] if self.cfg.per_pulse_bias else self.expert_bias
             biased_scores = scores + bias
-            _, topk_idx = torch.topk(biased_scores, k=self.cfg.top_k, dim=-1)  # [N, 2]
+            _, topk_idx = torch.topk(biased_scores, k=self.cfg.top_k, dim=-1)  # [N, K]
             topk_raw = torch.gather(scores, -1, topk_idx)
             topk_weights = (topk_raw / (topk_raw.sum(dim=-1, keepdim=True) + 1e-6)).to(x.dtype)
 
@@ -905,28 +913,37 @@ class PulsarMoEMLP(nn.Module):
             )
             out = (shared_out + routed_only * r_scale).view(B, T, D)
         else:
-            # Fallback for CPU / environments without custom CUDA extension.
-            # Applies the SAME capacity and drop rule as the CUDA path, so CPU
-            # evaluation matches training. Without this, CPU evals silently used
-            # unlimited capacity while training dropped assignments.
+            # Fallback for CPU, non-bf16, torch.compile, or environments without custom CUDA extension.
+            # Vectorized PyTorch MoE engine: zero Python loops over experts, zero dynamic shape
+            # graph breaks, and zero NaN poisoning (strictly initialized with torch.zeros).
             flat_token_idx = torch.arange(N, device=x.device).unsqueeze(1).expand(N, self.cfg.top_k).reshape(-1)
             flat_expert_ids = topk_idx.reshape(-1)
             flat_weights = topk_weights.reshape(-1).to(x.dtype)
             flat_slots = token_to_slot.reshape(-1)
+            E = self.cfg.n_routed_experts
+            C = capacity
 
-            routed_out = torch.zeros_like(x_flat)
-            for e in range(self.cfg.n_routed_experts):
-                sel = (flat_expert_ids == e) & (flat_slots >= 0)
-                if not bool(sel.any()):
-                    continue
-                rows = sel.nonzero().squeeze(-1)
-                idx_e = flat_token_idx[rows]
-                e_in = x_flat[idx_e]
-                gu_e = F.linear(e_in, self.routed_gate_up[e].t())
-                act_e = _FusedSwiGLUFunction.apply(gu_e, self.cfg.d_expert)
-                e_out = F.linear(act_e, self.routed_down[e].t())
-                w_e = flat_weights[rows].unsqueeze(-1)
-                routed_out.index_add_(0, idx_e, (e_out * w_e).to(x.dtype))
+            valid_mask = (flat_slots >= 0) & (flat_expert_ids >= 0) & (flat_expert_ids < E)
+            clamped_slot = flat_slots.clamp(min=0).long()
+            dest_idx = flat_expert_ids * C + clamped_slot
+
+            valid_tokens = torch.where(valid_mask.unsqueeze(-1), x_flat[flat_token_idx], torch.zeros_like(x_flat[flat_token_idx]))
+            expert_inputs_flat = torch.zeros(E * C, D, device=x.device, dtype=x.dtype)
+            expert_inputs_flat.index_add_(0, dest_idx, valid_tokens)
+            expert_inputs = expert_inputs_flat.view(E, C, D).to(self.routed_gate_up.dtype)
+
+            # Batched 3D GEMMs with ZERO weight stacking
+            gu = torch.bmm(expert_inputs, self.routed_gate_up)
+            act = _FusedSwiGLUFunction.apply(gu, self.cfg.d_expert)
+            expert_out = torch.bmm(act, self.routed_down.to(act.dtype))
+
+            # Vectorized gather
+            expert_out_flat = expert_out.view(E * C, D)
+            w = torch.where(valid_mask.unsqueeze(-1), flat_weights.unsqueeze(-1), torch.zeros_like(flat_weights.unsqueeze(-1)))
+            contrib = (w * expert_out_flat[dest_idx]).to(x.dtype)
+
+            routed_out = torch.zeros(N, D, device=x.device, dtype=x.dtype)
+            routed_out.index_add_(0, flat_token_idx, contrib)
 
             r_scale = self.routed_scale[pulse_idx].to(x.dtype)
             out = (shared_out + routed_out * r_scale).view(B, T, D)
@@ -1572,7 +1589,8 @@ class PulsarForCausalLM(nn.Module):
             (self.cfg.n_heads + 2 * self.cfg.n_kv_heads) * self.cfg.head_dim * self.cfg.d_model
             + self.cfg.d_model * self.cfg.d_model
         )
-        shared_mlp = 3 * self.cfg.d_model * self.cfg.d_expert
+        d_shared = self.cfg.d_shared if self.cfg.d_shared is not None else self.cfg.d_expert
+        shared_mlp = 3 * self.cfg.d_model * d_shared
         routed_mlp = self.cfg.top_k * (3 * self.cfg.d_model * self.cfg.d_expert)
         non_embed_active = self.cfg.n_core * (per_block_attn + shared_mlp + routed_mlp)
         active_params = self.cfg.vocab_size * self.cfg.d_model + non_embed_active
@@ -1590,10 +1608,11 @@ class PulsarForCausalLM(nn.Module):
             "n_kv_heads": self.cfg.n_kv_heads,
             "head_dim": self.cfg.head_dim,
             "d_expert": self.cfg.d_expert,
+            "d_shared": d_shared,
             "n_routed_experts": self.cfg.n_routed_experts,
             "n_shared_experts": 1,
             "top_k": self.cfg.top_k,
-            "active_ffn_dim": self.cfg.d_expert * (1 + self.cfg.top_k),
+            "active_ffn_dim": d_shared + self.cfg.top_k * self.cfg.d_expert,
             "vocab_size": self.cfg.vocab_size,
             "max_seq_len": self.cfg.max_seq_len,
         }

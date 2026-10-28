@@ -340,3 +340,61 @@ def test_step0_loss_and_variance_matching():
         f"(shared {rs:.5f}, routed {rr:.5f}); expected within [0.5, 2.0]"
     )
 
+
+def test_canary_with_compiled_blocks():
+    """generate_canary must unwrap compiled blocks during generation and restore them afterward."""
+    from src.model import PulsarConfig, PulsarForCausalLM
+    from src.train import generate_canary
+
+    cfg = PulsarConfig(
+        vocab_size=256,
+        d_model=64,
+        d_expert=32,
+        d_shared=64,
+        n_routed_experts=4,
+        top_k=2,
+        n_core=2,
+        default_pulses=2,
+    )
+    torch.manual_seed(42)
+    model = PulsarForCausalLM(cfg).float()
+    model.eval()
+
+    # Compile blocks with dynamic=False
+    if hasattr(torch, "compile"):
+        for i in range(len(model.core)):
+            model.core[i] = torch.compile(model.core[i], dynamic=False)
+
+    # 1. Run a fixed-shape forward pass (B=2, T=16)
+    x = torch.randint(0, cfg.vocab_size, (2, 16))
+    with torch.no_grad():
+        out, _, _ = model(x)
+    assert out.shape == (2, 16, cfg.vocab_size)
+
+    # 2. Mock tokenizer with prompt of length 6
+    class MockTokenizer:
+        eos_token_id = 0
+        unk_token_id = 1
+
+        def encode(self, prompt, return_tensors="pt"):
+            return torch.tensor([[10, 20, 30, 40, 50, 60]], dtype=torch.long)
+
+        def decode(self, ids, skip_special_tokens=False):
+            return "decoded canary text"
+
+        def convert_tokens_to_ids(self, s):
+            return 0
+
+    tok = MockTokenizer()
+
+    # 3. Call generate_canary (B=1, T=6..14)
+    # Must succeed without RuntimeError and return valid string
+    res = generate_canary(model, tok, "test prompt", max_new_tokens=8, device="cpu")
+    assert isinstance(res, str)
+    assert len(res) > 0
+
+    # 4. Verify compiled blocks were restored
+    if hasattr(torch, "compile"):
+        for blk in model.core:
+            assert hasattr(blk, "_orig_mod"), "Compiled core block was not restored after generate_canary"
+

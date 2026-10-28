@@ -1366,8 +1366,10 @@ class PulsarForCausalLM(nn.Module):
                     and not torch.compiler.is_compiling()
                     and hasattr(pulsar_cuda, "fused_softcap_ce_forward")):
                 part = _FusedSoftcapCrossEntropyFunction.apply(raw, tc, self.cfg.logit_softcap, "sum", -100)
-            else:
+            elif raw.is_cuda:
                 part = _compiled_softcap_ce(raw, tc, self.cfg.logit_softcap, "sum", -100)
+            else:
+                part = _softcap_cross_entropy(raw, tc, self.cfg.logit_softcap, "sum", -100)
             total = total + part
         # Divide by VALID tokens, not the total: ignored (-100) positions contribute
         # zero to the sum, so dividing by all tokens deflates the loss (and its
@@ -1520,8 +1522,16 @@ class PulsarForCausalLM(nn.Module):
                                 "mean",
                                 -100,
                             )
-                        else:
+                        elif raw_logits_sub.is_cuda:
                             loss_sub = _compiled_softcap_ce(
+                                raw_logits_sub.view(-1, self.cfg.vocab_size),
+                                lbl_sub.view(-1),
+                                self.cfg.logit_softcap,
+                                "mean",
+                                -100,
+                            )
+                        else:
+                            loss_sub = _softcap_cross_entropy(
                                 raw_logits_sub.view(-1, self.cfg.vocab_size),
                                 lbl_sub.view(-1),
                                 self.cfg.logit_softcap,

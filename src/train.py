@@ -188,9 +188,13 @@ def generate_canary(
         except Exception:
             pass
 
-    disable_ctx = torch._dynamo.disable() if hasattr(torch, "_dynamo") else contextlib.nullcontext()
-    with torch.no_grad():
-        with disable_ctx:
+    compiled_blocks = list(raw_model.core)
+    for i, blk in enumerate(compiled_blocks):
+        if hasattr(blk, "_orig_mod"):
+            raw_model.core[i] = blk._orig_mod
+
+    try:
+        with torch.no_grad():
             for _ in range(max_new_tokens):
                 context_window = input_ids[:, -1024:]
                 logits, _, _ = raw_model(context_window, labels=None)
@@ -212,6 +216,9 @@ def generate_canary(
 
                 if next_token.item() in stop_token_ids:
                     break
+    finally:
+        for i, blk in enumerate(compiled_blocks):
+            raw_model.core[i] = blk
 
     if was_training:
         model.train()

@@ -56,6 +56,12 @@ def execute_training(
     compile: bool = True,
     output_ckpt: str = None,
     max_steps: int = None,
+    warmup_steps: int = 300,
+    sampler: str = "bestfit",
+    num_pulses: int = 3,
+    moe_capacity_factor: float = 1.25,
+    bias_lr: float = 0.01,
+    per_pulse_bias: bool = True,
 ):
     """Core training harness with background volume sync."""
     ckpt_vol.reload()
@@ -91,20 +97,25 @@ def execute_training(
         "--global-batch-tokens", str(global_batch_tokens),
         "--max-steps", str(effective_max_steps),
         "--target-step", str(target_step),
-        "--warmup-steps", "150",
+        "--warmup-steps", str(warmup_steps),
         "--cooldown-steps", "0",
         "--lr-schedule", "wsd",
         "--muon-lr", str(muon_lr),
         "--adam-lr", str(adam_lr),
-        "--bias-lr", "0.01",
+        "--bias-lr", str(bias_lr),
         "--muon-momentum-fp32",
-        "--moe-capacity-factor", "1.25",
-        "--sampler", "flat",
+        "--moe-capacity-factor", str(moe_capacity_factor),
+        "--sampler", sampler,
+        "--num-pulses", str(num_pulses),
         "--eval-every", str(eval_every),
         "--eval-iters", "10",
         "--save-every", str(save_every),
         "--checkpoint-dir", "/checkpoints",
     ]
+    if per_pulse_bias:
+        cmd.append("--per-pulse-bias")
+    else:
+        cmd.append("--no-per-pulse-bias")
     if compile:
         cmd.append("--compile")
     if output_ckpt:
@@ -172,12 +183,18 @@ def main(
     val_shards: str = ALL_VAL_SHARDS,
     target_step: int = 30,
     max_steps: int = None,
-    mbs: int = 64,
+    mbs: int = 128,
     global_batch_tokens: int = 131072,
     seq_len: int = 1024,
+    warmup_steps: int = 300,
+    sampler: str = "bestfit",
+    num_pulses: int = 3,
+    moe_capacity_factor: float = 1.25,
+    bias_lr: float = 0.01,
+    per_pulse_bias: bool = True,
     muon_lr: float = 0.02,
     adam_lr: float = 6e-4,
-    eval_every: int = 10,
+    eval_every: int = 15,
     save_every: int = 30,
     resume: str = None,
     compile: bool = True,
@@ -191,6 +208,12 @@ def main(
         "micro_batch_size": mbs,
         "global_batch_tokens": global_batch_tokens,
         "seq_len": seq_len,
+        "warmup_steps": warmup_steps,
+        "sampler": sampler,
+        "num_pulses": num_pulses,
+        "moe_capacity_factor": moe_capacity_factor,
+        "bias_lr": bias_lr,
+        "per_pulse_bias": per_pulse_bias,
         "muon_lr": muon_lr,
         "adam_lr": adam_lr,
         "eval_every": eval_every,

@@ -501,6 +501,35 @@ std::vector<torch::Tensor> swiglu_backward_cuda(torch::Tensor dout, torch::Tenso
 // ------------------------------------------------------------------------
 // 3b. Fused SwiGLU: direct [..., 2*d_ff] -> [..., d_ff] (zero .chunk/.contiguous overhead)
 // ------------------------------------------------------------------------
+__global__ void fused_swiglu_forward_vec8_kernel(
+    const __nv_bfloat16* __restrict__ gu,
+    __nv_bfloat16* __restrict__ out,
+    int N,
+    int d_ff,
+    int vec_per_row
+) {
+    int v_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_vec = N * vec_per_row;
+    if (v_idx < total_vec) {
+        int r = v_idx / vec_per_row;
+        int vc = v_idx % vec_per_row;
+        int row_offset = r * (2 * d_ff);
+        uint4 g_u4 = *reinterpret_cast<const uint4*>(gu + row_offset + vc * 8);
+        uint4 u_u4 = *reinterpret_cast<const uint4*>(gu + row_offset + d_ff + vc * 8);
+        const __nv_bfloat16* g_bf = reinterpret_cast<const __nv_bfloat16*>(&g_u4);
+        const __nv_bfloat16* u_bf = reinterpret_cast<const __nv_bfloat16*>(&u_u4);
+
+        __nv_bfloat16 out_bf[8];
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            float g_val = __bfloat162float(g_bf[k]);
+            float u_val = __bfloat162float(u_bf[k]);
+            out_bf[k] = __float2bfloat16(silu_fast(g_val) * u_val);
+        }
+        *reinterpret_cast<uint4*>(out + v_idx * 8) = *reinterpret_cast<uint4*>(out_bf);
+    }
+}
+
 __global__ void fused_swiglu_forward_kernel(
     const __nv_bfloat16* __restrict__ gu,
     __nv_bfloat16* __restrict__ out,
@@ -516,6 +545,45 @@ __global__ void fused_swiglu_forward_kernel(
         float g_val = __bfloat162float(gu[row_offset + c]);
         float u_val = __bfloat162float(gu[row_offset + d_ff + c]);
         out[idx] = __float2bfloat16(silu_fast(g_val) * u_val);
+    }
+}
+
+__global__ void fused_swiglu_backward_vec8_kernel(
+    const __nv_bfloat16* __restrict__ dout,
+    const __nv_bfloat16* __restrict__ gu,
+    __nv_bfloat16* __restrict__ dgu,
+    int N,
+    int d_ff,
+    int vec_per_row
+) {
+    int v_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_vec = N * vec_per_row;
+    if (v_idx < total_vec) {
+        int r = v_idx / vec_per_row;
+        int vc = v_idx % vec_per_row;
+        int row_offset = r * (2 * d_ff);
+
+        uint4 do_u4 = *reinterpret_cast<const uint4*>(dout + v_idx * 8);
+        uint4 g_u4 = *reinterpret_cast<const uint4*>(gu + row_offset + vc * 8);
+        uint4 u_u4 = *reinterpret_cast<const uint4*>(gu + row_offset + d_ff + vc * 8);
+        const __nv_bfloat16* do_bf = reinterpret_cast<const __nv_bfloat16*>(&do_u4);
+        const __nv_bfloat16* g_bf = reinterpret_cast<const __nv_bfloat16*>(&g_u4);
+        const __nv_bfloat16* u_bf = reinterpret_cast<const __nv_bfloat16*>(&u_u4);
+
+        __nv_bfloat16 dg_bf[8];
+        __nv_bfloat16 du_bf[8];
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            float do_val = __bfloat162float(do_bf[k]);
+            float g_val = __bfloat162float(g_bf[k]);
+            float u_val = __bfloat162float(u_bf[k]);
+            float du = do_val * silu_fast(g_val);
+            float dg = do_val * u_val * dsilu_fast(g_val);
+            dg_bf[k] = __float2bfloat16(dg);
+            du_bf[k] = __float2bfloat16(du);
+        }
+        *reinterpret_cast<uint4*>(dgu + row_offset + vc * 8) = *reinterpret_cast<uint4*>(dg_bf);
+        *reinterpret_cast<uint4*>(dgu + row_offset + d_ff + vc * 8) = *reinterpret_cast<uint4*>(du_bf);
     }
 }
 
@@ -555,12 +623,22 @@ torch::Tensor fused_swiglu_forward_cuda(torch::Tensor gu, int64_t d_ff) {
     auto sizes = gu.sizes().vec();
     sizes.back() = d_ff;
     auto out = torch::empty(sizes, gu.options());
-    int total = N * d_ff;
-    fused_swiglu_forward_kernel<<<(total + 255) / 256, 256>>>(
-        reinterpret_cast<const __nv_bfloat16*>(gu.data_ptr<c10::BFloat16>()),
-        reinterpret_cast<__nv_bfloat16*>(out.data_ptr<c10::BFloat16>()),
-        N, (int)d_ff
-    );
+    if (d_ff % 8 == 0) {
+        int vec_per_row = (int)d_ff / 8;
+        int total_vec = N * vec_per_row;
+        fused_swiglu_forward_vec8_kernel<<<(total_vec + 255) / 256, 256>>>(
+            reinterpret_cast<const __nv_bfloat16*>(gu.data_ptr<c10::BFloat16>()),
+            reinterpret_cast<__nv_bfloat16*>(out.data_ptr<c10::BFloat16>()),
+            N, (int)d_ff, vec_per_row
+        );
+    } else {
+        int total = N * d_ff;
+        fused_swiglu_forward_kernel<<<(total + 255) / 256, 256>>>(
+            reinterpret_cast<const __nv_bfloat16*>(gu.data_ptr<c10::BFloat16>()),
+            reinterpret_cast<__nv_bfloat16*>(out.data_ptr<c10::BFloat16>()),
+            N, (int)d_ff
+        );
+    }
     return out;
 }
 
@@ -575,13 +653,24 @@ torch::Tensor fused_swiglu_backward_cuda(torch::Tensor dout, torch::Tensor gu, i
         return dgu;
     }
     int N = total_elements / (2 * d_ff);
-    int total = N * d_ff;
-    fused_swiglu_backward_kernel<<<(total + 255) / 256, 256>>>(
-        reinterpret_cast<const __nv_bfloat16*>(dout.data_ptr<c10::BFloat16>()),
-        reinterpret_cast<const __nv_bfloat16*>(gu.data_ptr<c10::BFloat16>()),
-        reinterpret_cast<__nv_bfloat16*>(dgu.data_ptr<c10::BFloat16>()),
-        N, (int)d_ff
-    );
+    if (d_ff % 8 == 0) {
+        int vec_per_row = (int)d_ff / 8;
+        int total_vec = N * vec_per_row;
+        fused_swiglu_backward_vec8_kernel<<<(total_vec + 255) / 256, 256>>>(
+            reinterpret_cast<const __nv_bfloat16*>(dout.data_ptr<c10::BFloat16>()),
+            reinterpret_cast<const __nv_bfloat16*>(gu.data_ptr<c10::BFloat16>()),
+            reinterpret_cast<__nv_bfloat16*>(dgu.data_ptr<c10::BFloat16>()),
+            N, (int)d_ff, vec_per_row
+        );
+    } else {
+        int total = N * d_ff;
+        fused_swiglu_backward_kernel<<<(total + 255) / 256, 256>>>(
+            reinterpret_cast<const __nv_bfloat16*>(dout.data_ptr<c10::BFloat16>()),
+            reinterpret_cast<const __nv_bfloat16*>(gu.data_ptr<c10::BFloat16>()),
+            reinterpret_cast<__nv_bfloat16*>(dgu.data_ptr<c10::BFloat16>()),
+            N, (int)d_ff
+        );
+    }
     return dgu;
 }
 
@@ -593,20 +682,17 @@ __global__ void rope_forward_kernel(
     __nv_bfloat16* __restrict__ qk_out,
     const float* __restrict__ cos_cache,
     const float* __restrict__ sin_cache,
-    int B, int num_heads, int T, int head_dim
+    int64_t total_rows, int T, int head_dim
 ) {
     int half_dim = head_dim / 2;
-    // Flatten (b, h, t) onto blockIdx.x. The previous layout put T on gridDim.y, whose
-    // hardware limit is 65535, so T >= 65536 failed to launch silently.
-    int row = blockIdx.x;
-    int t = row % T;
-    int h = (row / T) % num_heads;
-    int b = row / (T * num_heads);
     int i = threadIdx.x;
+    int r_in_block = threadIdx.y;
+    int64_t row = (int64_t)blockIdx.x * blockDim.y + r_in_block;
 
-    if (i < half_dim && t < T && h < num_heads && b < B) {
-        int idx1 = b * (num_heads * T * head_dim) + h * (T * head_dim) + t * head_dim + i;
-        int idx2 = idx1 + half_dim;
+    if (row < total_rows && i < half_dim) {
+        int t = (int)(row % T);
+        int64_t idx1 = row * head_dim + i;
+        int64_t idx2 = idx1 + half_dim;
 
         float x1 = __bfloat162float(qk_in[idx1]);
         float x2 = __bfloat162float(qk_in[idx2]);
@@ -628,13 +714,14 @@ torch::Tensor rope_forward_cuda(torch::Tensor qk, torch::Tensor cos, torch::Tens
     TORCH_CHECK(qk.scalar_type() == torch::kBFloat16, "qk must be bfloat16");
 
     auto out = torch::empty_like(qk);
-    // A zero-sized tensor would produce grid.x == 0, which is an invalid launch.
     if (qk.numel() == 0) {
         return out;
     }
-    // One block per (b, h, t) flattened onto x, which supports 2^31-1 blocks.
-    dim3 grid(B * T * num_heads);
-    dim3 block(head_dim / 2);
+    int64_t total_rows = (int64_t)B * num_heads * T;
+    int half_dim = head_dim / 2;
+    int rows_per_block = 8;
+    dim3 block(half_dim, rows_per_block);
+    dim3 grid((total_rows + rows_per_block - 1) / rows_per_block);
 
     auto cos_f = (cos.scalar_type() == torch::kFloat32) ? cos.contiguous() : cos.to(torch::kFloat32).contiguous();
     auto sin_f = (sin.scalar_type() == torch::kFloat32) ? sin.contiguous() : sin.to(torch::kFloat32).contiguous();
@@ -644,7 +731,7 @@ torch::Tensor rope_forward_cuda(torch::Tensor qk, torch::Tensor cos, torch::Tens
         reinterpret_cast<__nv_bfloat16*>(out.data_ptr<c10::BFloat16>()),
         cos_f.data_ptr<float>(),
         sin_f.data_ptr<float>(),
-        B, num_heads, T, head_dim
+        total_rows, T, head_dim
     );
     return out;
 }

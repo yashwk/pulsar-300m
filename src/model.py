@@ -126,17 +126,18 @@ class _RMSNormCUDAFunction(torch.autograd.Function):
 class _FusedQK_RMSNormFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor, weight: torch.Tensor, T: int, eps: float):
+        x_c = x.contiguous()
         weight_f = weight.float().contiguous()
-        y, rsqrt = pulsar_cuda.qk_rmsnorm_forward(x.contiguous(), weight_f, T, eps)
-        ctx.save_for_backward(x, weight, rsqrt)
+        y, rsqrt = pulsar_cuda.qk_rmsnorm_forward(x_c, weight_f, T, eps)
+        ctx.save_for_backward(x_c, weight, rsqrt)
         ctx.T = T
         return y
 
     @staticmethod
     def backward(ctx, dy: torch.Tensor):
-        x, weight, rsqrt = ctx.saved_tensors
+        x_c, weight, rsqrt = ctx.saved_tensors
         weight_f = weight.float().contiguous()
-        dx, dweight = pulsar_cuda.qk_rmsnorm_backward(dy.contiguous(), x.contiguous(), weight_f, rsqrt, ctx.T)
+        dx, dweight = pulsar_cuda.qk_rmsnorm_backward(dy.contiguous(), x_c, weight_f, rsqrt, ctx.T)
         return dx, dweight.to(weight.dtype), None, None
 
 
@@ -467,14 +468,14 @@ class PulsarAttention(nn.Module):
 
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2).contiguous()
 
         # Value-Residual skip connection
         if self.layer_idx == 0 and pulse_idx == 0:
             v_first = v
         elif v_first is not None:
             lv = torch.sigmoid(self.v_resid_lambda[pulse_idx]).to(v.dtype)
-            v = torch.lerp(v, v_first, lv)
+            v = torch.lerp(v, v_first, lv).contiguous()
 
         # Per-Pulse, Per-Head QK-RMSNorm (Fused single-warp reduction CUDA kernel).
         # The kernel is written for head_dim == 64: each of the 32 lanes handles one
@@ -571,6 +572,50 @@ class _FusedSwiGLUFunction(torch.autograd.Function):
         return torch.cat([dgate.to(gu.dtype), dup.to(gu.dtype)], dim=-1), None
 
 
+def _make_sort_key_eager(flat_e: torch.Tensor, flat_w: torch.Tensor) -> torch.Tensor:
+    w_norm = flat_w.clamp_min(0.0) / (1.0 + flat_w.clamp_min(0.0))
+    return flat_e.to(torch.float32) - w_norm * 0.5
+
+
+def _compute_slot_assignment_eager(
+    start_sorted: torch.Tensor, e_sorted: torch.Tensor, capacity: int, order: torch.Tensor
+) -> torch.Tensor:
+    M = e_sorted.shape[0]
+    rank_sorted = torch.arange(M, device=start_sorted.device) - start_sorted[e_sorted]
+    slot_sorted = torch.where(rank_sorted < capacity, rank_sorted.to(torch.int32), torch.full_like(rank_sorted, -1, dtype=torch.int32))
+    slots = torch.empty(M, dtype=torch.int32, device=start_sorted.device)
+    slots[order] = slot_sorted
+    return slots
+
+
+try:
+    _compiled_make_sort_key = torch.compile(_make_sort_key_eager)
+    _compiled_slot_assignment = torch.compile(_compute_slot_assignment_eager)
+except Exception:
+    _compiled_make_sort_key = _make_sort_key_eager
+    _compiled_slot_assignment = _compute_slot_assignment_eager
+
+
+def _make_sort_key(flat_e: torch.Tensor, flat_w: torch.Tensor) -> torch.Tensor:
+    if torch.compiler.is_compiling() or not flat_e.is_cuda:
+        return _make_sort_key_eager(flat_e, flat_w)
+    try:
+        return _compiled_make_sort_key(flat_e, flat_w)
+    except Exception:
+        return _make_sort_key_eager(flat_e, flat_w)
+
+
+def _compute_slot_assignment(
+    start_sorted: torch.Tensor, e_sorted: torch.Tensor, capacity: int, order: torch.Tensor
+) -> torch.Tensor:
+    if torch.compiler.is_compiling() or not start_sorted.is_cuda:
+        return _compute_slot_assignment_eager(start_sorted, e_sorted, capacity, order)
+    try:
+        return _compiled_slot_assignment(start_sorted, e_sorted, capacity, order)
+    except Exception:
+        return _compute_slot_assignment_eager(start_sorted, e_sorted, capacity, order)
+
+
 def compute_token_slots(
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -621,17 +666,13 @@ def compute_token_slots(
         # Single composite key sort: flat_e in [0, E), flat_w >= 0.
         # (expert asc, weight desc) is mapped to ascending order of sort_key in one 32-bit sort:
         # w / (1.0 + w) strictly preserves monotonic ordering for any w in [0, inf) and maps into [0, 1):
-        w_norm = flat_w.clamp_min(0.0) / (1.0 + flat_w.clamp_min(0.0))
-        sort_key = flat_e.to(torch.float32) - w_norm * 0.5
+        sort_key = _make_sort_key(flat_e, flat_w)
         order = torch.argsort(sort_key, stable=True)
         e_sorted = flat_e[order]
         counts_sorted = torch.zeros(num_experts, device=device, dtype=torch.long)
         counts_sorted.index_add_(0, e_sorted, torch.ones(M, device=device, dtype=torch.long))
         start_sorted = counts_sorted.cumsum(0) - counts_sorted
-        rank_sorted = torch.arange(M, device=device) - start_sorted[e_sorted]
-        slot_sorted = torch.where(rank_sorted < capacity, rank_sorted, torch.full_like(rank_sorted, -1))
-        slots = torch.empty(M, dtype=torch.int32, device=device)
-        slots[order] = slot_sorted.to(torch.int32)
+        slots = _compute_slot_assignment(start_sorted, e_sorted, capacity, order)
         return slots.view(N, K)
 
 

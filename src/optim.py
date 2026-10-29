@@ -70,6 +70,33 @@ def stochastic_round_(dst: torch.Tensor, src_fp32: torch.Tensor, generator: torc
         dst.copy_(src)
 
 
+def _fused_decay_update_sr_eager(
+    p: torch.Tensor, update: torch.Tensor, decay: float, scale_step: float, noise: torch.Tensor | None
+) -> torch.Tensor:
+    w32 = p.to(torch.float32) * decay + update.to(torch.float32) * scale_step
+    if noise is not None:
+        bits = w32.view(torch.int32)
+        w32 = ((bits + noise) & ~0xFFFF).view(torch.float32)
+    return w32.to(p.dtype)
+
+
+try:
+    _compiled_decay_update_sr = torch.compile(_fused_decay_update_sr_eager)
+except Exception:
+    _compiled_decay_update_sr = _fused_decay_update_sr_eager
+
+
+def _fused_decay_update_sr(
+    p: torch.Tensor, update: torch.Tensor, decay: float, scale_step: float, noise: torch.Tensor | None
+) -> torch.Tensor:
+    if torch.compiler.is_compiling() or not p.is_cuda:
+        return _fused_decay_update_sr_eager(p, update, decay, scale_step, noise)
+    try:
+        return _compiled_decay_update_sr(p, update, decay, scale_step, noise)
+    except Exception:
+        return _fused_decay_update_sr_eager(p, update, decay, scale_step, noise)
+
+
 class _SRMixin:
     """Shared generator/step bookkeeping for stochastic rounding."""
 
@@ -250,14 +277,14 @@ class Muon(_SROptimizerMixin, Optimizer):
                     # Apply decay and update in FP32 against the exact stored value, write
                     # back with stochastic rounding. Uniform rounding of the decay keeps
                     # `p *= 1 - lr*wd` unbiased instead of vanishing entirely.
-                    w32 = p.float()
-                    if wd > 0:
-                        w32 = w32 * (1.0 - lr * wd)
-                    w32 = w32.add(g_orth.float(), alpha=-lr * scale)
+                    decay = (1.0 - lr * wd) if wd > 0 else 1.0
+                    scale_step = -lr * scale
+                    noise = None
                     if self.stochastic_rounding and p.dtype == torch.bfloat16:
-                        stochastic_round_(p.data, w32, gen)
-                    else:
-                        p.copy_(w32)
+                        noise = torch.randint(
+                            0, 1 << 16, p.shape, dtype=torch.int32, device=p.device, generator=gen
+                        )
+                    p.data.copy_(_fused_decay_update_sr(p.data, g_orth, decay, scale_step, noise))
 
 
 class AdamWBF16SR(_SROptimizerMixin, _Optimizer):
@@ -310,17 +337,16 @@ class AdamWBF16SR(_SROptimizerMixin, _Optimizer):
 
                 bias_correction1 = 1.0 - beta1**step
                 bias_correction2 = 1.0 - beta2**step
-                denom = (v / bias_correction2).sqrt_().add_(eps)
+                step_dir = (m / bias_correction1) / ((v / bias_correction2).sqrt_().add_(eps))
 
-                w32 = p.float()
-                if wd > 0:
-                    w32 = w32.mul_(1.0 - lr * wd)
-                w32 = w32.addcdiv_(m / bias_correction1, denom, value=-lr)
-
+                decay = (1.0 - lr * wd) if wd > 0 else 1.0
+                scale_step = -lr
+                noise = None
                 if self.stochastic_rounding and p.dtype == torch.bfloat16:
-                    stochastic_round_(p.data, w32, self._gen(p.device, offset=7))
-                else:
-                    p.copy_(w32)
+                    noise = torch.randint(
+                        0, 1 << 16, p.shape, dtype=torch.int32, device=p.device, generator=self._gen(p.device, offset=7)
+                    )
+                p.data.copy_(_fused_decay_update_sr(p.data, step_dir, decay, scale_step, noise))
 
 
 class PulsarDualOptimizer:

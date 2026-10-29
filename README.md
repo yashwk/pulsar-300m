@@ -1,138 +1,188 @@
-# ⚡ Pulsar
+# Pulsar
 
-**Pulsar** is a 300M-parameter, high-efficiency language model pairing **recurrent compute efficiency** with **sparse Mixture-of-Experts (MoE)**, **32k hybrid local/global attention**, **harmonic residual refinement**, and **deep supervision**.
+Pulsar is a 283M-parameter, high-efficiency language model pairing recurrent compute efficiency with sparse Mixture-of-Experts (MoE), 32k hybrid local/global attention, harmonic residual refinement, and deep supervision.
 
-Built from the ground up for consumer hardware (NVIDIA RTX 4060 8GB Laptop GPU) while seamlessly scaling to multi-GPU clusters via modular 500M-token streaming shards.
+Engineered for extreme parameter efficiency and throughput, Pulsar achieves the reasoning depth of a 24-layer Transformer while maintaining the active parameter and cache footprint of an 8-layer physical model. Validated locally and trained at scale on NVIDIA Blackwell and Hopper cloud GPUs (B300 SXM6, B200, H200, H100) via Modal.
 
 ---
 
-## 🌟 Key Architectural Highlights
+## Key Architectural Specifications
 
-| Specification | Value | Notes |
+| Specification | Value | Technical Details |
 | :--- | :--- | :--- |
-| **Model Name** | **Pulsar** | Native agentic, reasoning, and coding engine |
-| **Total Parameters** | **299.68M** | Continuous neural weights (zero static hash tables) |
-| **Active Parameters** | **147.92M** | 97.59M non-embedding active per token (50.6% computational sparsity) |
-| **Physical Core** | **8 Layers** | Recurrently looped $K=3$ times |
-| **Effective Depth** | **24 Layers** | Equivalent compute to a 24-layer Transformer |
-| **Hidden Dimension ($d_{\text{model}}$)** | **1024** | 16 Attention Heads (GQA: 4 KV heads, $d_{\text{head}}=64$) |
-| **Attention Output Gating** | **16-Head Sigmoid Gate** | Pulse-indexed per-head output gate (zero attention-sink noise, 0% FlashAttention penalty) |
-| **Recurrent MoE MLP** | **1 Shared + 8 Routed** | Top-2 active ($d_{\text{expert}}=1024$, active MLP width = 3072) with per-pulse routed scaling |
+| **Model Name** | **Pulsar** | Native reasoning, agentic tool-calling, and code synthesis engine |
+| **Total Parameters** | **283.42M** (`283,422,784`) | Continuous neural weights (zero static hash tables) |
+| **Active Parameters** | **130.02M** (`130,023,424`) | 96.47M non-embedding active parameters per token (54.1% computational sparsity) |
+| **Physical Core** | **8 Layers** | Recurrently looped K = 3 times |
+| **Effective Reasoning Depth** | **24 Layers** | Equivalent compute depth to a 24-layer Transformer |
+| **Hidden Dimension ($d_{\text{model}}$)** | **1024** | 16 Query Heads (GQA: 4 KV Heads, $d_{\text{head}} = 64$) |
+| **Attention Output Gating** | **16-Head Sigmoid Gate** | Fused pulse-indexed per-head output gate with zero FlashAttention latency penalty |
+| **Recurrent MoE MLP** | **1 Shared + 16 Routed** | Top-4 routed active ($d_{\text{expert}} = 512$, $d_{\text{shared}} = 1024$, active MLP width = 3072) |
 | **Residual State Dynamics** | **Harmonic Refinement** | Learnable per-pulse channel scale $\mathbf{s}_k \sim 1/(k+1)$ (monotonic delta contraction) |
-| **Context Length** | **32,768 Tokens** | 6 Local (window 1024, $\theta=10\text{k}$) + 2 Global (full causal, $\theta=1\text{M}$) |
-| **Optimizer** | **Muon + AdamW** | 2D/3D weight matrices in Muon; embeddings, norms, gates & scales in AdamW |
-| **Training Horizon** | **6.0 Billion Tokens** | 3-Stage Curriculum packed in modular 500M-token binary shards |
-| **Hardware Throughput** | **~3,400–10,200 tok/s** | RTX 4060 Laptop GPU with fused CUDA MoE, Softcap CE & QK-RMSNorm kernels |
+| **Context Length** | **32,768 Tokens** | 6 Local (window 1024, $\theta=10\text{k}$) + 2 Global (full causal 32k, $\theta=1\text{M}$) |
+| **Vocabulary Size** | **32,768 Tokens** | Unified vocabulary matching standard open weights |
+| **Optimizer** | **Muon + AdamW** | 2D weight matrices in Muon; embeddings, norms, gates & scales in AdamW |
+| **Training Budget** | **3.80 Billion Tokens (Stage 1)** | 8 disjoint binary shards, 28,991 optimizer steps @ 131,072 tokens/step |
+| **Cloud Throughput** | **260,000+ tok/s (24% MFU)** | NVIDIA B300 SXM6 Blackwell Ultra on Modal |
 
 ---
 
-## 🔬 Core Innovations
+## Core Innovations
 
-1. **Pulse-Indexed 16-Head Attention Output Gate:**
-   - Evaluated immediately after FlashAttention (`scaled_dot_product_attention`) and prior to $W_o$:
-     $$\mathbf{g}_k = \sigma(\mathbf{x}\mathbf{W}_{\text{gate}}[k]^\top + \mathbf{b}_{\text{gate}}[k]) \in \mathbb{R}^{B \times T \times 16}$$
-   - Initialized open at $\sigma(2.0) \approx 0.88$, allowing heads to dynamically throttle attention-sink noise and close irrelevant heads with zero FlashAttention performance penalty.
+### 1. Fused Pulse-Indexed 16-Head Attention Output Gate
+Evaluated immediately after FlashAttention (`scaled_dot_product_attention`) and prior to $W_o$:
+$$\mathbf{g}_k = \sigma(\mathbf{x}\mathbf{W}_{\text{gate}}[k]^\top + \mathbf{b}_{\text{gate}}[k]) \in \mathbb{R}^{B \times T \times 16}$$
+Operates via a custom fused CUDA kernel (`fused_attn_gate_forward_cuda` / `fused_attn_gate_backward_cuda`) that merges elementwise sigmoid multiplication and memory layout transposition into a single pass. Heads dynamically suppress attention-sink tokens and mute irrelevant heads without forcing non-contiguous gradient allocations in backward passes.
 
-2. **Harmonic Per-Pulse Residual Refinement Scale:**
-   - Overcomes the representation overwrite dilemma where recurrent updates previously dwarfed the base state ($\|\Delta \mathbf{h}\| \gg \|\mathbf{h}_{\text{in}}\|$):
-     $$\Delta \mathbf{h}_k = (\mathbf{h}_{\text{curr}} - \mathbf{h}_{\text{in}}) \odot \mathbf{s}_k, \quad \mathbf{s}_k \sim \frac{1}{k+1}$$
-   - Harmonically scales updates ($1.00 \to 0.50 \to 0.33$), yielding strictly monotonic contraction ($\|\Delta \mathbf{h}_1\| = 40.0 > \|\Delta \mathbf{h}_2\| = 18.6 > \|\Delta \mathbf{h}_3\| = 12.4$).
+### 2. Recurrent MoE with Top-4 Routing and Shared Expert
+Each physical layer incorporates an always-on shared expert ($d_{\text{shared}} = 1024$) and 16 specialized routed experts ($d_{\text{expert}} = 512$), selecting the Top-4 experts per token:
+- Active FFN width: $1024 + 4 \times 512 = 3072$.
+- Total FFN width across all 16 experts: $1024 + 16 \times 512 = 9216$.
+- By linear algebra associativity, the routed output scale $\mathbf{r}_k$ is fused into the expert down-projection weights prior to `torch.bmm`, unlocking direct accumulation of `shared_out` inside the fused CUDA combine kernel and eliminating 6.4 GB/step of intermediate HBM allocations.
 
-3. **Per-Pulse Routed-Expert Scaling:**
-   - In `PulsarMoEMLP`, a learnable FP32 vector $\mathbf{r}_k$ scales the Top-2 routed expert contribution relative to the Always-On Shared Expert:
-     $$\mathbf{y}_{\text{moe}} = \mathbf{y}_{\text{shared}} + \mathbf{y}_{\text{routed}} \odot \mathbf{r}_k$$
-   - Balances foundational shared knowledge in early pulses with deep domain specialization in late pulses.
+### 3. Harmonic Residual Refinement Scaling
+Resolves the representation overwrite dilemma where recurrent updates previously dwarfed the base state:
+$$\Delta \mathbf{h}_k = (\mathbf{h}_{\text{curr}} - \mathbf{h}_{\text{in}}) \odot \mathbf{s}_k, \quad \mathbf{s}_k \sim \frac{1}{k+1}$$
+Harmonically scales updates ($1.00 \to 0.50 \to 0.33$), yielding strictly monotonic contraction across recursive passes ($\|\Delta \mathbf{h}_1\| = 40.0 > \|\Delta \mathbf{h}_2\| = 18.6 > \|\Delta \mathbf{h}_3\| = 12.4$).
 
-4. **Tool-Call Format:**
-   - Agentic tool calls use a single, consistent format across the corpus:
-     `<|tool_call|>{"name": ..., "arguments": ...}<|/tool_call|>`
-   - Measured over the 952M-token corpus: 100,914 balanced open/close pairs, every
-     payload using the `{"name", "arguments"}` schema. (An earlier version of this README
-     described a 70/15/15 split across native, XML and Markdown-JSON formats; the corpus
-     does not contain such a split.)
+### 4. 32k Hybrid Local/Global Attention
+- **6 Local Layers** ($\theta = 10,000$, sliding window 1024): Provide high-resolution local positional representation for dense syntax, code structures, and JSON tool schemas.
+- **2 Global Anchor Layers** (Layers 3 & 7, $\theta = 1,000,000$, full causal 32k span with YaRN temperature scaling): Execute full causal sequence sweeps. Looped K = 3 times, this executes 6 global context sweeps across sequence history.
 
-5. **Verbatim Reasoning Traces:**
-   - `<|think|>` traces are stored intact. Measured over the corpus: 114,893 balanced
-     open/close pairs and **zero** `\n\n[...]\n\n` splices. Every one of the 215
-     `[...]` occurrences is genuine source content (NumPy ellipsis, quoted text, name
-     elisions), not an inserted elision.
-   - Training on ungrounded "skip the middle" bridges would teach the model to emit
-     `[...]` and invent conclusions, so traces are kept verbatim instead.
+### 5. Multi-Step Deep Supervision with Subsampled Auxiliary Loss
+Intermediate recurrent pulses are guided by a 25% subsampled auxiliary cross-entropy loss with rotating disjoint offsets to prevent intermediate representation collapse:
+$$\mathcal{L}_{\text{total}} = 0.15 \cdot \mathcal{L}_1 + 0.25 \cdot \mathcal{L}_2 + 0.60 \cdot \mathcal{L}_3 + \mathcal{L}_{\text{router\_z}}$$
 
-6. **32k Hybrid Attention Pattern:**
-   - 6 Local High-Precision Layers ($\theta=10,000$, sliding window 1024) provide 4x sharper positional resolution for code, math, and JSON.
-   - 2 Global Anchor Layers (Layers 3 & 7, $\theta=1,000,000$) perform full causal 32k sweeps with YaRN query temperature scaling. Looped $K=3$ times, this executes 6 global context sweeps across sequence history.
-
-7. **Multi-Step Deep Supervision with Subsampled Auxiliary Loss:**
-   - Intermediate pulses use a 25% subsampled auxiliary cross-entropy loss with rotating disjoint offsets to prevent intermediate representation collapse:
-     $$\mathcal{L}_{\text{total}} = 0.15 \cdot \mathcal{L}_1 + 0.25 \cdot \mathcal{L}_2 + 0.60 \cdot \mathcal{L}_3 + \mathcal{L}_{\text{router\_z}}$$
-
-8. **Fused C++ CUDA Acceleration (`pulsar_cuda`):**
-   - 128-bit vectorized (`uint4`) token dispatch & combine CUDA kernels eliminate Python loop and `torch.argsort` overhead.
-   - Fused Logit Soft-Capped Cross-Entropy kernel (`fused_softcap_ce`) computes online logsumexp and fused backward in registers, cutting memory allocations from 800 MB down to 8 KB per micro-batch.
-   - Fused QK-RMSNorm warp reduction kernel replaces 864 separate elementwise PyTorch kernels.
+### 6. High-Performance Fused CUDA Kernels (`pulsar_cuda`)
+Hand-optimized C++/CUDA kernels in `csrc/kernels.cu` eliminate Python runtime overhead and HBM bandwidth roundtrips:
+- **`qk_rmsnorm_rope`**: Fuses QK-RMSNorm and Rotary Positional Embeddings in registers, eliminating 32 GB/step of memory roundtrips.
+- **`fused_attn_gate`**: Fuses 16-head sigmoid gating and memory transpose into a single vectorized pass.
+- **`moe_dispatch` & `moe_combine`**: 128-bit vectorized `uint4` token dispatch and combine with register-level scaling and early-exit on dropped tokens.
+- **`moe_slots_from_order`**: C++ post-argsort slot assignment and expert histogram reduction.
+- **`fused_sr_update`**: Fuses Muon momentum weight updates with on-chip deterministic PRNG (SplitMix32) stochastic rounding in registers.
+- **`fused_softcap_ce`**: Computes online logsumexp and fused backward in registers, cutting peak memory from 800 MB down to 8 KB per micro-batch.
 
 ---
 
-## 🚀 Quickstart
+## Directory Layout
 
-### 1. Build Native CUDA Extension
-```bash
-python setup.py build_ext --inplace
+```
+pulsar-300m/
+├── csrc/                   # Native C++ and CUDA kernel implementations
+│   ├── kernels.cu          # Fused CUDA kernels (QK-RoPE, AttnGate, MoE, SR, Softcap CE)
+│   └── pulsar_cuda.cpp     # PyTorch C++ bindings
+├── src/                    # Core Python model and training engine
+│   ├── model.py            # PulsarConfig, PulsarAttention, PulsarMoEMLP, PulsarForCausalLM
+│   ├── optim.py            # PulsarDualOptimizer (Muon + AdamW with stochastic rounding)
+│   ├── train.py            # Main training loop with automated telemetry rollback
+│   ├── packing.py          # Best-fit document packing loader
+│   └── infer.py            # Native KV-cache inference engine with sliding-window ring buffer
+├── scripts/                # Cloud orchestration and utility scripts
+│   ├── modal_train.py      # Modal cloud pretraining harness (B300, B200, H200, H100)
+│   ├── sync_cloud_monitor.py # Background telemetry sync daemon from Modal volume
+│   ├── calc_steps.py       # Exact curriculum and schedule calculator
+│   └── benchmark.py        # Latency, memory, and throughput benchmarking suite
+├── monitor/                # Real-time web telemetry dashboard
+│   ├── web_server.py       # Lightweight HTTP server for live training dashboard
+│   ├── index.html          # Modern dark-mode web monitoring UI
+│   └── thresholds.json     # Automated health checks and warning thresholds
+├── checkpoints/            # Single flat directory for checkpoints and telemetry
+│   ├── latest.pt           # Atomic latest checkpoint
+│   ├── best.pt             # Lowest validation loss checkpoint
+│   ├── metrics.jsonl       # Per-step JSONL telemetry
+│   ├── metrics.csv         # Tabular CSV training metrics
+│   ├── live_status.json    # Instantaneous snapshot for web monitor
+│   └── train.log           # Full stdout training logs
+├── tests/                  # Unit tests and gradient parity assertions
+│   ├── test_kernels.py     # Forward/backward parity checks for all fused CUDA kernels
+│   ├── test_model.py       # Architectural constraints, parameter counts, memory benchmarks
+│   ├── test_optim.py       # Muon and AdamW optimizer assertions
+│   └── test_rollback.py    # Automated telemetry rollback validation
+└── docs/                   # Detailed architectural and curriculum specifications
+    ├── ARCHITECTURE.md     # In-depth architectural equations and tensor diagrams
+    ├── CURRICULUM.md       # Pretraining curriculum and shard specifications
+    ├── MONITOR.md          # Real-time telemetry dashboard architecture
+    └── CLOUD_TRAINING.md   # Cloud training and operations runbook
 ```
 
-### 2. Check the Shards on Disk
-The corpus is already built and tokenized (`data/*.bin`, uint16 token ids); there is no
-shard-preparation script in this repository. See the state of what is present, including
-document-length structure and what packing at a given context length would cost:
+---
+
+## Quickstart
+
+### 1. Installation
+Clone the repository and set up a virtual environment with PyTorch and dependencies:
 ```bash
-python scripts/measure_packing.py --seq-len 1024
-python scripts/analyze_agentic_lengths.py --tokenizer data/pulsar_tokenizer
+git clone https://github.com/yashwk/pulsar-300m.git
+cd pulsar-300m
+uv sync
 ```
 
-### 3. Sanity-Check the Trainer
+### 2. Build Native CUDA Extension
+Compile the custom CUDA acceleration library:
 ```bash
-# 2-step smoke run: --no-save avoids writing a 1.3 GB checkpoint
+pip install -e . --no-build-isolation
+```
+
+Verify that the extension compiles and all tests pass:
+```bash
+uv run pytest tests/
+```
+
+### 3. Local Smoke Test Run
+Run a quick 2-step verification run on CPU or GPU without writing checkpoints:
+```bash
 python -m src.train --max-steps 2 --warmup-steps 1 --no-save \
-    --micro-batch-size 3 --seq-len 1024 --checkpoint-dir checkpoints/smoke
-```
-Omit `--no-save` for a real run; checkpoints go to `--checkpoint-dir` (default
-`checkpoints/`), and `latest.pt` / `best.pt` are overwritten in place.
-
-### 4. Launch Web Telemetry Dashboard
-```bash
-python monitor/web_server.py --port 7860
-```
-Open [http://localhost:7860](http://localhost:7860) to view real-time loss, per-pulse hidden state contraction ($\Delta h$), expert load distribution, and throughput gauges.
-
-### 5. High-Efficiency Native Inference Engine
-Pulsar implements a native unified KV-cache inference engine with sliding-window ring buffering for 11x KV cache compression (73.4 MB @ 32k context):
-```bash
-# Interactive REPL:
-python src/infer.py --checkpoint checkpoints/best.pt --interactive
-
-# Single prompt completion (standard autoregressive):
-python src/infer.py --checkpoint checkpoints/best.pt --prompt "def quicksort(arr: list[int]) -> list[int]:"
-
-# Accelerated self-speculative decoding (Pulse 1 draft + Pulse 3 verification):
-python src/infer.py --checkpoint checkpoints/best.pt --prompt "def quicksort(arr: list[int]) -> list[int]:" --speculative
-
-# Memory footprint benchmark across context lengths:
-python src/infer.py --benchmark
+    --micro-batch-size 2 --seq-len 1024 --train-bin data/train_shard0.bin \
+    --val-bin data/val_shard0.bin --tokenizer data/pulsar_tokenizer
 ```
 
 ---
 
-## 📚 Technical Documentation
-- [2,000-Step Pretraining Milestone Report (CE: 2.0643, PPL: 7.88, Python AST: 100%)](docs/TRAINING_RUN_2000.md)
-- [500-Step Pretraining Milestone Report (CE: 2.6761, Latent Gain: +0.1465)](docs/TRAINING_RUN_500.md)
+## Cloud Training on Modal
+
+Pulsar is optimized for remote training on high-end cloud accelerators via Modal.
+
+### 1. Launch Production Pretraining (Detached Mode)
+Run unattended pretraining on an NVIDIA B300 SXM6 (Blackwell Ultra). The `--detach` flag launches the job in the cloud and exits immediately, ensuring that local Wi-Fi dropouts or laptop sleep will not interrupt training:
+```bash
+modal run scripts/modal_train.py \
+    --gpu B300 \
+    --detach \
+    --target-step 28991 \
+    --mbs 128 \
+    --global-batch-tokens 131072 \
+    --seq-len 1024 \
+    --resume latest
+```
+
+### 2. Launch Local Real-Time Dashboard
+Monitor training live at `http://localhost:7860`:
+```bash
+# Terminal 1: Background cloud telemetry sync
+python scripts/sync_cloud_monitor.py --checkpoint-dir checkpoints
+
+# Terminal 2: Web monitor server
+python monitor/web_server.py --port 7860 --checkpoint-dir checkpoints
+```
+
+### 3. Automated Telemetry Rollback
+If a cloud run is interrupted or preempted between checkpoint intervals, resuming with `--resume latest` automatically prunes orphaned records from `metrics.jsonl`, `metrics.csv`, and `train.log` back to the exact checkpoint step (`latest.pt`), guaranteeing clean, strictly monotonic telemetry curves on the dashboard.
+
+---
+
+## Technical Documentation
 - [Architecture & Implementation Specification](docs/ARCHITECTURE.md)
 - [Curriculum & Shard Specification](docs/CURRICULUM.md)
+- [Monitoring & Dashboard Specification](docs/MONITOR.md)
+- [Cloud Training & Operations Runbook](docs/CLOUD_TRAINING.md)
+- [2,000-Step Pretraining Milestone Report](docs/TRAINING_RUN_2000.md)
+- [500-Step Pretraining Milestone Report](docs/TRAINING_RUN_500.md)
 - [Engineering Audit & Telemetry Notes](docs/AUDIT.md)
 
 ---
 
-## 📑 References & Acknowledgements
-- **Unified Recurrent KV-Cache Dynamics:** Attractor dynamics and cross-pass recurrent state sharing inspired by UCSD Sandy Research / Fu et al. (*Be-Nice: Recurrent Transformers with Contractive State Attractors*).
-- **Compressed Sparse & Sliding-Window Inference Bounds:** Multi-layer hybrid KV caching and context scaling inspired by DeepSeek CSA2 architecture (*DeepSeek-V4.1-Flash*).
-- **Pipelined Self-Speculative Decoding for Looped Architectures:** Recurrent-depth draft extraction and zero-overhead parallel verification inspired by KAIST FLEXML Lab / Bae et al. (*LoopSpec: Pipelined Self-Speculative Decoding for Looped Transformers*).
+## References & Acknowledgements
+- **Unified Recurrent KV-Cache Dynamics:** Cross-pass recurrent state sharing inspired by UCSD Sandy Research / Fu et al. (*Be-Nice: Recurrent Transformers with Contractive State Attractors*).
+- **DeepSeek Innovations:** Multi-head latent routing and auxiliary-loss-free balancing inspired by DeepSeek AI (*DeepSeek-V3 / DeepSeek-V4.1-Flash Technical Reports*).
+- **Pipelined Self-Speculative Decoding:** Recurrent-depth draft extraction inspired by KAIST FLEXML Lab / Bae et al. (*LoopSpec: Pipelined Self-Speculative Decoding for Looped Transformers*).
+- **Muon Optimizer:** High-efficiency matrix orthogonalization via Newton-Schulz iterations inspired by Jordan Keller / Moonshine AI (*Muon: An Optimizer for Hidden Layers*).

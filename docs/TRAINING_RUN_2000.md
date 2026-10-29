@@ -4,7 +4,7 @@ This document provides a comprehensive technical audit of the first **2,000 trai
 
 ---
 
-## 📊 1. Executive Summary & Progression
+##  1. Executive Summary & Progression
 
 | Metric | Milestone 500 | Milestone 1,000 | Milestone 2,000 | Total Progression |
 | :--- | :--- | :--- | :--- | :--- |
@@ -22,7 +22,7 @@ This document provides a comprehensive technical audit of the first **2,000 trai
 
 ---
 
-## 📈 2. Validation Loss & Perplexity Trajectory
+##  2. Validation Loss & Perplexity Trajectory
 
 Evaluations were performed every 50 global steps on clean, out-of-distribution validation shards:
 
@@ -46,7 +46,7 @@ graph LR
 
 ---
 
-## 🔄 3. Recurrent Pulse Dynamics & Attractor Stability
+##  3. Recurrent Pulse Dynamics & Attractor Stability
 
 Pulsar reuses 8 physical layers looped $K=3$ times. At Step 2,000, the latent refinement demonstrates robust, non-saturating dynamics:
 
@@ -63,7 +63,7 @@ Pulsar reuses 8 physical layers looped $K=3$ times. At Step 2,000, the latent re
 
 ---
 
-## 🔬 4. Standardized Capability Benchmark (CUDA Results)
+##  4. Standardized Capability Benchmark (CUDA Results)
 
 The official benchmark harness ([`scripts/benchmark.py`](file:///home/yashwanth/projects/pulsar-300m/scripts/benchmark.py)) scored `milestone_step_2000.pt` directly on the RTX 4060 GPU:
 

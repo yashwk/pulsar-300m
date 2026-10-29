@@ -4,7 +4,7 @@ This document provides a comprehensive technical audit of the first **500 traini
 
 ---
 
-## 📊 1. Executive Summary & Core Metrics
+##  1. Executive Summary & Core Metrics
 
 | Metric | Start (Step 1) | Midpoint (Step 250) | Milestone (Step 500) | Net Change |
 | :--- | :--- | :--- | :--- | :--- |
@@ -24,7 +24,7 @@ This document provides a comprehensive technical audit of the first **500 traini
 
 ---
 
-## 📈 2. Validation Progression Across 50-Step Intervals
+##  2. Validation Progression Across 50-Step Intervals
 
 Evaluations were performed every 50 global steps on an out-of-distribution holdout slice from [`data/val_shard1.bin`](file:///home/yashwanth/projects/pulsar-300m/data/val_shard1.bin). Every single evaluation checkpoint produced a new model best, with no overfitting or divergence.
 
@@ -52,7 +52,7 @@ graph LR
 
 ---
 
-## 🔄 3. Recurrent Pulse Dynamics: Latent Refinement Verification
+##  3. Recurrent Pulse Dynamics: Latent Refinement Verification
 
 Pulsar executes its 8 physical transformer blocks recurrently across $K=3$ pulses to achieve 24 effective layers of reasoning depth. A major theoretical question prior to this run was whether intermediate pulses would experience representation overwrite or premature saturation.
 
@@ -91,7 +91,7 @@ graph TD
 
 ---
 
-## 🔀 4. Sparse Mixture-of-Experts (MoE) Routing Equilibrium
+##  4. Sparse Mixture-of-Experts (MoE) Routing Equilibrium
 
 Pulsar routes tokens dynamically across 8 specialized feed-forward experts while routing through 1 shared expert on every token ($1\text{ Shared} + \text{Top-2 of } 8\text{ Routed}$).
 
@@ -135,7 +135,7 @@ graph LR
 
 ---
 
-## 💻 6. Hardware & Compute Efficiency (RTX 4060 Laptop)
+##  6. Hardware & Compute Efficiency (RTX 4060 Laptop)
 
 - **Compute Hardware**: Single NVIDIA GeForce RTX 4060 Laptop GPU (8GB GDDR6, 115W TGP).
 - **Global Batch Size**: $131,072$ tokens / step (128 sequences of length 1,024).
@@ -149,7 +149,7 @@ graph LR
 
 ---
 
-## 🎯 7. Qualitative Canary Evaluations (Live at Step 500)
+##  7. Qualitative Canary Evaluations (Live at Step 500)
 
 At Step 500 (only 65.5M tokens seen, ~1.1% of the 6.0B token horizon), the model was prompted with 5 fixed canary prompts across diverse domains:
 
@@ -226,7 +226,7 @@ version = "1.0"
 
 ---
 
-## 🚀 8. Artifacts & Next Steps
+##  8. Artifacts & Next Steps
 
 ### Saved Checkpoints
 - [`checkpoints/best.pt`](file:///home/yashwanth/projects/pulsar-300m/checkpoints/best.pt) — Best model weights (Validation CE: `2.6761`, Step 500).

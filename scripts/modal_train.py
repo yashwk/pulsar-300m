@@ -237,6 +237,7 @@ def main(
     resume: str = None,
     compile: bool = False,
     output_ckpt: str = None,
+    detach: bool = False,
 ):
     # Calculate invariant hardware-agnostic batch dynamics
     tokens_per_micro = mbs * seq_len
@@ -318,17 +319,23 @@ def main(
     selected_gpu = gpu.upper()
     print(f"\n[Modal Orchestrator] Target GPU: {selected_gpu} | Target Step: {target_step} | MBS: {mbs}")
 
-    if selected_gpu == "B300":
-        print("[Modal Orchestrator] Provisioning NVIDIA B300 SXM6 (Blackwell Ultra)...")
-        train_remote_b300.remote(**kwargs)
-    elif selected_gpu == "B200":
-        print("[Modal Orchestrator] Provisioning NVIDIA B200 (Blackwell)...")
-        train_remote_b200.remote(**kwargs)
-    elif selected_gpu == "H200":
-        print("[Modal Orchestrator] Provisioning NVIDIA H200...")
-        train_remote_h200.remote(**kwargs)
-    elif selected_gpu == "H100":
-        print("[Modal Orchestrator] Provisioning NVIDIA H100...")
-        train_remote_h100.remote(**kwargs)
-    else:
+    fn_map = {
+        "B300": train_remote_b300,
+        "B200": train_remote_b200,
+        "H200": train_remote_h200,
+        "H100": train_remote_h100,
+    }
+    if selected_gpu not in fn_map:
         raise ValueError(f"Unsupported GPU selection: {selected_gpu}")
+
+    remote_fn = fn_map[selected_gpu]
+    if detach:
+        print(f"[Modal Orchestrator] Spawning detached training run on NVIDIA {selected_gpu}...")
+        call = remote_fn.spawn(**kwargs)
+        print(f"[Modal Orchestrator] Run successfully spawned in the cloud! FunctionCall ID: {call.object_id}")
+        print("[Modal Orchestrator] Safe to disconnect WiFi, close laptop, or exit. Modal cloud container will run independently.")
+        print("[Modal Orchestrator] Monitor logs and progress via Modal dashboard or local web monitor (sync_cloud_monitor.py).")
+        return
+    else:
+        print(f"[Modal Orchestrator] Launching synchronous training run on NVIDIA {selected_gpu}...")
+        remote_fn.remote(**kwargs)

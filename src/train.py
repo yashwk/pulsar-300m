@@ -3,6 +3,7 @@ import glob
 import json
 import math
 import os
+import re
 import signal
 import sys
 import time
@@ -41,6 +42,7 @@ def format_duration(seconds: float) -> str:
 class DualLogger:
     """Tee logger mirroring stdout to both the console and a persistent log file."""
     def __init__(self, filepath: str):
+        self.filepath = filepath
         self.terminal = sys.stdout
         os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
         self.log_file = open(filepath, "a", encoding="utf-8")
@@ -48,11 +50,174 @@ class DualLogger:
     def write(self, message: str):
         self.terminal.write(message)
         self.log_file.write(message)
-        self.log_file.flush()
 
     def flush(self):
         self.terminal.flush()
         self.log_file.flush()
+
+    def reopen(self):
+        try:
+            self.log_file.close()
+        except Exception:
+            pass
+        self.log_file = open(self.filepath, "a", encoding="utf-8")
+
+
+def rollback_telemetry(
+    checkpoint_dir: str,
+    max_step: int,
+    tokens_seen: int | None = None,
+    best_val_loss: float | None = None,
+) -> dict[str, int]:
+    """Roll back telemetry files (metrics.jsonl, metrics.csv, live_status.json, train.log)
+    to a specific max_step, pruning any uncommitted records from crashed or aborted runs.
+    """
+    stats = {
+        "pruned_jsonl": 0,
+        "kept_jsonl": 0,
+        "pruned_csv": 0,
+        "kept_csv": 0,
+        "pruned_log_lines": 0,
+        "rolled_back_live_status": 0,
+    }
+
+    # 1. Roll back metrics.jsonl
+    jsonl_path = os.path.join(checkpoint_dir, "metrics.jsonl")
+    last_kept_metric = None
+    if os.path.exists(jsonl_path):
+        kept_lines = []
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line_str = line.strip()
+                if not line_str:
+                    continue
+                try:
+                    record = json.loads(line_str)
+                    if record.get("step", 0) <= max_step:
+                        kept_lines.append(line_str + "\n")
+                        last_kept_metric = record
+                    else:
+                        stats["pruned_jsonl"] += 1
+                except Exception:
+                    kept_lines.append(line_str + "\n")
+
+        stats["kept_jsonl"] = len(kept_lines)
+        if stats["pruned_jsonl"] > 0:
+            tmp_path = jsonl_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.writelines(kept_lines)
+            os.replace(tmp_path, jsonl_path)
+
+    # 2. Roll back metrics.csv
+    csv_path = os.path.join(checkpoint_dir, "metrics.csv")
+    if os.path.exists(csv_path):
+        kept_csv_lines = []
+        with open(csv_path, "r", encoding="utf-8") as f:
+            for idx, line in enumerate(f):
+                if idx == 0:
+                    kept_csv_lines.append(line)
+                    continue
+                line_str = line.strip()
+                if not line_str:
+                    continue
+                parts = line_str.split(",")
+                try:
+                    step_val = int(parts[0])
+                    if step_val <= max_step:
+                        kept_csv_lines.append(line)
+                    else:
+                        stats["pruned_csv"] += 1
+                except Exception:
+                    kept_csv_lines.append(line)
+
+        stats["kept_csv"] = len(kept_csv_lines) - 1 if len(kept_csv_lines) > 0 else 0
+        if stats["pruned_csv"] > 0:
+            tmp_path = csv_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.writelines(kept_csv_lines)
+            os.replace(tmp_path, csv_path)
+
+    # 3. Roll back live_status.json
+    live_path = os.path.join(checkpoint_dir, "live_status.json")
+    if os.path.exists(live_path):
+        try:
+            with open(live_path, "r", encoding="utf-8") as f:
+                live_data = json.load(f)
+        except Exception:
+            live_data = {}
+
+        if live_data.get("step", 0) > max_step:
+            stats["rolled_back_live_status"] = 1
+            if last_kept_metric is not None:
+                new_live = dict(last_kept_metric)
+            else:
+                new_live = dict(live_data)
+                new_live["step"] = max_step
+                if tokens_seen is not None:
+                    new_live["tokens_seen"] = tokens_seen
+                if best_val_loss is not None and best_val_loss != float("inf"):
+                    new_live["best_val_loss"] = round(best_val_loss, 4)
+
+            new_live["status"] = "resumed"
+            tmp_path = live_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(new_live, f, indent=2)
+            os.replace(tmp_path, live_path)
+
+    # 4. Roll back train.log
+    log_path = os.path.join(checkpoint_dir, "train.log")
+    if os.path.exists(log_path):
+        if isinstance(sys.stdout, DualLogger):
+            sys.stdout.flush()
+            try:
+                sys.stdout.log_file.close()
+            except Exception:
+                pass
+
+        step_pattern = re.compile(r"^\[Step\s+(\d+)/")
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+            log_lines = f.readlines()
+
+        last_valid_step_idx = -1
+        for i, line in enumerate(log_lines):
+            m = step_pattern.match(line)
+            if m and int(m.group(1)) <= max_step:
+                last_valid_step_idx = i
+
+        cut_idx = len(log_lines)
+        if max_step == 0:
+            for i, line in enumerate(log_lines):
+                m = step_pattern.match(line)
+                if m and int(m.group(1)) > 0:
+                    cut_idx = i
+                    break
+        elif last_valid_step_idx != -1:
+            for i in range(last_valid_step_idx + 1, len(log_lines)):
+                m = step_pattern.match(log_lines[i])
+                if m and int(m.group(1)) > max_step:
+                    cut_idx = i
+                    break
+
+        if cut_idx < len(log_lines):
+            stats["pruned_log_lines"] = len(log_lines) - cut_idx
+            tmp_path = log_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.writelines(log_lines[:cut_idx])
+            os.replace(tmp_path, log_path)
+
+        if isinstance(sys.stdout, DualLogger):
+            sys.stdout.reopen()
+
+    if any(stats[k] > 0 for k in ("pruned_jsonl", "pruned_csv", "pruned_log_lines", "rolled_back_live_status")):
+        print(
+            f"[Pulsar] Telemetry rollback: pruned uncommitted steps > {max_step} "
+            f"(metrics.jsonl: {stats['pruned_jsonl']} entries, "
+            f"metrics.csv: {stats['pruned_csv']} rows, "
+            f"train.log: {stats['pruned_log_lines']} lines). "
+            f"live_status synchronized to step {max_step}."
+        )
+
+    return stats
 
 
 def compute_param_group_grad_norm(optimizer_sub) -> float:
@@ -398,7 +563,15 @@ def train():
     parser.add_argument("--thermal-cooldown-seconds", type=int, default=100, help="Duration of thermal cooldown pause")
     parser.add_argument("--reset-dataset", action="store_true", default=False,
                         help="Reset dataset window cursor to 0 upon resume (crucial when switching shards or transitioning curriculum stages, while preserving model weights, step count, and optimizer moments).")
+    parser.add_argument("--rollback-telemetry-to-step", type=int, default=None,
+                        help="Prune telemetry files (metrics.jsonl, metrics.csv, live_status.json, train.log) "
+                             "back to a specific step without running training.")
     args = parser.parse_args()
+
+    if args.rollback_telemetry_to_step is not None:
+        stats = rollback_telemetry(args.checkpoint_dir, args.rollback_telemetry_to_step)
+        print(f"[Pulsar] Standalone rollback to step {args.rollback_telemetry_to_step} completed: {stats}")
+        return
 
     # Logging setup
     os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -586,6 +759,15 @@ def train():
             del ckpt
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+            # Roll back any uncommitted telemetry lines (from a prior crashed or preempted run)
+            # that were logged past start_step, ensuring strict monotonic alignment.
+            rollback_telemetry(
+                args.checkpoint_dir,
+                start_step,
+                tokens_seen=tokens_seen,
+                best_val_loss=best_val_loss,
+            )
 
             # A packed loaders' position is its cursor, not the RNG seed: without this
             # a resumed run restarts at window 0 and retrains the opening data.

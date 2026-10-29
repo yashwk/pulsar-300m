@@ -90,6 +90,7 @@ def execute_training(
     output_ckpt: str = None,
     max_steps: int = None,
     warmup_steps: int = 300,
+    cooldown_steps: int = 0,
     sampler: str = "bestfit",
     num_pulses: int = 3,
     moe_capacity_factor: float = 1.25,
@@ -131,7 +132,7 @@ def execute_training(
         "--max-steps", str(effective_max_steps),
         "--target-step", str(target_step),
         "--warmup-steps", str(warmup_steps),
-        "--cooldown-steps", "0",
+        "--cooldown-steps", str(cooldown_steps),
         "--lr-schedule", "wsd",
         "--muon-lr", str(muon_lr),
         "--adam-lr", str(adam_lr),
@@ -222,6 +223,8 @@ def main(
     seq_len: int = 1024,
     warmup_steps: int = None,
     warmup_tokens: str = None,
+    cooldown_steps: int = None,
+    cooldown_tokens: str = None,
     sampler: str = "bestfit",
     num_pulses: int = 3,
     moe_capacity_factor: float = 1.25,
@@ -264,6 +267,14 @@ def main(
     else:
         effective_warmup_steps = max(1, int(round(effective_max_steps * 0.01)))
 
+    # 4. Resolve cooldown_steps from cooldown_tokens or 10% curriculum default for WSD
+    if cooldown_tokens is not None:
+        effective_cooldown_steps = max(0, parse_tokens(cooldown_tokens) // effective_gbt)
+    elif cooldown_steps is not None:
+        effective_cooldown_steps = cooldown_steps
+    else:
+        effective_cooldown_steps = max(0, int(round(effective_max_steps * 0.10))) if effective_target_step >= effective_max_steps else 0
+
     tokens_targeted = effective_target_step * effective_gbt
     total_curriculum_tokens = effective_max_steps * effective_gbt
 
@@ -276,6 +287,7 @@ def main(
     print(f" Global Batch Tokens:        {effective_gbt:,} tokens/step")
     print(f" Total Curriculum Horizon:   {effective_max_steps:,} steps ({total_curriculum_tokens:,} tokens)")
     print(f" Warmup Schedule:            {effective_warmup_steps:,} steps ({effective_warmup_steps * effective_gbt:,} tokens)")
+    print(f" Cooldown Schedule:          {effective_cooldown_steps:,} steps ({effective_cooldown_steps * effective_gbt:,} tokens)")
     print(f" Active Session Target:      Step {effective_target_step:,} ({tokens_targeted:,} tokens)")
     print("=" * 70 + "\n")
 
@@ -288,6 +300,7 @@ def main(
         "global_batch_tokens": effective_gbt,
         "seq_len": seq_len,
         "warmup_steps": effective_warmup_steps,
+        "cooldown_steps": effective_cooldown_steps,
         "sampler": sampler,
         "num_pulses": num_pulses,
         "moe_capacity_factor": moe_capacity_factor,

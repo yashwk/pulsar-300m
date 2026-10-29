@@ -11,7 +11,7 @@ import subprocess
 import time
 
 
-def sync_cloud_telemetry(checkpoint_dir: str = "checkpoints/b300_trial", interval: float = 5.0):
+def sync_cloud_telemetry(checkpoint_dir: str = "checkpoints", interval: float = 5.0):
     os.makedirs(checkpoint_dir, exist_ok=True)
     modal_bin = os.path.abspath(".venv/bin/modal")
     if not os.path.exists(modal_bin):
@@ -36,8 +36,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint-dir",
         type=str,
-        default="checkpoints/b300_trial",
-        help="Local directory to write synced telemetry (default: checkpoints/b300_trial)",
+        default="checkpoints",
+        help="Local directory to write synced telemetry (default: checkpoints)",
     )
     parser.add_argument(
         "--interval",

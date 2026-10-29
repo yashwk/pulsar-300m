@@ -624,7 +624,7 @@ def train():
     if args.sampler == "bestfit":
         # EOS-aligned packing: whole documents fill each window; leftover space comes
         # only from documents longer than seq_len (which can never be intact anyway).
-        # See docs/AUDIT.md for the measured intactness and the filler-share caveat.
+        # See docs/CURRICULUM.md for the measured intactness and the filler-share caveat.
         _t0 = time.time()
         train_index = build_doc_index(train_shards)
         train_plan = plan_epoch(

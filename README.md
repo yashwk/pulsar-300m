@@ -175,9 +175,6 @@ If a cloud run is interrupted or preempted between checkpoint intervals, resumin
 - [Curriculum & Shard Specification](docs/CURRICULUM.md)
 - [Monitoring & Dashboard Specification](docs/MONITOR.md)
 - [Cloud Training & Operations Runbook](docs/CLOUD_TRAINING.md)
-- [2,000-Step Pretraining Milestone Report](docs/TRAINING_RUN_2000.md)
-- [500-Step Pretraining Milestone Report](docs/TRAINING_RUN_500.md)
-- [Engineering Audit & Telemetry Notes](docs/AUDIT.md)
 
 ---
 

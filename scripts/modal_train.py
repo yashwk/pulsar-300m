@@ -267,13 +267,13 @@ def main(
     else:
         effective_warmup_steps = max(1, int(round(effective_max_steps * 0.01)))
 
-    # 4. Resolve cooldown_steps from cooldown_tokens or 10% curriculum default for WSD
+    # 4. Resolve cooldown_steps (default 0 for Stage 1 pretraining)
     if cooldown_tokens is not None:
         effective_cooldown_steps = max(0, parse_tokens(cooldown_tokens) // effective_gbt)
     elif cooldown_steps is not None:
         effective_cooldown_steps = cooldown_steps
     else:
-        effective_cooldown_steps = max(0, int(round(effective_max_steps * 0.10))) if effective_target_step >= effective_max_steps else 0
+        effective_cooldown_steps = 0
 
     tokens_targeted = effective_target_step * effective_gbt
     total_curriculum_tokens = effective_max_steps * effective_gbt

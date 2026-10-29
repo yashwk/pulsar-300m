@@ -287,7 +287,7 @@ std::vector<torch::Tensor> rmsnorm_backward_cuda(torch::Tensor dy, torch::Tensor
     // keeps every warp full; the surplus threads simply find v >= num_vec and add 0.
     //   dim=384 -> num_vec=48 -> threads=64 (was 48: 2.9e-1 dx error)
     int threads = std::min(1024, ((std::max(32, num_vec) + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE);
-    int blocks = std::min(total_tokens, 256);
+    int blocks = std::min(total_tokens, 4096);
     rmsnorm_backward_vec8_kernel<<<blocks, threads>>>(
         reinterpret_cast<const __nv_bfloat16*>(dy.data_ptr<c10::BFloat16>()),
         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<c10::BFloat16>()),
@@ -1536,7 +1536,7 @@ std::vector<torch::Tensor> qk_rmsnorm_backward_cuda(
         int threads_per_block = 128;
         int warps_per_block = threads_per_block / WARP_SIZE;
         int vectors_per_head = total_vectors / num_heads;
-        int blocks_x = std::min((vectors_per_head + warps_per_block - 1) / warps_per_block, 32);
+        int blocks_x = std::min((vectors_per_head + warps_per_block - 1) / warps_per_block, 512);
         dim3 grid(blocks_x, num_heads);
 
         qk_rmsnorm_backward_kernel<<<grid, threads_per_block>>>(

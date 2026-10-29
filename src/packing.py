@@ -543,7 +543,7 @@ class PackedBatchLoader:
             )
         return self.x_buf[:count].clone(), self.y_buf[:count].clone()
 
-    def routing_mask(self, x: torch.Tensor) -> torch.Tensor:
+    def routing_mask(self, x: torch.Tensor) -> torch.Tensor | None:
         """Boolean mask of positions that may enter MoE routing and expert counts.
 
         Padding must be excluded: a run of identical pad tokens would all route to the
@@ -554,7 +554,9 @@ class PackedBatchLoader:
         """
         rows = x.shape[0]
         if not self._last_n_real or all(n == self.seq_len for n in self._last_n_real[-rows:]):
-            return torch.ones_like(x, dtype=torch.bool)
+            if torch.compiler.is_compiling():
+                return torch.ones_like(x, dtype=torch.bool)
+            return None
         n_real = self._last_n_real[-rows:]
         lengths = torch.as_tensor(n_real, device=x.device, dtype=torch.int64).unsqueeze(1)
         col_idx = torch.arange(x.shape[1], device=x.device).unsqueeze(0)

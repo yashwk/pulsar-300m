@@ -647,10 +647,6 @@ def compute_token_slots(
         return torch.empty((N, K), dtype=torch.int32, device=device)
 
     with torch.no_grad():
-        counts = torch.zeros(num_experts, device=device, dtype=torch.long)
-        counts.index_add_(0, flat_e, torch.ones(M, device=device, dtype=torch.long))
-        start_off = counts.cumsum(0) - counts            # [E] group start per expert
-
         # Single path, no branch and no host sync.
         #
         # The rank must be the assignment's ORDINAL WITHIN ITS EXPERT, not its position

@@ -791,10 +791,9 @@ def train():
                     metric_accum[_k] = _avg(metric_accum.get(_k), _v, grad_accum)
             step_metrics = metric_accum
 
-        accum_loss = accum_loss_tensor.item()
         tokens_seen += effective_global_batch_tokens
 
-        # Sub-optimizer gradient norms before clipping (fused foreach kernels)
+        # Sub-optimizer gradient norms before clipping (fused foreach kernels on GPU without CPU stall)
         m_grads = [p.grad for group in optimizer.opt_muon.param_groups for p in group["params"] if p.grad is not None]
         # Both AdamW sub-optimizers: opt_adam_sr holds the bf16 embedding (~17% of
         # parameters), so omitting it hid most of the Adam gradient norm.
@@ -805,12 +804,12 @@ def train():
             for p in group["params"]
             if p.grad is not None
         ]
-        muon_grad_norm = torch.linalg.vector_norm(torch.stack(torch._foreach_norm(m_grads))).item() if m_grads else 0.0
-        adam_grad_norm = torch.linalg.vector_norm(torch.stack(torch._foreach_norm(a_grads))).item() if a_grads else 0.0
+        muon_grad_norm_t = torch.linalg.vector_norm(torch.stack(torch._foreach_norm(m_grads))) if m_grads else None
+        adam_grad_norm_t = torch.linalg.vector_norm(torch.stack(torch._foreach_norm(a_grads))) if a_grads else None
 
         # Global gradient clipping (fused C++ foreach multi-tensor)
         all_trainable = [p for p in model.parameters() if p.grad is not None]
-        total_grad_norm = torch.nn.utils.clip_grad_norm_(all_trainable, args.grad_clip, foreach=True).item()
+        total_grad_norm_t = torch.nn.utils.clip_grad_norm_(all_trainable, args.grad_clip, foreach=True)
 
         # Optimizer step
         t_opt_start = time.time()
@@ -830,6 +829,12 @@ def train():
             gpu_fwd_ms = t_fwd_total * 1000.0
             gpu_bwd_ms = t_bwd_total * 1000.0
             gpu_opt_ms = t_opt_total * 1000.0
+
+        # Extract scalar metrics after stream synchronization to eliminate CPU-GPU pipeline bubbles
+        accum_loss = float(accum_loss_tensor.item())
+        muon_grad_norm = float(muon_grad_norm_t.item()) if muon_grad_norm_t is not None else 0.0
+        adam_grad_norm = float(adam_grad_norm_t.item()) if adam_grad_norm_t is not None else 0.0
+        total_grad_norm = float(total_grad_norm_t.item()) if isinstance(total_grad_norm_t, torch.Tensor) else float(total_grad_norm_t)
 
         time_per_token_us = (gpu_step_ms * 1000.0) / max(1, effective_global_batch_tokens)
         fwd_pct = (gpu_fwd_ms / max(1e-3, gpu_step_ms)) * 100.0

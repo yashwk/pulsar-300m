@@ -2684,10 +2684,9 @@ void fused_sr_update_cuda(
 ) {
     int64_t N = dst.numel();
     if (N == 0) return;
-    TORCH_CHECK(dst.is_cuda() && dst.is_contiguous(), "dst must be contiguous CUDA");
-    TORCH_CHECK(dst.scalar_type() == torch::kBFloat16, "dst must be bfloat16");
-    TORCH_CHECK(update.is_cuda() && update.is_contiguous(), "update must be contiguous CUDA");
-    TORCH_CHECK(update.scalar_type() == torch::kBFloat16, "update must be bfloat16");
+    TORCH_CHECK(dst.is_cuda() && update.is_cuda(), "dst and update must be CUDA tensors");
+    TORCH_CHECK(dst.is_contiguous() && update.is_contiguous(), "dst and update must be contiguous");
+    TORCH_CHECK(dst.scalar_type() == torch::kBFloat16 && update.scalar_type() == torch::kBFloat16, "dst and update must be bfloat16");
     TORCH_CHECK(update.numel() == N, "dst and update must have the same number of elements");
 
     int threads = 256;

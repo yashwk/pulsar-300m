@@ -233,6 +233,7 @@ class Muon(_SROptimizerMixin, Optimizer):
                     continue
                 shape_groups.setdefault(p.shape, []).append(p)
 
+            idx = 0
             for shape, plist in shape_groups.items():
                 grads = [p.grad for p in plist]
                 bufs = []
@@ -286,18 +287,20 @@ class Muon(_SROptimizerMixin, Optimizer):
                     # `p *= 1 - lr*wd` unbiased instead of vanishing entirely.
                     decay = (1.0 - lr * wd) if wd > 0 else 1.0
                     scale_step = -lr * scale
+                    g_orth_c = g_orth.contiguous()
                     if (self.stochastic_rounding and HAS_PULSAR_CUDA and p.is_cuda
                             and p.dtype == torch.bfloat16 and not torch.compiler.is_compiling()
                             and hasattr(pulsar_cuda, "fused_sr_update")):
-                        step_seed = (self.seed + self._step_count * 1000003) & 0x7FFFFFFF
-                        pulsar_cuda.fused_sr_update(p.data, g_orth, scale_step, decay, step_seed)
+                        step_seed = (self.seed + self._step_count * 1000003 + idx * 999983) & 0x7FFFFFFF
+                        pulsar_cuda.fused_sr_update(p.data, g_orth_c, scale_step, decay, step_seed)
                     else:
                         noise = None
                         if self.stochastic_rounding and p.dtype == torch.bfloat16:
                             noise = torch.randint(
                                 0, 1 << 16, p.shape, dtype=torch.int32, device=p.device, generator=gen
                             )
-                        p.data.copy_(_fused_decay_update_sr(p.data, g_orth, decay, scale_step, noise))
+                        p.data.copy_(_fused_decay_update_sr(p.data, g_orth_c, decay, scale_step, noise))
+                    idx += 1
 
 
 class AdamWBF16SR(_SROptimizerMixin, _Optimizer):

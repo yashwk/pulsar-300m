@@ -136,7 +136,6 @@ def execute_training(
         "--muon-lr", str(muon_lr),
         "--adam-lr", str(adam_lr),
         "--bias-lr", str(bias_lr),
-        "--muon-momentum-fp32",
         "--moe-capacity-factor", str(moe_capacity_factor),
         "--sampler", sampler,
         "--num-pulses", str(num_pulses),

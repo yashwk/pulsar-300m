@@ -88,6 +88,30 @@ def test_muon_bf16_momentum_not_duplicated_in_checkpoint():
     assert "_fp32_state" not in opt.state_dict()
 
 
+@pytest.mark.skipif(not HAS_CUDA, reason="needs CUDA for tall parameter Muon test")
+def test_muon_tall_parameter_update_matches_direction():
+    """Muon on tall 2D parameters (size(-2) > size(-1)) updates in the correct direction with contiguous memory."""
+    from src.optim import zeropower_via_newtonschulz5
+    torch.manual_seed(42)
+    H, W = 128, 64
+    p = nn.Parameter(torch.zeros(H, W, device="cuda", dtype=torch.bfloat16))
+    p_init = p.detach().clone()
+    g = torch.randn(H, W, device="cuda", dtype=torch.bfloat16)
+    p.grad = g.clone()
+
+    lr = 0.02
+    opt = Muon([p], lr=lr, momentum=0.0, weight_decay=0.0, stochastic_rounding=True, seed=42)
+    opt.step()
+
+    g_orth_ref = zeropower_via_newtonschulz5(g)
+    scale = max(1.0, H / W) ** 0.5
+    expected_delta = -lr * scale * g_orth_ref
+
+    actual_delta = (p.detach() - p_init).float()
+    cos_sim = torch.cosine_similarity(actual_delta.flatten(), expected_delta.flatten(), dim=0)
+    assert cos_sim.item() > 0.99, f"Tall 2D update direction mismatch: cos_sim={cos_sim.item():.4f}"
+
+
 # ---------------------------------------------------------------------------
 # Stochastic Rounding & AdamWBF16SR Contract Tests
 # ---------------------------------------------------------------------------

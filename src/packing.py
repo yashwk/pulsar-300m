@@ -456,6 +456,16 @@ class PackedBatchLoader:
         self._cursor = 0
         self._last_n_real: list[int] = []
 
+        is_cuda = (
+            device == "cuda"
+            or (isinstance(device, str) and device.startswith("cuda"))
+            or (isinstance(device, torch.device) and device.type == "cuda")
+        )
+        self.is_cuda = is_cuda
+        can_pin = is_cuda and torch.cuda.is_available()
+        self.x_buf = torch.empty((micro_batch_size, self.seq_len), dtype=torch.long, pin_memory=can_pin)
+        self.y_buf = torch.empty((micro_batch_size, self.seq_len), dtype=torch.long, pin_memory=can_pin)
+
     def reset(self) -> None:
         self._cursor = 0
         self._last_n_real = []
@@ -494,11 +504,16 @@ class PackedBatchLoader:
             self._cursor += self.micro_batch_size
         else:
             ids = list(window_ids)
-        xs, ys = [], []
+        n_req = len(ids)
+        if self.x_buf.shape[0] < n_req:
+            can_pin = self.is_cuda and torch.cuda.is_available()
+            self.x_buf = torch.empty((n_req, self.seq_len), dtype=torch.long, pin_memory=can_pin)
+            self.y_buf = torch.empty((n_req, self.seq_len), dtype=torch.long, pin_memory=can_pin)
+
         # Cleared per call: this was appended to forever, leaking memory over training.
         self._last_n_real.clear()
         n_windows = len(self.plan.windows)
-        for wid in ids:
+        for i, wid in enumerate(ids):
             if n_windows == 0:
                 break
             wid = wid % n_windows   # next epoch: reuse the plan cyclically
@@ -515,15 +530,18 @@ class PackedBatchLoader:
             if n_real > 1:
                 eos_at = np.flatnonzero(toks[: n_real - 1] == self.eos_id)
                 y[eos_at] = self.ignore_index
-            xs.append(toks)
-            ys.append(y)
+            self.x_buf[i].copy_(torch.from_numpy(toks))
+            self.y_buf[i].copy_(torch.from_numpy(y))
             self._last_n_real.append(int(n_real))
-        if not xs:
+        if not self._last_n_real:
             raise IndexError("no windows left in plan")
-        return (
-            torch.from_numpy(np.stack(xs)).to(self.device),
-            torch.from_numpy(np.stack(ys)).to(self.device),
-        )
+        count = len(self._last_n_real)
+        if self.is_cuda:
+            return (
+                self.x_buf[:count].to(self.device, non_blocking=True),
+                self.y_buf[:count].to(self.device, non_blocking=True),
+            )
+        return self.x_buf[:count].clone(), self.y_buf[:count].clone()
 
     def routing_mask(self, x: torch.Tensor) -> torch.Tensor:
         """Boolean mask of positions that may enter MoE routing and expert counts.
@@ -538,7 +556,6 @@ class PackedBatchLoader:
         if not self._last_n_real or all(n == self.seq_len for n in self._last_n_real[-rows:]):
             return torch.ones_like(x, dtype=torch.bool)
         n_real = self._last_n_real[-rows:]
-        mask = torch.zeros_like(x, dtype=torch.bool)
-        for r, n in enumerate(n_real):
-            mask[r, :n] = True
-        return mask
+        lengths = torch.as_tensor(n_real, device=x.device, dtype=torch.int64).unsqueeze(1)
+        col_idx = torch.arange(x.shape[1], device=x.device).unsqueeze(0)
+        return col_idx < lengths

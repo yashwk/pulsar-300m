@@ -35,7 +35,7 @@ class PulsarConfig:
     top_k: int = 4
     eos_token_id: int = 0
     rms_eps: float = 1e-6
-    ce_chunk_size: int = 4096
+    ce_chunk_size: int = 32768
     # Divided by n_core*K (=24) when applied, so the effective weight is 4.2e-5.
     # Raised from 1e-4 because centring the logits and slowing the router reduced the
     # only remaining regulariser on router magnitude.
@@ -474,7 +474,7 @@ class PulsarAttention(nn.Module):
             v_first = v
         elif v_first is not None:
             lv = torch.sigmoid(self.v_resid_lambda[pulse_idx]).to(v.dtype)
-            v = (1.0 - lv) * v + lv * v_first
+            v = torch.lerp(v, v_first, lv)
 
         # Per-Pulse, Per-Head QK-RMSNorm (Fused single-warp reduction CUDA kernel).
         # The kernel is written for head_dim == 64: each of the 32 lanes handles one
@@ -538,9 +538,7 @@ class PulsarAttention(nn.Module):
         gate_w = self.attn_gate[pulse_idx].to(x.dtype)
         gate_b = self.attn_gate_bias[pulse_idx].to(x.dtype)
         g = torch.sigmoid(F.linear(x, gate_w, gate_b))  # [B, T, n_heads]
-        out = out * g.transpose(1, 2).unsqueeze(-1)
-
-        out = out.transpose(1, 2).contiguous().view(B, T, -1)
+        out = (out.transpose(1, 2) * g.unsqueeze(-1)).reshape(B, T, -1)
         return self.wo(out), v_first
 
 
@@ -817,8 +815,8 @@ class PulsarMoEMLP(nn.Module):
         # The transients are small (N x E), unlike an FP32 copy of x.
         router_w = self.router_weight[pulse_idx]
         logits = F.linear(
-            x_flat.float(), router_w.float() if router_w.dtype != torch.float32 else router_w
-        )  # [N, E] fp32
+            x_flat, router_w.to(x_flat.dtype)
+        ).float()  # [N, E] fp32
         # Centre the logits across experts. Top-k selection and the bias addition are
         # both invariant to a per-token constant, so this changes nothing mathematically
         # but keeps the absolute scale from drifting with the shared batch-mean component
@@ -954,7 +952,7 @@ class PulsarMoEMLP(nn.Module):
             routed_only = _FusedMoECombineFunction.apply(
                 expert_out, topk_idx, topk_weights, token_to_slot, None
             )
-            out = (shared_out + routed_only * r_scale).view(B, T, D)
+            out = torch.addcmul(shared_out, routed_only, r_scale).view(B, T, D)
         else:
             # Fallback for CPU, non-bf16, torch.compile, or environments without custom CUDA extension.
             # Vectorized PyTorch MoE engine: zero Python loops over experts, zero dynamic shape
@@ -989,7 +987,7 @@ class PulsarMoEMLP(nn.Module):
             routed_out.index_add_(0, flat_token_idx, contrib)
 
             r_scale = self.routed_scale[pulse_idx].to(x.dtype)
-            out = (shared_out + routed_out * r_scale).view(B, T, D)
+            out = torch.addcmul(shared_out, routed_out, r_scale).view(B, T, D)
         # Router confidence = mean max gating weight. topk_weights are normalised to sum
         # to 1 per token, so their mean over all (token, k) entries is exactly 0.5 no
         # matter what the router does - the old value was pinned at 0.5 by construction.
@@ -1359,7 +1357,7 @@ class PulsarForCausalLM(nn.Module):
         """Mean soft-capped cross-entropy over all tokens, chunked to bound VRAM."""
         h_flat = h.reshape(-1, self.cfg.d_model)
         tgt_flat = labels.reshape(-1)
-        chunk = getattr(self.cfg, "ce_chunk_size", 4096)
+        chunk = getattr(self.cfg, "ce_chunk_size", 32768)
         total = torch.zeros((), device=h_flat.device, dtype=torch.float32)
         for i in range(0, h_flat.size(0), chunk):
             hc = h_flat[i:i + chunk]
@@ -1454,7 +1452,7 @@ class PulsarForCausalLM(nn.Module):
                 h_in = h_0_norm + step_emb
             else:
                 mix_k = torch.sigmoid(self.input_mix_logit[k]).to(h_pulse.dtype)
-                h_in = (1.0 - mix_k) * self.pulse_state_norm(h_pulse) + mix_k * h_0_norm + step_emb
+                h_in = torch.lerp(self.pulse_state_norm(h_pulse), h_0_norm, mix_k) + step_emb
 
             # 2. Core 8-block recurrent pass
             h_curr = h_in

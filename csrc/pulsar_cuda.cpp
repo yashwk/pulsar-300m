@@ -101,6 +101,51 @@ torch::Tensor moe_router_topk_backward_cuda(
     float z_loss_weight = 1e-4f
 );
 
+std::vector<torch::Tensor> qk_rmsnorm_rope_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor cos,
+    torch::Tensor sin,
+    int64_t T,
+    float eps
+);
+
+std::vector<torch::Tensor> qk_rmsnorm_rope_backward_cuda(
+    torch::Tensor dy,
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor rsqrt_in,
+    torch::Tensor cos,
+    torch::Tensor sin,
+    int64_t T
+);
+
+torch::Tensor fused_attn_gate_forward_cuda(
+    torch::Tensor attn_out,
+    torch::Tensor gate_logits
+);
+
+std::vector<torch::Tensor> fused_attn_gate_backward_cuda(
+    torch::Tensor grad_out,
+    torch::Tensor attn_out,
+    torch::Tensor gate_logits
+);
+
+std::vector<torch::Tensor> moe_slots_from_order_cuda(
+    torch::Tensor flat_e,
+    torch::Tensor order,
+    int64_t num_experts,
+    int64_t capacity
+);
+
+void fused_sr_update_cuda(
+    torch::Tensor dst,
+    torch::Tensor update,
+    float lr_scale,
+    float wd_factor,
+    int64_t seed
+);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rmsnorm_forward", &rmsnorm_forward_cuda, "RMSNorm Forward (CUDA)");
     m.def("rmsnorm_backward", &rmsnorm_backward_cuda, "RMSNorm Backward (CUDA)");
@@ -117,6 +162,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_combine_backward", &moe_combine_backward_cuda, "Fused MoE Combine Backward (CUDA)");
     m.def("qk_rmsnorm_forward", &qk_rmsnorm_forward_cuda, "Fused QK-RMSNorm Forward (CUDA)");
     m.def("qk_rmsnorm_backward", &qk_rmsnorm_backward_cuda, "Fused QK-RMSNorm Backward (CUDA)");
+    m.def("qk_rmsnorm_rope_forward", &qk_rmsnorm_rope_forward_cuda, "Fused QK-RMSNorm + RoPE Forward (CUDA)",
+          py::arg("x"), py::arg("weight"), py::arg("cos"), py::arg("sin"), py::arg("T"), py::arg("eps") = 1e-6f);
+    m.def("qk_rmsnorm_rope_backward", &qk_rmsnorm_rope_backward_cuda, "Fused QK-RMSNorm + RoPE Backward (CUDA)",
+          py::arg("dy"), py::arg("x"), py::arg("weight"), py::arg("rsqrt_in"), py::arg("cos"), py::arg("sin"), py::arg("T"));
+
+    m.def("fused_attn_gate_forward", &fused_attn_gate_forward_cuda, "Fused Attention Gate + Transpose Forward (CUDA)",
+          py::arg("attn_out"), py::arg("gate_logits"));
+    m.def("fused_attn_gate_backward", &fused_attn_gate_backward_cuda, "Fused Attention Gate + Transpose Backward (CUDA)",
+          py::arg("grad_out"), py::arg("attn_out"), py::arg("gate_logits"));
+
+    m.def("moe_slots_from_order", &moe_slots_from_order_cuda, "Fused MoE Slots from Order (CUDA)",
+          py::arg("flat_e"), py::arg("order"), py::arg("num_experts"), py::arg("capacity"));
+
+    m.def("fused_sr_update", &fused_sr_update_cuda, "Fused Muon Stochastic Rounding Update (CUDA)",
+          py::arg("dst"), py::arg("update"), py::arg("lr_scale"), py::arg("wd_factor"), py::arg("seed"));
+
     m.def("fused_softcap_ce_forward", &fused_softcap_ce_forward_cuda, "Fused Softcap Cross-Entropy Forward (CUDA)",
           py::arg("logits"), py::arg("targets"), py::arg("softcap") = 30.0f, py::arg("ignore_index") = -100);
     m.def("fused_softcap_ce_backward", &fused_softcap_ce_backward_cuda, "Fused Softcap Cross-Entropy Backward (CUDA)",

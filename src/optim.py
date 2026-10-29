@@ -28,6 +28,12 @@ import torch
 from torch.optim import Optimizer as _Optimizer
 from torch.optim import Optimizer
 
+try:
+    import pulsar_cuda
+    HAS_PULSAR_CUDA = True
+except ImportError:
+    HAS_PULSAR_CUDA = False
+
 
 @torch.compile
 def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
@@ -228,21 +234,22 @@ class Muon(_SROptimizerMixin, Optimizer):
                 shape_groups.setdefault(p.shape, []).append(p)
 
             for shape, plist in shape_groups.items():
-                g_updates = []
-                for p in plist:
-                    g = p.grad
+                grads = [p.grad for p in plist]
+                bufs = []
+                for p, g in zip(plist, grads):
                     state = self.state[p]
                     if "momentum_buffer" not in state:
                         buf_dtype = torch.float32 if self.momentum_fp32 else g.dtype
                         state["momentum_buffer"] = torch.zeros_like(g, dtype=buf_dtype)
-                    buf = state["momentum_buffer"]
-                    buf.mul_(momentum).add_(g.to(buf.dtype))
-                    # Keep the Nesterov combination in bf16 all the way through
-                    # Newton-Schulz. Promoting to FP32 here allocated an extra copy of
-                    # one [8, 1024, 2048] expert tensor (~67 MB, and the following cat
-                    # doubles it) only to be cast straight back to bf16.
-                    # Measured on that tensor: bf16 path 478 MB peak, FP32 path 545 MB.
-                    g_updates.append(g.to(torch.bfloat16).add(buf.to(torch.bfloat16), alpha=momentum))
+                    bufs.append(state["momentum_buffer"])
+
+                # Batched foreach momentum update
+                torch._foreach_mul_(bufs, momentum)
+                torch._foreach_add_(bufs, [g.to(b.dtype) for g, b in zip(grads, bufs)])
+                g_updates = [
+                    g.to(torch.bfloat16).add(buf.to(torch.bfloat16), alpha=momentum)
+                    for g, buf in zip(grads, bufs)
+                ]
 
                 # Batch along dim 0: 2D matrices stack to [N, H, W]; 3D expert tensors cat to [N*E, H, W]
                 is_3d = (len(shape) == 3)
@@ -279,12 +286,18 @@ class Muon(_SROptimizerMixin, Optimizer):
                     # `p *= 1 - lr*wd` unbiased instead of vanishing entirely.
                     decay = (1.0 - lr * wd) if wd > 0 else 1.0
                     scale_step = -lr * scale
-                    noise = None
-                    if self.stochastic_rounding and p.dtype == torch.bfloat16:
-                        noise = torch.randint(
-                            0, 1 << 16, p.shape, dtype=torch.int32, device=p.device, generator=gen
-                        )
-                    p.data.copy_(_fused_decay_update_sr(p.data, g_orth, decay, scale_step, noise))
+                    if (self.stochastic_rounding and HAS_PULSAR_CUDA and p.is_cuda
+                            and p.dtype == torch.bfloat16 and not torch.compiler.is_compiling()
+                            and hasattr(pulsar_cuda, "fused_sr_update")):
+                        step_seed = (self.seed + self._step_count * 1000003) & 0x7FFFFFFF
+                        pulsar_cuda.fused_sr_update(p.data, g_orth, scale_step, decay, step_seed)
+                    else:
+                        noise = None
+                        if self.stochastic_rounding and p.dtype == torch.bfloat16:
+                            noise = torch.randint(
+                                0, 1 << 16, p.shape, dtype=torch.int32, device=p.device, generator=gen
+                            )
+                        p.data.copy_(_fused_decay_update_sr(p.data, g_orth, decay, scale_step, noise))
 
 
 class AdamWBF16SR(_SROptimizerMixin, _Optimizer):

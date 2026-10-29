@@ -483,3 +483,132 @@ def test_forward_backward_in_both_dtypes_on_cuda():
         _, loss, _ = model(x, labels=y, num_pulses=2)
         loss.backward()
         assert torch.isfinite(loss)
+
+
+# ---------------------------------------------------------------------------
+# Fused QK-RMSNorm + RoPE
+# ---------------------------------------------------------------------------
+
+@needs_gpu
+@needs_cuda_ext
+def test_fused_qk_rmsnorm_rope_parity():
+    """_FusedQKRMSNormRoPEFunction forward and backward match unfused QK-RMSNorm + RoPE."""
+    import pulsar_cuda
+    from src.model import _FusedQK_RMSNormFunction, _FusedQKRMSNormRoPEFunction, apply_rotary_emb
+
+    B, H, T, D = 2, 4, 16, 64
+    x1 = _bf16(B, H, T, D, seed=42).requires_grad_(True)
+    x2 = x1.detach().clone().requires_grad_(True)
+    w1 = torch.randn(H, D, device="cuda", dtype=torch.float32, requires_grad=True)
+    w2 = w1.detach().clone().requires_grad_(True)
+
+    # cos and sin tables
+    theta = 10000.0
+    inv_freq = 1.0 / (theta ** (torch.arange(0, D, 2, device="cuda").float() / D))
+    t = torch.arange(T, device="cuda", dtype=torch.float32)
+    freqs = torch.outer(t, inv_freq)
+    cos = freqs.cos()
+    sin = freqs.sin()
+
+    # Fused pass
+    out_fused = _FusedQKRMSNormRoPEFunction.apply(x1, w1, cos, sin, T, 1e-6)
+    out_fused.sum().backward()
+
+    # Unfused reference pass
+    q_norm = _FusedQK_RMSNormFunction.apply(x2, w2, T, 1e-6)
+    out_unfused = apply_rotary_emb(q_norm, cos, sin)
+    out_unfused.sum().backward()
+
+    assert_close(out_fused, out_unfused, atol=3.5e-2, msg="fwd qk_rmsnorm_rope match")
+    assert_close(x1.grad, x2.grad, atol=3.5e-2, msg="dx qk_rmsnorm_rope match")
+    assert_close(w1.grad, w2.grad, atol=6e-2, msg="dw qk_rmsnorm_rope match")
+
+
+# ---------------------------------------------------------------------------
+# Fused Attention Gate + Layout Transpose
+# ---------------------------------------------------------------------------
+
+@needs_gpu
+@needs_cuda_ext
+def test_fused_attn_gate_parity():
+    """_FusedAttnGateFunction forward and backward match unfused transpose + sigmoid gate."""
+    from src.model import _FusedAttnGateFunction
+
+    B, H, T, D = 2, 4, 16, 64
+    attn_out1 = _bf16(B, H, T, D, seed=101).requires_grad_(True)
+    attn_out2 = attn_out1.detach().clone().requires_grad_(True)
+
+    gate_logits1 = torch.randn(B, T, H, device="cuda", dtype=torch.float32, requires_grad=True)
+    gate_logits2 = gate_logits1.detach().clone().requires_grad_(True)
+
+    # Fused
+    out_fused = _FusedAttnGateFunction.apply(attn_out1, gate_logits1)
+    out_fused.sum().backward()
+
+    # Unfused reference
+    g = torch.sigmoid(gate_logits2)
+    out_unfused = (attn_out2.transpose(1, 2) * g.unsqueeze(-1)).reshape(B, T, -1)
+    out_unfused.sum().backward()
+
+    assert_close(out_fused, out_unfused, atol=2e-3, msg="fwd attn_gate match")
+    assert_close(attn_out1.grad, attn_out2.grad, atol=2e-3, msg="d_attn_out match")
+    assert_close(gate_logits1.grad, gate_logits2.grad, atol=2e-3, msg="d_gate_logits match")
+
+
+# ---------------------------------------------------------------------------
+# Fused MoE Slot Assignment & Histogram from Order
+# ---------------------------------------------------------------------------
+
+@needs_gpu
+@needs_cuda_ext
+def test_moe_slots_from_order_parity():
+    """moe_slots_from_order matches eager histogram, prefix sum, and slot assignment."""
+    import pulsar_cuda
+    from src.model import _make_sort_key_eager, _compute_slot_assignment_eager
+
+    M = 128
+    E = 8
+    capacity = 16
+    flat_e = torch.randint(0, E, (M,), device="cuda", dtype=torch.long)
+    flat_w = torch.rand(M, device="cuda", dtype=torch.float32)
+
+    sort_key = _make_sort_key_eager(flat_e, flat_w)
+    order = torch.argsort(sort_key, stable=True)
+
+    # CUDA kernel
+    slots_cuda, counts_cuda = pulsar_cuda.moe_slots_from_order(flat_e, order, E, capacity)
+
+    # Reference
+    e_sorted = flat_e[order]
+    counts_ref = torch.zeros(E, device="cuda", dtype=torch.long)
+    counts_ref.index_add_(0, e_sorted, torch.ones(M, device="cuda", dtype=torch.long))
+    start_sorted = counts_ref.cumsum(0) - counts_ref
+    slots_ref = _compute_slot_assignment_eager(start_sorted, e_sorted, capacity, order)
+
+    assert torch.equal(counts_cuda, counts_ref)
+    assert torch.equal(slots_cuda, slots_ref)
+
+
+# ---------------------------------------------------------------------------
+# Fused Muon Weight Decay + Stochastic Rounding Update
+# ---------------------------------------------------------------------------
+
+@needs_gpu
+@needs_cuda_ext
+def test_fused_sr_update_parity():
+    """fused_sr_update preserves sub-ulp accumulation within statistical tolerance."""
+    import pulsar_cuda
+
+    n = 4096
+    dst = torch.full((n,), 0.02, dtype=torch.bfloat16, device="cuda")
+    step = 3e-5
+    update = torch.full((n,), 1.0, dtype=torch.bfloat16, device="cuda")
+
+    reps = 1000
+    for i in range(reps):
+        pulsar_cuda.fused_sr_update(dst, update, step, 1.0, 42 + i * 10007)
+
+    expected_drift = reps * step
+    got_drift = (dst.float() - 0.02).mean().item()
+    lo, hi = 0.85 * expected_drift, 1.15 * expected_drift
+    assert lo <= got_drift <= hi

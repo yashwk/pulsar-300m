@@ -141,6 +141,43 @@ class _FusedQK_RMSNormFunction(torch.autograd.Function):
         return dx, dweight.to(weight.dtype), None, None
 
 
+class _FusedQKRMSNormRoPEFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, weight: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, T: int, eps: float):
+        x_c = x.contiguous()
+        weight_f = weight.float().contiguous()
+        cos_f = cos.float().contiguous()
+        sin_f = sin.float().contiguous()
+        y, rsqrt = pulsar_cuda.qk_rmsnorm_rope_forward(x_c, weight_f, cos_f, sin_f, T, eps)
+        ctx.save_for_backward(x_c, weight, rsqrt, cos, sin)
+        ctx.T = T
+        return y
+
+    @staticmethod
+    def backward(ctx, dy: torch.Tensor):
+        x_c, weight, rsqrt, cos, sin = ctx.saved_tensors
+        weight_f = weight.float().contiguous()
+        cos_f = cos.float().contiguous()
+        sin_f = sin.float().contiguous()
+        dx, dweight = pulsar_cuda.qk_rmsnorm_rope_backward(dy.contiguous(), x_c, weight_f, rsqrt, cos_f, sin_f, ctx.T)
+        return dx, dweight.to(weight.dtype), None, None, None, None
+
+
+class _FusedAttnGateFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, attn_out: torch.Tensor, gate_logits: torch.Tensor):
+        ctx.save_for_backward(attn_out, gate_logits)
+        return pulsar_cuda.fused_attn_gate_forward(attn_out.contiguous(), gate_logits.contiguous())
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        attn_out, gate_logits = ctx.saved_tensors
+        d_attn_out, d_gate_logits = pulsar_cuda.fused_attn_gate_backward(
+            grad_out.contiguous(), attn_out.contiguous(), gate_logits.contiguous()
+        )
+        return d_attn_out, d_gate_logits
+
+
 class _FusedSoftcapCrossEntropyFunction(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -477,7 +514,7 @@ class PulsarAttention(nn.Module):
             lv = torch.sigmoid(self.v_resid_lambda[pulse_idx]).to(v.dtype)
             v = torch.lerp(v, v_first, lv).contiguous()
 
-        # Per-Pulse, Per-Head QK-RMSNorm (Fused single-warp reduction CUDA kernel).
+        # Per-Pulse, Per-Head QK-RMSNorm + RoPE (Fused single-warp reduction CUDA kernel).
         # The kernel is written for head_dim == 64: each of the 32 lanes handles one
         # (even, odd) pair, i.e. exactly 64 elements. It does NOT validate head_dim, so
         # any other value makes the upper lanes read and write past the end of the
@@ -485,9 +522,9 @@ class PulsarAttention(nn.Module):
         # here and fall back to the PyTorch path for other head dims.
         if (HAS_PULSAR_CUDA and self.head_dim == 64 and q.is_cuda
                 and q.dtype == torch.bfloat16 and not torch.compiler.is_compiling()
-                and hasattr(pulsar_cuda, "qk_rmsnorm_forward")):
-            q = _FusedQK_RMSNormFunction.apply(q, self.q_norm_weight[pulse_idx], T, self.cfg.rms_eps)
-            k = _FusedQK_RMSNormFunction.apply(k, self.k_norm_weight[pulse_idx], T, self.cfg.rms_eps)
+                and hasattr(pulsar_cuda, "qk_rmsnorm_rope_forward")):
+            q = _FusedQKRMSNormRoPEFunction.apply(q, self.q_norm_weight[pulse_idx], cos, sin, T, self.cfg.rms_eps)
+            k = _FusedQKRMSNormRoPEFunction.apply(k, self.k_norm_weight[pulse_idx], cos, sin, T, self.cfg.rms_eps)
         else:
             q_rms = torch.rsqrt(q.float().pow(2).mean(-1, keepdim=True) + self.cfg.rms_eps)
             scale_q = self.q_norm_weight[pulse_idx].view(1, self.n_heads, 1, self.head_dim)
@@ -497,9 +534,9 @@ class PulsarAttention(nn.Module):
             scale_k = self.k_norm_weight[pulse_idx].view(1, self.n_kv_heads, 1, self.head_dim)
             k = (scale_k.float() * (k.float() * k_rms)).to(k.dtype)
 
-        # Apply RoPE
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+            # Apply RoPE
+            q = apply_rotary_emb(q, cos, sin)
+            k = apply_rotary_emb(k, cos, sin)
 
         # Global layers (3 & 7): YaRN-style temperature scaling. The scale is a function
         # of each QUERY POSITION, not of the call's total length:
@@ -538,8 +575,14 @@ class PulsarAttention(nn.Module):
         # Pulse-Indexed 16-Head Output Gate
         gate_w = self.attn_gate[pulse_idx].to(x.dtype)
         gate_b = self.attn_gate_bias[pulse_idx].to(x.dtype)
-        g = torch.sigmoid(F.linear(x, gate_w, gate_b))  # [B, T, n_heads]
-        out = (out.transpose(1, 2) * g.unsqueeze(-1)).reshape(B, T, -1)
+        gate_logits = F.linear(x, gate_w, gate_b)
+        if (HAS_PULSAR_CUDA and out.is_cuda and out.dtype == torch.bfloat16
+                and self.head_dim == 64 and not torch.compiler.is_compiling()
+                and hasattr(pulsar_cuda, "fused_attn_gate_forward")):
+            out = _FusedAttnGateFunction.apply(out, gate_logits)
+        else:
+            g = torch.sigmoid(gate_logits)  # [B, T, n_heads]
+            out = (out.transpose(1, 2) * g.unsqueeze(-1)).reshape(B, T, -1)
         return self.wo(out), v_first
 
 
@@ -669,6 +712,13 @@ def compute_token_slots(
         # w / (1.0 + w) strictly preserves monotonic ordering for any w in [0, inf) and maps into [0, 1):
         sort_key = _make_sort_key(flat_e, flat_w)
         order = torch.argsort(sort_key, stable=True)
+        if HAS_PULSAR_CUDA and flat_e.is_cuda and not torch.compiler.is_compiling() and hasattr(pulsar_cuda, "moe_slots_from_order"):
+            slots, counts_sorted = pulsar_cuda.moe_slots_from_order(flat_e, order, num_experts, capacity)
+            res_slots = slots.view(N, K)
+            if return_counts:
+                return res_slots, counts_sorted
+            return res_slots
+
         e_sorted = flat_e[order]
         counts_sorted = torch.zeros(num_experts, device=device, dtype=torch.long)
         counts_sorted.index_add_(0, e_sorted, torch.ones(M, device=device, dtype=torch.long))

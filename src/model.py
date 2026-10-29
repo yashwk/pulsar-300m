@@ -621,7 +621,8 @@ def compute_token_slots(
     topk_weights: torch.Tensor,
     num_experts: int,
     capacity: int,
-) -> torch.Tensor:
+    return_counts: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Assign each (token, k) assignment to a slot, deterministically.
 
     The kernel used to assign slots with ``atomicAdd``, so which assignments overflowed
@@ -638,13 +639,17 @@ def compute_token_slots(
     sort entirely.
 
     Returns int32 ``[N, K]`` with the slot index, or -1 for a dropped assignment.
+    If ``return_counts`` is True, also returns ``counts_sorted`` ([E] int64 tensor).
     """
     N, K = topk_idx.shape
     device = topk_idx.device
     flat_e = topk_idx.reshape(-1).long()
     M = flat_e.numel()
     if M == 0:
-        return torch.empty((N, K), dtype=torch.int32, device=device)
+        empty_slots = torch.empty((N, K), dtype=torch.int32, device=device)
+        if return_counts:
+            return empty_slots, torch.zeros(num_experts, device=device, dtype=torch.long)
+        return empty_slots
 
     with torch.no_grad():
         # Single path, no branch and no host sync.
@@ -669,7 +674,10 @@ def compute_token_slots(
         counts_sorted.index_add_(0, e_sorted, torch.ones(M, device=device, dtype=torch.long))
         start_sorted = counts_sorted.cumsum(0) - counts_sorted
         slots = _compute_slot_assignment(start_sorted, e_sorted, capacity, order)
-        return slots.view(N, K)
+        res_slots = slots.view(N, K)
+        if return_counts:
+            return res_slots, counts_sorted
+        return res_slots
 
 
 class _FusedMoEDispatchFunction(torch.autograd.Function):
@@ -920,25 +928,41 @@ class PulsarMoEMLP(nn.Module):
         # of dropped assignments is the count of negative slots. Deriving drops from
         # bincounts only equals that while the slot logic is correct - the fast-path bug
         # discarded ~85% of assignments while this metric read 0%.
-        token_to_slot = compute_token_slots(
-            topk_idx, topk_weights, self.cfg.n_routed_experts, capacity
-        )
-        if valid is not None:
+        bincounts = None
+        if valid is None:
+            try:
+                res = compute_token_slots(
+                    topk_idx, topk_weights, self.cfg.n_routed_experts, capacity, return_counts=True
+                )
+            except TypeError:
+                res = compute_token_slots(
+                    topk_idx, topk_weights, self.cfg.n_routed_experts, capacity
+                )
+            if isinstance(res, tuple):
+                token_to_slot, counts_sorted = res
+                bincounts = counts_sorted.to(torch.float32)
+            else:
+                token_to_slot = res
+        else:
+            token_to_slot = compute_token_slots(
+                topk_idx, topk_weights, self.cfg.n_routed_experts, capacity
+            )
             token_to_slot = torch.where(valid.unsqueeze(-1), token_to_slot, torch.full_like(token_to_slot, -1))
 
         with torch.no_grad():
-            bincounts = torch.zeros(self.cfg.n_routed_experts, device=x.device, dtype=torch.float32)
-            count_idx = topk_idx.reshape(-1)
-            # Branch-free, so no host sync on `valid.all()`. Padded assignments are
-            # remapped onto expert 0 and weighted 0, which index_add_ discards; the
-            # unmasked case is simply the same expression with an all-ones weight.
-            if valid is not None:
-                assign_valid = valid.repeat_interleave(self.cfg.top_k)
-                weights = assign_valid.to(torch.float32)
-                count_idx = torch.where(assign_valid, count_idx, torch.zeros_like(count_idx))
-            else:
-                weights = torch.ones(topk_idx.numel(), device=x.device, dtype=torch.float32)
-            bincounts.index_add_(0, count_idx, weights)
+            if bincounts is None:
+                bincounts = torch.zeros(self.cfg.n_routed_experts, device=x.device, dtype=torch.float32)
+                count_idx = topk_idx.reshape(-1)
+                # Branch-free, so no host sync on `valid.all()`. Padded assignments are
+                # remapped onto expert 0 and weighted 0, which index_add_ discards; the
+                # unmasked case is simply the same expression with an all-ones weight.
+                if valid is not None:
+                    assign_valid = valid.repeat_interleave(self.cfg.top_k)
+                    weights = assign_valid.to(torch.float32)
+                    count_idx = torch.where(assign_valid, count_idx, torch.zeros_like(count_idx))
+                else:
+                    weights = torch.ones(topk_idx.numel(), device=x.device, dtype=torch.float32)
+                bincounts.index_add_(0, count_idx, weights)
             # Counters feed the auxiliary-loss-free bias update, so only TRAINING
             # forwards may move them. Validation and generation were accumulating too:
             # one eval forward added 768 assignments and shifted the routing bias before
@@ -982,14 +1006,13 @@ class PulsarMoEMLP(nn.Module):
             # Batched expert projections with ZERO weight stacking
             gu = torch.bmm(expert_inputs, self.routed_gate_up)              # [E, C, 2048]
             act = _FusedSwiGLUFunction.apply(gu, self.cfg.d_expert)          # [E, C, 1024]
-            expert_out = torch.bmm(act, self.routed_down)                   # [E, C, 1024]
+            r_scale = self.routed_scale[pulse_idx].to(x.dtype)
+            expert_out = torch.bmm(act, self.routed_down.to(act.dtype) * r_scale.view(1, 1, D)) # [E, C, 1024]
 
             # Fused combine with shared expert residual initialization (zero extra memory roundtrips)
-            r_scale = self.routed_scale[pulse_idx].to(x.dtype)
-            routed_only = _FusedMoECombineFunction.apply(
-                expert_out, topk_idx, topk_weights, token_to_slot, None
-            )
-            out = torch.addcmul(shared_out, routed_only, r_scale).view(B, T, D)
+            out = _FusedMoECombineFunction.apply(
+                expert_out, topk_idx, topk_weights, token_to_slot, shared_out
+            ).view(B, T, D)
         else:
             # Fallback for CPU, non-bf16, torch.compile, or environments without custom CUDA extension.
             # Vectorized PyTorch MoE engine: zero Python loops over experts, zero dynamic shape
@@ -1013,7 +1036,8 @@ class PulsarMoEMLP(nn.Module):
             # Batched 3D GEMMs with ZERO weight stacking
             gu = torch.bmm(expert_inputs, self.routed_gate_up)
             act = _FusedSwiGLUFunction.apply(gu, self.cfg.d_expert)
-            expert_out = torch.bmm(act, self.routed_down.to(act.dtype))
+            r_scale = self.routed_scale[pulse_idx].to(x.dtype)
+            expert_out = torch.bmm(act, self.routed_down.to(act.dtype) * r_scale.view(1, 1, D))
 
             # Vectorized gather
             expert_out_flat = expert_out.view(E * C, D)
@@ -1023,8 +1047,7 @@ class PulsarMoEMLP(nn.Module):
             routed_out = torch.zeros(N, D, device=x.device, dtype=x.dtype)
             routed_out.index_add_(0, flat_token_idx, contrib)
 
-            r_scale = self.routed_scale[pulse_idx].to(x.dtype)
-            out = torch.addcmul(shared_out, routed_out, r_scale).view(B, T, D)
+            out = (shared_out + routed_out).view(B, T, D)
         # Router confidence = mean max gating weight. topk_weights are normalised to sum
         # to 1 per token, so their mean over all (token, k) entries is exactly 0.5 no
         # matter what the router does - the old value was pinned at 0.5 by construction.

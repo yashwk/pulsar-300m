@@ -1058,8 +1058,8 @@ __global__ void moe_dispatch_forward_kernel(
     if (expert_id < 0 || expert_id >= E) return;
 
     int token_idx = idx / K;
-    const __nv_bfloat16* src = x + token_idx * D;
-    __nv_bfloat16* dst = expert_inputs + (expert_id * C + slot) * D;
+    const __nv_bfloat16* src = x + (int64_t)token_idx * D;
+    __nv_bfloat16* dst = expert_inputs + (int64_t)(expert_id * C + slot) * D;
 
     if (D % 8 == 0) {
         int num_vec = D / 8;
@@ -1083,7 +1083,7 @@ __global__ void moe_dispatch_backward_kernel(
     int token_idx = blockIdx.x; // Block per token: 0 <= token_idx < N
     if (token_idx >= N) return;
 
-    __nv_bfloat16* dx_ptr = dx + token_idx * D;
+    __nv_bfloat16* dx_ptr = dx + (int64_t)token_idx * D;
     int num_vec = D / 8;
 
     for (int v = threadIdx.x; v < num_vec; v += blockDim.x) {
@@ -1096,7 +1096,7 @@ __global__ void moe_dispatch_backward_kernel(
 
             if (slot >= 0 && slot < C && expert_id >= 0 && expert_id < E) {
                 uint4 in_u4 = *reinterpret_cast<const uint4*>(
-                    d_expert_inputs + ((expert_id * C + slot) * D + v * 8)
+                    d_expert_inputs + ((int64_t)(expert_id * C + slot) * D + v * 8)
                 );
                 const __nv_bfloat16* in_bf = reinterpret_cast<const __nv_bfloat16*>(&in_u4);
                 #pragma unroll
@@ -1127,7 +1127,7 @@ __global__ void moe_combine_forward_kernel(
     int token_idx = blockIdx.x; // Block per token: 0 <= token_idx < N
     if (token_idx >= N) return;
 
-    __nv_bfloat16* out_ptr = routed_out + token_idx * D;
+    __nv_bfloat16* out_ptr = routed_out + (int64_t)token_idx * D;
     int num_vec = D / 8;
 
     for (int v = threadIdx.x; v < num_vec; v += blockDim.x) {
@@ -1135,7 +1135,7 @@ __global__ void moe_combine_forward_kernel(
 
         // Fused shared expert residual initialization (zero extra memory roundtrips)
         if (shared_out != nullptr) {
-            uint4 sh_u4 = *reinterpret_cast<const uint4*>(shared_out + token_idx * D + v * 8);
+            uint4 sh_u4 = *reinterpret_cast<const uint4*>(shared_out + (int64_t)token_idx * D + v * 8);
             const __nv_bfloat16* sh_bf = reinterpret_cast<const __nv_bfloat16*>(&sh_u4);
             #pragma unroll
             for (int i = 0; i < 8; ++i) {
@@ -1151,7 +1151,7 @@ __global__ void moe_combine_forward_kernel(
 
             if (slot >= 0 && slot < C && expert_id >= 0 && expert_id < E) {
                 uint4 in_u4 = *reinterpret_cast<const uint4*>(
-                    expert_outputs + ((expert_id * C + slot) * D + v * 8)
+                    expert_outputs + ((int64_t)(expert_id * C + slot) * D + v * 8)
                 );
                 const __nv_bfloat16* in_bf = reinterpret_cast<const __nv_bfloat16*>(&in_u4);
                 #pragma unroll
@@ -1186,32 +1186,37 @@ __global__ void moe_combine_backward_kernel(
     int token_idx = idx / K;
     int expert_id = (int)topk_idx[idx];
     int slot = token_to_slot[idx];
-    float w = __bfloat162float(topk_weights[idx]);
 
+    if (slot < 0 || slot >= C || expert_id < 0 || expert_id >= E) {
+        if (threadIdx.x == 0) {
+            d_topk_weights[idx] = __float2bfloat16(0.0f);
+        }
+        return;
+    }
+
+    float w = __bfloat162float(topk_weights[idx]);
     float dot_val = 0.0f;
 
-    if (slot >= 0 && slot < C && expert_id >= 0 && expert_id < E) {
-        const __nv_bfloat16* dy_ptr = d_routed_out + token_idx * D;
-        const __nv_bfloat16* e_out_ptr = expert_outputs + (expert_id * C + slot) * D;
-        __nv_bfloat16* de_out_ptr = d_expert_outputs + (expert_id * C + slot) * D;
+    const __nv_bfloat16* dy_ptr = d_routed_out + (int64_t)token_idx * D;
+    const __nv_bfloat16* e_out_ptr = expert_outputs + (int64_t)(expert_id * C + slot) * D;
+    __nv_bfloat16* de_out_ptr = d_expert_outputs + (int64_t)(expert_id * C + slot) * D;
 
-        int num_vec = D / 8;
-        for (int v = threadIdx.x; v < num_vec; v += blockDim.x) {
-            uint4 dy_u4 = *reinterpret_cast<const uint4*>(dy_ptr + v * 8);
-            uint4 eo_u4 = *reinterpret_cast<const uint4*>(e_out_ptr + v * 8);
-            const __nv_bfloat16* dy_bf = reinterpret_cast<const __nv_bfloat16*>(&dy_u4);
-            const __nv_bfloat16* eo_bf = reinterpret_cast<const __nv_bfloat16*>(&eo_u4);
+    int num_vec = D / 8;
+    for (int v = threadIdx.x; v < num_vec; v += blockDim.x) {
+        uint4 dy_u4 = *reinterpret_cast<const uint4*>(dy_ptr + v * 8);
+        uint4 eo_u4 = *reinterpret_cast<const uint4*>(e_out_ptr + v * 8);
+        const __nv_bfloat16* dy_bf = reinterpret_cast<const __nv_bfloat16*>(&dy_u4);
+        const __nv_bfloat16* eo_bf = reinterpret_cast<const __nv_bfloat16*>(&eo_u4);
 
-            __nv_bfloat16 de_bf[8];
-            #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                float dy_f = __bfloat162float(dy_bf[i]);
-                float eo_f = __bfloat162float(eo_bf[i]);
-                dot_val += dy_f * eo_f;
-                de_bf[i] = __float2bfloat16(w * dy_f);
-            }
-            *reinterpret_cast<uint4*>(de_out_ptr + v * 8) = *reinterpret_cast<uint4*>(de_bf);
+        __nv_bfloat16 de_bf[8];
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            float dy_f = __bfloat162float(dy_bf[i]);
+            float eo_f = __bfloat162float(eo_bf[i]);
+            dot_val += dy_f * eo_f;
+            de_bf[i] = __float2bfloat16(w * dy_f);
         }
+        *reinterpret_cast<uint4*>(de_out_ptr + v * 8) = *reinterpret_cast<uint4*>(de_bf);
     }
 
     dot_val = warp_reduce_sum(dot_val);

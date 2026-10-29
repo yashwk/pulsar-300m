@@ -52,11 +52,11 @@ _v2_incremental_reader = IncrementalMetricsReader(METRICS_JSONL_FILE)
 
 # Fallback used only when checkpoints/config.json is missing AND the trainer has not
 # written model_config into live_status.json. Values are PulsarConfig() defaults
-# (299,675,712 total / 146,800,640 active), not stale guesses.
+# (283,422,784 total / 130,023,424 active), not stale guesses.
 DEFAULT_MODEL_SUMMARY = {
     "model_name": "Pulsar",
-    "total_params": 299675712,
-    "active_params": 146800640,
+    "total_params": 283422784,
+    "active_params": 130023424,
     "non_embed_active_params": 96468992,
     "n_core": 8,
     "num_pulses": 3,
@@ -65,12 +65,13 @@ DEFAULT_MODEL_SUMMARY = {
     "n_heads": 16,
     "n_kv_heads": 4,
     "head_dim": 64,
-    "d_expert": 1024,
-    "n_routed_experts": 8,
+    "d_expert": 512,
+    "d_shared": 1024,
+    "n_routed_experts": 16,
     "n_shared_experts": 1,
-    "top_k": 2,
+    "top_k": 4,
     "active_ffn_dim": 3072,
-    "vocab_size": 49152,
+    "vocab_size": 32768,
     "max_seq_len": 32768,
 }
 
@@ -95,9 +96,11 @@ def get_model_summary_cached():
     try:
         with open(config_json, "r", encoding="utf-8") as f:
             cfg_dict = json.load(f)
+        import torch
         from src.model import PulsarConfig, PulsarForCausalLM
         cfg = PulsarConfig.from_dict(cfg_dict)
-        summary = PulsarForCausalLM(cfg).get_model_summary(cfg.default_pulses)
+        with torch.device("meta"):
+            summary = PulsarForCausalLM(cfg).get_model_summary(cfg.default_pulses)
     except Exception:
         summary = None
     if summary is None:

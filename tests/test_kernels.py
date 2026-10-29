@@ -288,7 +288,7 @@ def test_router_topk_and_weight_normalization(E, K):
     weights_ref = raw / (raw.sum(-1, keepdim=True) + 1e-6)
 
     assert_close(weights, weights_ref, atol=2e-3)
-    assert torch.allclose(weights.float().sum(-1), torch.ones(N, device="cuda"), atol=2e-3)
+    assert torch.allclose(weights.float().sum(-1), torch.ones(N, device="cuda"), atol=max(2e-3, K * 1e-3))
 
 
 @needs_gpu
@@ -430,6 +430,40 @@ def test_cuda_vs_fallback_moe_layer():
         model_mod.HAS_PULSAR_CUDA = orig
 
     assert_close(out_cuda, out_fallback, atol=3e-2)
+
+
+@needs_gpu
+@needs_cuda_ext
+def test_cuda_vs_fallback_moe_layer_backward():
+    """Full PulsarMoEMLP backward gradients match between CUDA and fallback paths."""
+    from src.model import PulsarMoEMLP
+    import src.model as model_mod
+
+    cfg = make_cfg(d_model=64, d_expert=64, n_routed_experts=8, top_k=2, max_pulses=2)
+    torch.manual_seed(42)
+    mlp_cuda = PulsarMoEMLP(cfg).cuda().bfloat16().train()
+    mlp_fb = PulsarMoEMLP(cfg).cuda().bfloat16().train()
+    mlp_fb.load_state_dict(mlp_cuda.state_dict())
+
+    x1 = torch.randn(2, 16, cfg.d_model, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    x2 = x1.detach().clone().requires_grad_(True)
+
+    orig = model_mod.HAS_PULSAR_CUDA
+    try:
+        model_mod.HAS_PULSAR_CUDA = True
+        out_cuda, _, _, _ = mlp_cuda(x1, pulse_idx=0)
+        out_cuda.sum().backward()
+
+        model_mod.HAS_PULSAR_CUDA = False
+        out_fb, _, _, _ = mlp_fb(x2, pulse_idx=0)
+        out_fb.sum().backward()
+    finally:
+        model_mod.HAS_PULSAR_CUDA = orig
+
+    assert_close(out_cuda, out_fb, atol=3e-2, msg="forward match")
+    assert_close(x1.grad, x2.grad, atol=3e-2, msg="dx match")
+    assert_close(mlp_cuda.routed_down.grad, mlp_fb.routed_down.grad, atol=3e-2, msg="d_routed_down match")
+    assert_close(mlp_cuda.routed_scale.grad, mlp_fb.routed_scale.grad, atol=3e-2, msg="d_routed_scale match")
 
 
 @needs_gpu

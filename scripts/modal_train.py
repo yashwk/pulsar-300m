@@ -306,7 +306,7 @@ def main(
     resume: str = None,
     compile: bool = False,
     output_ckpt: str = None,
-    detach: bool = False,
+    detach: bool = True,
 ):
     # Calculate invariant hardware-agnostic batch dynamics
     tokens_per_micro = mbs * seq_len

@@ -54,8 +54,8 @@ def generate_fixture(filepath: str, total_steps: int = 45000):
                 if val_loss < val_best:
                     val_best = val_loss
 
-            # MoE expert shares (mostly balanced around 12.5%, with occasional burst)
-            shares = [12.5 + random.gauss(0, 0.4) for _ in range(8)]
+            # MoE expert shares (mostly balanced around 6.25%, with occasional burst)
+            shares = [6.25 + random.gauss(0, 0.2) for _ in range(16)]
             tot = sum(shares)
             shares = [round((s / tot) * 100.0, 2) for s in shares]
 

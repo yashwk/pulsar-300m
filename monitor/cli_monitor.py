@@ -6,7 +6,7 @@ Provides a modern, high-tech terminal TUI monitoring Pulsar training telemetry:
 - Multi-Pulse recurrent losses (L1, L2, L3) and hidden state deltas (Δh1, Δh2, Δh3)
 - MoE Router Confidence, Across-Pulse Expert Load Balance, Bias Magnitude
 - Dual-Optimizer LRs (Muon, Adam) and Pre-Clip Gradient Norms
-- Hardware Saturation: tok/s, MFU %, and NVIDIA RTX 4060 VRAM Gauges
+- Hardware Saturation: tok/s, MFU %, and VRAM Gauges
 - Live Canary Generations Inspection Bay
 
 Usage:
@@ -127,10 +127,17 @@ def build_ui(data: dict | None, recent_losses: list[float]) -> Layout:
         else Text.assemble((" ○ ", "bold yellow"), ("STANDBY ", "bold white on rgb(60,50,20)"))
     )
 
+    mc = (data or {}).get("model_config") or {}
+    total_m = (mc.get("total_params", 283422784)) / 1e6
+    active_m = (mc.get("active_params", 130023424)) / 1e6
+    k_pulses = (data or {}).get("num_pulses") or mc.get("num_pulses", 3)
+    n_core = mc.get("n_core", 8)
+    eff_l = n_core * k_pulses
+
     header_text = Text.assemble(
         (" PULSAR ", "bold black on bright_cyan"),
-        ("  Recurrent MoE (K=3, 8L→24L) + 32k Hybrid Attention  ", "bold white on rgb(15,23,42)"),
-        ("  201.8M Params (107M Active)  ", "bold bright_yellow on rgb(30,41,59)"),
+        (f"  Recurrent MoE (K={k_pulses}, {n_core}L→{eff_l}L) + 32k Hybrid Attention  ", "bold white on rgb(15,23,42)"),
+        (f"  {total_m:.1f}M Params ({active_m:.1f}M Active)  ", "bold bright_yellow on rgb(30,41,59)"),
         ("  ", ""),
         status_pill,
         (f"  [{now_str}]", "dim bright_cyan"),
@@ -250,12 +257,19 @@ def build_ui(data: dict | None, recent_losses: list[float]) -> Layout:
         Text.assemble((format_tok_rate(speed) + " ", "bold bright_green"), mfu_gauge, (f" {mfu:4.1f}% MFU", "dim white")),
     )
 
-    vram_peak = data.get("vram_peak_gb", 0.0)
-    vram_free = data.get("vram_free_gb", 0.0)
-    vram_pct = (vram_peak / 8.0) * 100.0
+    vram_peak = data.get("vram_peak_gb", 0.0) or data.get("vram_peak", 0.0)
+    total_vram = data.get("total_vram_gb", 0.0) or 8.0
+    vram_free = max(0.0, total_vram - vram_peak)
+    vram_pct = (vram_peak / max(0.1, total_vram)) * 100.0
     vram_gauge = make_gauge(vram_pct, width=6, color="bright_cyan" if vram_pct < 85 else "bright_red")
+    dev_title = data.get("device_name", "GPU")
+    short_dev = "GPU"
+    for cand in ["B300", "B200", "H200", "H100", "A100", "4090", "4080", "4060", "L40S", "L40", "L4", "T4"]:
+        if cand in dev_title:
+            short_dev = f"RTX {cand}" if cand in ["4090", "4080", "4060"] else cand
+            break
     table_right.add_row(
-        "VRAM (RTX4060)",
+        f"VRAM ({short_dev})",
         Text.assemble((f"{vram_peak:.2f}G ", "bold bright_cyan"), vram_gauge, (f" Free:{vram_free:.1f}G", "dim white")),
     )
 

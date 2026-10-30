@@ -351,7 +351,7 @@ def intact_fractions(
     *,
     plan: PackPlan | None = None,
     global_start: np.ndarray | None = None,
-    seq_len: int = 2048,
+    seq_len: int = 1024,
     is_cot: np.ndarray | None = None,
 ) -> dict:
     """Fraction of documents presented intact, count- and token-weighted.

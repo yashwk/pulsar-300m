@@ -1002,7 +1002,7 @@ class PulsarMoEMLP(nn.Module):
         if routing_mask is not None:
             valid = routing_mask.reshape(-1).bool()
 
-        # 2. Router selection: fused top-2 + sigmoid + weight normalisation (CUDA),
+        # 2. Router selection: fused top-k + sigmoid + weight normalisation (CUDA),
         #    with z-loss computed in PyTorch so autograd scales it correctly. The z
         #    tensor is [N, E] (a few hundred KB), negligible next to the router matmul.
         lse_sq = torch.logsumexp(logits.float(), dim=-1).pow(2)
@@ -1196,7 +1196,7 @@ class PulsarMoEMLP(nn.Module):
 
             Var_e(w_e . mu) / (Var_e(w_e . mu) + mean_tokens Var_e(w_e . (x - mu)))
 
-        Also reports how often the balancing bias overrides the content-based top-2.
+        Also reports how often the balancing bias overrides the content-based top-k.
         Runs under no_grad on the caller's sample; no host syncs here.
         """
         with torch.no_grad():
@@ -1212,14 +1212,14 @@ class PulsarMoEMLP(nn.Module):
             denom = (var_shared + var_diff).clamp_min(1e-12)
             shared_mean_frac = (var_shared / denom).reshape(())
 
-            # bias_override_rate: top-2 with bias differs from top-2 without it.
+            # bias_override_rate: top-k with bias differs from top-k without it.
             bias = (self.expert_bias[pulse_idx] if self.cfg.per_pulse_bias
                     else self.expert_bias).float()
             k = self.cfg.top_k
             scores = torch.sigmoid(logits.float())
             with_bias = torch.topk(scores + bias, k=k, dim=-1).indices
             without = torch.topk(scores, k=k, dim=-1).indices
-            # Compare as sets: the same two experts in a different order is not an override.
+            # Compare as sets: the same k experts in a different order is not an override.
             same = (with_bias.unsqueeze(-1) == without.unsqueeze(1)).any(-1).sum(-1) == k
             bias_override_rate = (~same).float().mean()
 

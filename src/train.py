@@ -511,7 +511,7 @@ def train():
     parser.add_argument("--train-bin", type=str, default=default_train_str, help="Path to train shard(s), comma-separated")
     parser.add_argument("--val-bin", type=str, default=default_val_str, help="Path to val shard(s), comma-separated")
     parser.add_argument("--tokenizer", type=str, default="data/pulsar_tokenizer", help="Tokenizer model path or HF name")
-    parser.add_argument("--global-batch-tokens", type=int, default=131_072, help="Fixed global batch tokens (64 seqs x 2048)")
+    parser.add_argument("--global-batch-tokens", type=int, default=131_072, help="Fixed global batch tokens (128 seqs x 1024)")
     parser.add_argument("--seq-len", type=int, default=1024, help="Sequence context length")
     parser.add_argument("--micro-batch-size", type=int, default=3, help="Micro batch size per forward pass (MBS=3: 6.30 GB peak VRAM on 8GB GPU)")
     parser.add_argument("--max-steps", type=int, default=10000, help="Total curriculum training steps")
@@ -555,7 +555,7 @@ def train():
                         help="flat: fixed-stride windows (Stage 1). bestfit: EOS-aligned packing, "
                              "so documents that fit are presented intact (Stage 2+).")
     parser.add_argument("--moe-capacity-factor", type=float, default=None,
-                        help="Override MoE capacity headroom (default 1.12). Raising it mid-run is "
+                        help="Override MoE capacity headroom (default 1.25). Raising it mid-run is "
                              "safe: capacity changes no checkpoint format.")
     parser.add_argument("--drop-warn-pct", type=float, default=2.0,
                         help="Warn when overall MoE drop rate exceeds this percentage")
@@ -1048,20 +1048,32 @@ def train():
         tok_per_sec = effective_global_batch_tokens / max(1e-4, step_dt)
 
         # MFU estimation: FLOPs/tok scales with the number of pulses K.
-        # The K=3 baseline is 2.05 GFLOPs/tok (6 * 97.15M non-embed active params * 3,
-        # rounded to include attention). Scale linearly from that baseline so a 1- or
-        # 2-pulse run is not reported as if it did K=3 work.
-        flops_per_tok = 2.05e-3 * (args.num_pulses / 3.0)   # GFLOPs per token
+        # Active params per token: 96.47M non-embedding active params.
+        # Forward + backward FLOPs per token: ~6 * 96.47M * K pulses = 1.736 GFLOPs (at K=3).
+        # Plus attention matmuls (12 * n_layers * K * T * d_model): ~0.302 GFLOPs at T=1024, K=3.
+        # Total compute per token at K=3 is ~2.04 GFLOPs/tok (2.04e-3 TFLOPs/tok).
+        flops_per_tok = 2.04e-3 * (args.num_pulses / 3.0)   # TFLOPs per token
         achieved_tflops = tok_per_sec * flops_per_tok
 
         # Dynamic GPU detection for peak dense BF16 TFLOPS and physical VRAM
-        dev_name = torch.cuda.get_device_name(0).upper() if torch.cuda.is_available() else ""
+        raw_dev_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else ""
+        dev_name = raw_dev_name.upper()
         if "B300" in dev_name or "B200" in dev_name:
             peak_tflops = 2250.0
         elif "H200" in dev_name or "H100" in dev_name:
             peak_tflops = 989.0
+        elif "L40S" in dev_name or "L40" in dev_name:
+            peak_tflops = 366.0
         elif "A100" in dev_name:
             peak_tflops = 312.0
+        elif "4090" in dev_name:
+            peak_tflops = 165.0
+        elif "L4" in dev_name:
+            peak_tflops = 120.0
+        elif "4080" in dev_name:
+            peak_tflops = 97.0
+        elif "T4" in dev_name:
+            peak_tflops = 65.0
         elif "4060" in dev_name:
             peak_tflops = 60.0
         else:
@@ -1136,7 +1148,7 @@ def train():
                 drop_str = f" | Drops: [{' '.join(rates)}] cap {int(moe_stats['capacity'])}"
                 overall = moe_stats["drop_rate"] * 100.0
                 if overall > args.drop_warn_pct:
-                    drop_str += f" [WARN] overall {overall:.2f}% > {args.drop_warn_pct}% -> consider --moe-capacity-factor 1.25"
+                    drop_str += f" [WARN] overall {overall:.2f}% > {args.drop_warn_pct}% -> consider increasing --moe-capacity-factor (e.g. 1.35)"
         print(f"  ↳ MoE Experts: [{moe_str}] | Conf: {conf:4.2f} | MaxBias: {max_bias:5.3f}{drop_str}")
         print(f"  ↳ Pulses: {pulses_str} | λ: {mix_lambda:.3f}")
         print(
@@ -1269,6 +1281,7 @@ def train():
             "tok_per_sec": round(tok_per_sec, 1),
             "mfu_pct": round(mfu_pct, 1),
             "achieved_tflops": round(achieved_tflops, 1),
+            "peak_tflops": peak_tflops,
             "gpu_step_ms": round(gpu_step_ms, 2),
             "gpu_fwd_ms": round(gpu_fwd_ms, 2),
             "gpu_bwd_ms": round(gpu_bwd_ms, 2),

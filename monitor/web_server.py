@@ -111,7 +111,7 @@ def get_model_summary_cached():
 
 
 def flop_scale_per_tok():
-    """TFLOP/s per (tok/s): aligned with src/train.py baseline (2.05 GFLOPs/tok for K=3)."""
+    """TFLOP/s per (tok/s): aligned with src/train.py baseline (2.04 GFLOPs/tok for K=3)."""
     mc = None
     try:
         with open(LIVE_STATUS_FILE, "r", encoding="utf-8") as f:
@@ -121,7 +121,7 @@ def flop_scale_per_tok():
     if not mc:
         mc = get_model_summary_cached()
     pulses = mc.get("num_pulses") or 3
-    return 2.05e-3 * (pulses / 3.0)
+    return 2.04e-3 * (pulses / 3.0)
 
 
 RUN_CONFIG_FILE = os.path.join(CHECKPOINT_DIR, "run_config.json")
@@ -518,7 +518,11 @@ def enrich_status_payload(data):
         data["model_config"] = get_model_summary_cached()
 
     if "device_name" not in data:
-        data["device_name"] = "NVIDIA GeForce RTX 4060 Laptop GPU"
+        try:
+            import torch
+            data["device_name"] = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "GPU Accelerator"
+        except Exception:
+            data["device_name"] = "GPU Accelerator"
 
     # Enrich canaries with tags & categories
     if "canaries" in data and isinstance(data["canaries"], list):

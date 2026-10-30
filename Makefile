@@ -16,7 +16,7 @@ help:
 	@echo "make clean       - Clean build artifacts and pycache"
 
 build:
-	pip install -e . --no-build-isolation
+	uv run python setup.py build_ext --inplace
 
 test:
 	$(PYTEST) tests/

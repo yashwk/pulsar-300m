@@ -1497,7 +1497,7 @@
         </div>
         <div class="badges-group" id="headerBadgesGroup">
           <span class="spec-badge spec-badge-accent" id="hdrBadgeCore">Recurrent MoE Architecture</span>
-          <span class="spec-badge" id="hdrBadgeMoE">Auxiliary-Loss-Free Top-2 Routing</span>
+          <span class="spec-badge" id="hdrBadgeMoE">Auxiliary-Loss-Free Top-4 Routing</span>
           <span class="spec-badge" id="hdrBadgeAttn">Hybrid Sliding-Window Attention</span>
           <span class="spec-badge" id="hdrBadgeParams">Loading Model Config...</span>
           <span class="spec-badge" id="hdrBadgeDevice">Detecting GPU...</span>
@@ -1653,7 +1653,7 @@
       <div class="kpi-card">
         <div class="kpi-top">
           <span class="kpi-label">MoE Routing Health</span>
-          <span id="kpiMoeUniformBadge" class="kpi-metric-tag" style="color: var(--purple);">Top-2 (7E)</span>
+          <span id="kpiMoeUniformBadge" class="kpi-metric-tag" style="color: var(--purple);">Top-4 (16E)</span>
         </div>
         <div class="kpi-main-val" id="kpiMoeUniformity" style="color: var(--purple);">--% Uniform</div>
         <div class="kpi-sub-row">
@@ -1896,7 +1896,7 @@
       <!-- Card 2: Sparse MoE Routing & Specialization Engine -->
       <div class="subsystem-card">
         <div class="subsystem-title subsystem-title-purple" id="diagMoETitle">
-          Sparse MoE Routing & Expert Specialization (1 Shared + 8 Routed, Top-2)
+          Sparse MoE Routing & Expert Specialization (1 Shared + 16 Routed, Top-4)
         </div>
         <table class="pulse-breakdown-table">
           <thead>
@@ -1910,19 +1910,19 @@
           <tbody>
             <tr>
               <td><strong style="color: var(--purple);">Routing Geometry</strong></td>
-              <td id="diagMoEGeom">1 Shared + 8 Routed (Top-2)</td>
+              <td id="diagMoEGeom">1 Shared + 16 Routed (Top-4)</td>
               <td id="diagMoEDist" style="color: var(--white); font-size: 0.7rem;">[--]</td>
               <td style="color: var(--emerald);">Balanced Uniformity</td>
             </tr>
             <tr>
               <td><strong style="color: var(--cyan);">Compute Budget</strong></td>
-              <td id="diagActiveCompute">147.5M Active / 298.5M Total</td>
-              <td id="diagActiveParamsDetail" style="color: var(--silver);">97.1M non-embed</td>
-              <td style="color: var(--cyan);">49.4% Sparsity Ratio</td>
+              <td id="diagActiveCompute">130.0M Active / 283.4M Total</td>
+              <td id="diagActiveParamsDetail" style="color: var(--silver);">96.5M non-embed</td>
+              <td style="color: var(--cyan);">54.1% Sparsity Ratio</td>
             </tr>
             <tr>
               <td><strong style="color: var(--amber);">FFN Dimension</strong></td>
-              <td id="diagMoEActiveFFN">d_expert = 1024 | 3072 Active Width</td>
+              <td id="diagMoEActiveFFN">d_expert = 512 | 3072 Active FFN Width</td>
               <td id="diagRouterConf" style="color: var(--amber);">--</td>
               <td id="diagMoEEntropy" style="color: var(--text-secondary);">Max Bias: 0.151</td>
             </tr>
@@ -2230,11 +2230,16 @@
     });
 
     // 4. Chart 4: Sparse MoE Expert Routing & Load Distribution
-    const EXPERT_COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ec4899', '#8b5cf6', '#06b6d4', '#f97316', '#f43f5e'];
+    const EXPERT_COLORS = [
+      '#3b82f6', '#10b981', '#f59e0b', '#ec4899',
+      '#8b5cf6', '#06b6d4', '#f97316', '#f43f5e',
+      '#14b8a6', '#6366f1', '#84cc16', '#d946ef',
+      '#eab308', '#0ea5e9', '#a855f7', '#22c55e'
+    ];
     // Rebuild chart 4's datasets when the model's routed-expert count differs from the
-    // 8-expert default (the trainer reports the real count in model_config).
+    // 16-expert default (the trainer reports the real count in model_config).
     function ensureExpertDatasets(n) {
-      const count = (Number.isFinite(n) && n > 0) ? Math.floor(n) : 8;
+      const count = (Number.isFinite(n) && n > 0) ? Math.floor(n) : 16;
       const ds = chart4.data.datasets;
       const idealLabel = `Ideal (${(100 / count).toFixed(1)}%)`;
       if (ds.length === count + 2) {
@@ -2257,22 +2262,26 @@
       chart4.data.datasets = rebuilt;
     }
 
+    const initialExpertCount = 16;
+    const initialDatasets = [];
+    for (let e = 0; e < initialExpertCount; e++) {
+      initialDatasets.push({
+        label: `Expert ${e}`,
+        borderColor: EXPERT_COLORS[e % EXPERT_COLORS.length],
+        borderWidth: 1.5,
+        data: [],
+        pointRadius: 0,
+        yAxisID: 'y'
+      });
+    }
+    initialDatasets.push({ label: `Ideal (${(100 / initialExpertCount).toFixed(1)}%)`, borderColor: '#64748b', borderWidth: 1.4, borderDash: [4, 4], data: [], pointRadius: 0, yAxisID: 'y' });
+    initialDatasets.push({ label: 'Router Bias |b_i|', borderColor: '#94a3b8', borderWidth: 1.2, borderDash: [2, 2], data: [], pointRadius: 0, yAxisID: 'y1' });
+
     const chart4 = new Chart(document.getElementById('chart4Canvas'), {
       type: 'line',
       data: {
         labels: [],
-        datasets: [
-          { label: 'Expert 0', borderColor: '#3b82f6', borderWidth: 1.5, data: [], pointRadius: 0, yAxisID: 'y' },
-          { label: 'Expert 1', borderColor: '#10b981', borderWidth: 1.5, data: [], pointRadius: 0, yAxisID: 'y' },
-          { label: 'Expert 2', borderColor: '#f59e0b', borderWidth: 1.5, data: [], pointRadius: 0, yAxisID: 'y' },
-          { label: 'Expert 3', borderColor: '#ec4899', borderWidth: 1.5, data: [], pointRadius: 0, yAxisID: 'y' },
-          { label: 'Expert 4', borderColor: '#8b5cf6', borderWidth: 1.5, data: [], pointRadius: 0, yAxisID: 'y' },
-          { label: 'Expert 5', borderColor: '#06b6d4', borderWidth: 1.5, data: [], pointRadius: 0, yAxisID: 'y' },
-          { label: 'Expert 6', borderColor: '#f97316', borderWidth: 1.5, data: [], pointRadius: 0, yAxisID: 'y' },
-          { label: 'Expert 7', borderColor: '#f43f5e', borderWidth: 1.5, data: [], pointRadius: 0, yAxisID: 'y' },
-          { label: 'Ideal', borderColor: '#64748b', borderWidth: 1.4, borderDash: [4, 4], data: [], pointRadius: 0, yAxisID: 'y' },
-          { label: 'Router Bias |b_i|', borderColor: '#94a3b8', borderWidth: 1.2, borderDash: [2, 2], data: [], pointRadius: 0, yAxisID: 'y1' }
-        ]
+        datasets: initialDatasets
       },
       options: {
         ...baseChartOptions,
@@ -2924,7 +2933,7 @@
       chart4.data.labels = steps;
       const lastRow = slice[slice.length - 1];
       const nExp = (lastRow && lastRow.expert_pcts && lastRow.expert_pcts.length)
-        || (lastModelConfig && lastModelConfig.n_routed_experts) || 8;
+        || (lastModelConfig && lastModelConfig.n_routed_experts) || 16;
       ensureExpertDatasets(nExp);
       for (let e = 0; e < nExp; e++) {
         chart4.data.datasets[e].data = slice.map(r => r.expert_pcts?.[e] ?? (r[`e${e}`] ?? null));
@@ -3187,7 +3196,7 @@
           const bMoE = document.getElementById('hdrBadgeMoE');
           if (bMoE) {
             bMoE.innerText = (mc.n_routed_experts > 0)
-              ? `MoE: ${mc.n_shared_experts || 1} Shared + ${mc.n_routed_experts} Routed (Top-${mc.top_k || 2})`
+              ? `MoE: ${mc.n_shared_experts || 1} Shared + ${mc.n_routed_experts} Routed (Top-${mc.top_k || 4})`
               : `Dense SwiGLU FFN`;
           }
 
@@ -3454,7 +3463,7 @@
 
           const moeBadge = document.getElementById('kpiMoeUniformBadge');
           if (moeBadge) {
-            moeBadge.innerText = `Top-${data.model_config?.top_k || 2} (${ep.length}E)`;
+            moeBadge.innerText = `Top-${data.model_config?.top_k || 4} (${ep.length}E)`;
           }
 
           // Also update Chart 4 header status pill
@@ -3598,18 +3607,18 @@
           const moeTitle = document.getElementById('diagMoETitle');
           if (moeTitle) {
             moeTitle.innerText = (mc.n_routed_experts > 0)
-              ? `Sparse MoE Routing & Expert Specialization (${mc.n_shared_experts || 1} Shared + ${mc.n_routed_experts} Routed, Top-${mc.top_k || 2})`
+              ? `Sparse MoE Routing & Expert Specialization (${mc.n_shared_experts || 1} Shared + ${mc.n_routed_experts} Routed, Top-${mc.top_k || 4})`
               : `Dense SwiGLU Backbone (No Mixture-of-Experts)`;
           }
           const geomEl = document.getElementById('diagMoEGeom');
           if (geomEl) {
             geomEl.innerText = (mc.n_routed_experts > 0)
-              ? `${mc.n_shared_experts || 1} Shared + ${mc.n_routed_experts} Routed (Top-${mc.top_k || 2})`
+              ? `${mc.n_shared_experts || 1} Shared + ${mc.n_routed_experts} Routed (Top-${mc.top_k || 4})`
               : `Dense SwiGLU`;
           }
           const ffnEl = document.getElementById('diagMoEActiveFFN');
           if (ffnEl) {
-            ffnEl.innerText = `d_expert = ${mc.d_expert || 1024} | ${mc.active_ffn_dim || 3072} Active FFN Width`;
+            ffnEl.innerText = `d_expert = ${mc.d_expert || 512} | ${mc.active_ffn_dim || 3072} Active FFN Width`;
           }
           const compEl = document.getElementById('diagActiveCompute');
           if (compEl) {

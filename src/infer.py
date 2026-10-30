@@ -309,7 +309,7 @@ class PulsarInferenceEngine:
         B, T, D = x.shape
         x_flat = x.view(-1, D)
 
-        # Router top-2
+        # Router top-k
         router_w = mlp.router_weight[pulse_idx].float()
         logits = F.linear(x_flat.float(), router_w)
         logits = logits - logits.mean(dim=-1, keepdim=True)

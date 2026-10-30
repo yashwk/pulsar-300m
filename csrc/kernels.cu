@@ -1968,7 +1968,7 @@ torch::Tensor fused_softcap_ce_backward_dev_cuda(
 }
 
 // ------------------------------------------------------------------------
-// 11. Fused MoE Router Top-2 + Sigmoid + Z-Loss (E = 8, K = 2)
+// 11. Fused MoE Router Top-K + Sigmoid + Z-Loss (E = 16, K = 4 / E = 8, K = 2)
 // ------------------------------------------------------------------------
 
 __device__ __forceinline__ float load_logit(const __nv_bfloat16 v) { return __bfloat162float(v); }

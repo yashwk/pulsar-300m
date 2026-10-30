@@ -413,8 +413,8 @@ def evaluate_health(
 
     max_bias = float(latest_status.get("router_max_bias") or 0.0)
     conf = float(latest_status.get("router_confidence") or 0.0)
-    w_watch = th.get("moe_balance", {}).get("worst_expert_share_watch_pct", 25.0)
-    w_alert = th.get("moe_balance", {}).get("worst_expert_share_alert_pct", 35.0)
+    w_watch = th.get("moe_balance", {}).get("worst_expert_share_watch_pct", 15.0)
+    w_alert = th.get("moe_balance", {}).get("worst_expert_share_alert_pct", 25.0)
 
     bal_level = "OK"
     if worst_share > w_alert:

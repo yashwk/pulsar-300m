@@ -427,13 +427,7 @@ def main(
         raise ValueError(f"Unsupported GPU selection: {selected_gpu}")
 
     remote_fn = fn_map[selected_gpu]
-    if detach:
-        print(f"[Modal Orchestrator] Spawning detached training run on NVIDIA {selected_gpu}...")
-        call = remote_fn.spawn(**kwargs)
-        print(f"[Modal Orchestrator] Run successfully spawned in the cloud! FunctionCall ID: {call.object_id}")
-        print("[Modal Orchestrator] Safe to disconnect WiFi, close laptop, or exit. Modal cloud container will run independently.")
-        print("[Modal Orchestrator] Graceful Shutdown: Run 'modal app stop pulsar-training' to gracefully finish the step, save latest.pt, and stop.")
-        return
-    else:
-        print(f"[Modal Orchestrator] Launching synchronous training run on NVIDIA {selected_gpu}...")
-        remote_fn.remote(**kwargs)
+    print(f"[Modal Orchestrator] Launching training run on NVIDIA {selected_gpu}...")
+    print("[Modal Orchestrator] Note: Running with 'modal run --detach' ensures the cloud container continues if local terminal disconnects.")
+    print("[Modal Orchestrator] Graceful Shutdown: Run 'modal app stop pulsar-training' to gracefully finish the step, save latest.pt, and stop.")
+    remote_fn.remote(**kwargs)

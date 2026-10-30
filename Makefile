@@ -22,7 +22,7 @@ test:
 	$(PYTEST) tests/
 
 test-fast:
-	$(PYTEST) tests/test_kernels.py tests/test_rollback.py
+	$(PYTEST) tests/test_kernels.py tests/test_model.py
 
 smoke:
 	$(PYTHON) -m src.train --max-steps 2 --warmup-steps 1 --no-save \

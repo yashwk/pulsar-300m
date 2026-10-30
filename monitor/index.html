@@ -1501,6 +1501,7 @@
           <span class="spec-badge" id="hdrBadgeAttn">Hybrid Sliding-Window Attention</span>
           <span class="spec-badge" id="hdrBadgeParams">Loading Model Config...</span>
           <span class="spec-badge" id="hdrBadgeDevice">Detecting GPU...</span>
+          <span class="spec-badge" id="hdrBadgeCloud">Cloud: Standby</span>
         </div>
       </div>
       <div class="header-actions">
@@ -1516,6 +1517,16 @@
         <button class="btn-action" onclick="fetchHistory(true)">Refresh</button>
       </div>
     </header>
+
+    <!-- Cloud Training Crash Alert Banner -->
+    <div id="crashBanner" class="alert-banner" style="display: none; background: rgba(244, 63, 94, 0.12); border: 1px solid var(--rose); padding: 0.85rem; border-radius: 8px; margin-bottom: 0.75rem;">
+      <div class="alert-header" style="color: var(--rose); font-weight: 700; display: flex; justify-content: space-between; align-items: center;">
+        <span id="crashTitle">CLOUD TRAINING CRASH DETECTED</span>
+        <span id="crashBadge" style="background: var(--rose); color: #fff; padding: 0.15rem 0.5rem; border-radius: 4px; font-size: 0.75rem; font-weight: 600;">CRITICAL FAILURE</span>
+      </div>
+      <div id="crashDesc" class="alert-desc" style="color: var(--text-primary); font-size: 0.85rem; margin-top: 0.35rem;"></div>
+      <pre id="crashTrace" style="display: none; background: rgba(0,0,0,0.45); padding: 0.6rem; border-radius: 6px; font-size: 0.75rem; color: #fca5a5; overflow-x: auto; margin-top: 0.5rem; max-height: 220px; line-height: 1.4; font-family: monospace;"></pre>
+    </div>
 
     <!-- Thermal Cooldown Banner -->
     <div id="coolingBanner" class="alert-banner alert-banner-amber" style="display: none;">
@@ -3153,34 +3164,88 @@
           return;
         }
 
+        const crashBanner = document.getElementById('crashBanner');
         const coolingBanner = document.getElementById('coolingBanner');
-        if (data.status === 'cooling') {
-          if (statusDot) {
-            statusDot.classList.remove('offline');
-            statusDot.classList.add('cooling');
-          }
-          const rem = data.cooling_remaining_s || 0;
-          const total = data.cooling_total_s || 120;
-          const pct = Math.max(0, Math.min(100, (rem / total) * 100));
+        const bCloud = document.getElementById('hdrBadgeCloud');
 
-          statusText.innerText = `Cooling (${rem}s)`;
-          statusText.style.color = 'var(--amber)';
-
-          if (coolingBanner) {
-            coolingBanner.style.display = 'flex';
-            const countdownEl = document.getElementById('coolingCountdown');
-            if (countdownEl) countdownEl.innerText = `${rem}s`;
-            const meterEl = document.getElementById('coolingMeterFill');
-            if (meterEl) meterEl.style.width = `${pct}%`;
-          }
-        } else {
+        if (data.status === 'crashed') {
           if (statusDot) {
-            statusDot.classList.remove('offline');
+            statusDot.classList.add('offline');
             statusDot.classList.remove('cooling');
           }
-          statusText.innerText = 'Active Run';
-          statusText.style.color = 'var(--emerald)';
+          statusText.innerText = 'Crashed';
+          statusText.style.color = 'var(--rose)';
           if (coolingBanner) coolingBanner.style.display = 'none';
+          if (crashBanner) {
+            crashBanner.style.display = 'block';
+            const descEl = document.getElementById('crashDesc');
+            if (descEl) descEl.innerText = `${data.error_message || 'Training process crashed unexpectedly.'} (Exit code: ${data.exit_code ?? -1})`;
+            const traceEl = document.getElementById('crashTrace');
+            if (traceEl) {
+              const logs = (data.log_tail && data.log_tail.length) ? data.log_tail.join('\n') : (data.error_trace || '');
+              if (logs) {
+                traceEl.innerText = logs;
+                traceEl.style.display = 'block';
+              } else {
+                traceEl.style.display = 'none';
+              }
+            }
+          }
+          if (bCloud) {
+            bCloud.innerText = 'Cloud: Crashed';
+            bCloud.style.color = 'var(--rose)';
+          }
+        } else {
+          if (crashBanner) crashBanner.style.display = 'none';
+
+          if (data.status === 'cooling') {
+            if (statusDot) {
+              statusDot.classList.remove('offline');
+              statusDot.classList.add('cooling');
+            }
+            const rem = data.cooling_remaining_s || 0;
+            const total = data.cooling_total_s || 120;
+            const pct = Math.max(0, Math.min(100, (rem / total) * 100));
+
+            statusText.innerText = `Cooling (${rem}s)`;
+            statusText.style.color = 'var(--amber)';
+
+            if (coolingBanner) {
+              coolingBanner.style.display = 'flex';
+              const countdownEl = document.getElementById('coolingCountdown');
+              if (countdownEl) countdownEl.innerText = `${rem}s`;
+              const meterEl = document.getElementById('coolingMeterFill');
+              if (meterEl) meterEl.style.width = `${pct}%`;
+            }
+            if (bCloud) {
+              bCloud.innerText = 'Cloud: Cooldown';
+              bCloud.style.color = 'var(--amber)';
+            }
+          } else if (data.status === 'completed') {
+            if (statusDot) {
+              statusDot.classList.remove('offline');
+              statusDot.classList.remove('cooling');
+            }
+            statusText.innerText = 'Completed';
+            statusText.style.color = 'var(--purple)';
+            if (coolingBanner) coolingBanner.style.display = 'none';
+            if (bCloud) {
+              bCloud.innerText = 'Cloud: Completed';
+              bCloud.style.color = 'var(--emerald)';
+            }
+          } else {
+            if (statusDot) {
+              statusDot.classList.remove('offline');
+              statusDot.classList.remove('cooling');
+            }
+            statusText.innerText = 'Active Run';
+            statusText.style.color = 'var(--emerald)';
+            if (coolingBanner) coolingBanner.style.display = 'none';
+            if (bCloud) {
+              bCloud.innerText = 'Cloud: Active';
+              bCloud.style.color = 'var(--cyan)';
+            }
+          }
         }
 
         // 1. Dynamic Model Architecture & Hardware Badges

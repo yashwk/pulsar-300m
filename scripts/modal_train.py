@@ -163,10 +163,79 @@ def execute_training(
 
     try:
         subprocess.run(cmd, check=True)
+        live_path = "/checkpoints/live_status.json"
+        if os.path.exists(live_path):
+            try:
+                import json
+                with open(live_path, "r", encoding="utf-8") as f:
+                    st = json.load(f)
+                st["status"] = "completed"
+                st["completed_at"] = time.time()
+                with open(live_path, "w", encoding="utf-8") as f:
+                    json.dump(st, f, indent=2)
+            except Exception:
+                pass
+    except subprocess.CalledProcessError as exc:
+        print(f"\n[Modal Trainer ERROR] Training subprocess failed with exit code {exc.returncode}")
+        live_path = "/checkpoints/live_status.json"
+        log_path = "/checkpoints/train.log"
+        tail_lines = []
+        if os.path.exists(log_path):
+            try:
+                with open(log_path, "r", encoding="utf-8") as lf:
+                    lines = lf.readlines()
+                    tail_lines = [l.strip() for l in lines[-40:] if l.strip()]
+            except Exception:
+                pass
+        crash_info = {
+            "status": "crashed",
+            "crashed_at": time.time(),
+            "exit_code": exc.returncode,
+            "error_name": "CalledProcessError",
+            "error_message": f"Training process failed with exit code {exc.returncode}",
+            "log_tail": tail_lines,
+        }
+        try:
+            import json
+            cur = {}
+            if os.path.exists(live_path):
+                with open(live_path, "r", encoding="utf-8") as f:
+                    cur = json.load(f)
+            cur.update(crash_info)
+            with open(live_path, "w", encoding="utf-8") as f:
+                json.dump(cur, f, indent=2)
+        except Exception:
+            pass
+        raise
+    except Exception as exc:
+        print(f"\n[Modal Trainer ERROR] Training harness exception: {exc}")
+        live_path = "/checkpoints/live_status.json"
+        crash_info = {
+            "status": "crashed",
+            "crashed_at": time.time(),
+            "exit_code": -1,
+            "error_name": type(exc).__name__,
+            "error_message": str(exc),
+        }
+        try:
+            import json
+            cur = {}
+            if os.path.exists(live_path):
+                with open(live_path, "r", encoding="utf-8") as f:
+                    cur = json.load(f)
+            cur.update(crash_info)
+            with open(live_path, "w", encoding="utf-8") as f:
+                json.dump(cur, f, indent=2)
+        except Exception:
+            pass
+        raise
     finally:
         stop_event.set()
-        ckpt_vol.commit()
-        print("\n[Modal Checkpoints] Training session finished. Checkpoints successfully committed to 'pulsar-checkpoints' volume.")
+        try:
+            ckpt_vol.commit()
+            print("\n[Modal Checkpoints] Final checkpoint commit to 'pulsar-checkpoints' volume completed.")
+        except Exception as e:
+            print(f"[Modal Checkpoints] Warning on final commit: {e}")
 
 
 @app.function(

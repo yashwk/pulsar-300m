@@ -76,21 +76,26 @@ This guarantees that resumption never creates duplicate steps or non-monotonic t
 
 ---
 
-## 4. Real-Time Local Monitoring
+## 4. Real-Time Cloud Monitoring
 
-Telemetry streams from the remote container to your local machine via a lightweight synchronization daemon:
+Telemetry streams from the remote container to your local machine or web browser through two streamlined options:
 
-### Terminal 1: Background Telemetry Sync
+### Option A: Unified Local Monitor (`make monitor-cloud`)
+Runs both the in-process Python SDK volume sync and the local web dashboard in a single terminal command:
 ```bash
-python scripts/sync_cloud_monitor.py --checkpoint-dir checkpoints --interval 5.0
+make monitor-cloud
+# Or:
+python monitor/web_server.py --port 7860 --checkpoint-dir checkpoints --cloud
 ```
-Pulls `/live_status.json`, `/metrics.jsonl`, and run metadata from the Modal volume `pulsar-checkpoints` into the local `checkpoints/` directory every 5 seconds.
+Access the dashboard at `http://localhost:7860`. The server automatically tails `pulsar-checkpoints` in an in-process background thread without spawning external CLI subprocesses.
 
-### Terminal 2: Web Monitor Dashboard
+### Option B: Serverless Cloud Monitor (`modal serve`)
+Run the monitor directly in the cloud attached to the persistent volume with zero local daemon overhead and an authenticated public URL:
 ```bash
-python monitor/web_server.py --port 7860 --checkpoint-dir checkpoints
+modal serve scripts/modal_monitor.py
+# Or permanent deployment:
+modal deploy scripts/modal_monitor.py
 ```
-Access the dashboard at `http://localhost:7860`.
 
 ---
 

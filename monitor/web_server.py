@@ -880,7 +880,7 @@ class PulsarMonitorHandler(SimpleHTTPRequestHandler):
         self.wfile.write(payload)
 
 
-def run_server(port: int = 7860, host: str = "127.0.0.1"):
+def run_server(port: int = 7860, host: str = "127.0.0.1", stop_event: threading.Event | None = None):
     server_address = (host, port)
     httpd = ThreadingHTTPServer(server_address, PulsarMonitorHandler)
     display_host = "localhost" if host == "0.0.0.0" else host
@@ -896,6 +896,9 @@ def run_server(port: int = 7860, host: str = "127.0.0.1"):
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\n[Pulsar Monitor] Shutting down web monitor.")
+    finally:
+        if stop_event is not None:
+            stop_event.set()
         httpd.server_close()
 
 
@@ -928,6 +931,18 @@ if __name__ == "__main__":
         help="Run directory to monitor (default: checkpoints). Point this at the trainer's "
              "--checkpoint-dir, e.g. checkpoints/baseline.",
     )
+    parser.add_argument(
+        "--cloud", action="store_true", default=False,
+        help="Run in cloud mode: launches background Modal volume telemetry sync thread automatically.",
+    )
+    parser.add_argument(
+        "--sync-interval", type=float, default=5.0,
+        help="Modal volume sync interval in seconds when --cloud is enabled (default: 5.0).",
+    )
+    parser.add_argument(
+        "--volume-name", type=str, default="pulsar-checkpoints",
+        help="Modal volume name when --cloud is enabled (default: pulsar-checkpoints).",
+    )
     args = parser.parse_args()
 
     if args.checkpoint_dir:
@@ -939,4 +954,17 @@ if __name__ == "__main__":
     if args.cooldown_steps is not None:
         _OVERRIDES["cooldown_steps"] = args.cooldown_steps
 
-    run_server(port=args.port, host=args.host)
+    stop_sync = None
+    if args.cloud:
+        import sys
+        sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+        from scripts.sync_cloud_monitor import start_sync_thread
+        stop_sync = threading.Event()
+        start_sync_thread(
+            checkpoint_dir=CHECKPOINT_DIR,
+            interval=args.sync_interval,
+            stop_event=stop_sync,
+            volume_name=args.volume_name,
+        )
+
+    run_server(port=args.port, host=args.host, stop_event=stop_sync)

@@ -27,9 +27,9 @@ flowchart TD
     end
 
     subgraph SyncDaemon [Local Workstation Sync]
-        SYNC["scripts/sync_cloud_monitor.py"]
+        SYNC["scripts/sync_cloud_monitor.py (In-Process Python SDK Sync)"]
         LOCAL_DIR["checkpoints/"]
-        COMMIT -->|modal volume get --force| SYNC
+        COMMIT -->|modal.Volume read_file_into_fileobj (mtime/size delta)| SYNC
         SYNC --> LOCAL_DIR
     end
 

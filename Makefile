@@ -32,6 +32,15 @@ smoke:
 monitor:
 	$(PYTHON) monitor/web_server.py --port 7860 --checkpoint-dir checkpoints
 
+monitor-cloud:
+	$(PYTHON) monitor/web_server.py --port 7860 --checkpoint-dir checkpoints --cloud
+
+serve-cloud-monitor:
+	modal serve scripts/modal_monitor.py
+
+deploy-cloud-monitor:
+	modal deploy scripts/modal_monitor.py
+
 sync:
 	$(PYTHON) scripts/sync_cloud_monitor.py --checkpoint-dir checkpoints
 

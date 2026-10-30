@@ -5,6 +5,7 @@ persistent volumes for training shards ('pulsar-data') and checkpoints ('pulsar-
 """
 
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -96,6 +97,7 @@ def execute_training(
     moe_capacity_factor: float = 1.25,
     bias_lr: float = 0.01,
     per_pulse_bias: bool = True,
+    no_milestones: bool = True,
 ):
     """Core training harness with background volume sync."""
     ckpt_vol.reload()
@@ -149,6 +151,8 @@ def execute_training(
         cmd.append("--per-pulse-bias")
     else:
         cmd.append("--no-per-pulse-bias")
+    if no_milestones:
+        cmd.append("--no-milestones")
     if compile:
         cmd.append("--compile")
     if output_ckpt:
@@ -161,15 +165,38 @@ def execute_training(
     print(f"   Command: {' '.join(cmd)}")
     print(f"{'='*70}\n")
 
+    proc = None
     try:
-        subprocess.run(cmd, check=True)
+        proc = subprocess.Popen(cmd)
+
+        def handle_signal(sig, frame):
+            print(f"\n[Modal Trainer] Signal {sig} received by container. Forwarding to training subprocess...")
+            if proc is not None and proc.poll() is None:
+                proc.send_signal(sig)
+
+        orig_sigterm = signal.signal(signal.SIGTERM, handle_signal)
+        orig_sigint = signal.signal(signal.SIGINT, handle_signal)
+
+        ret = proc.wait()
+
+        # Restore original handlers
+        try:
+            signal.signal(signal.SIGTERM, orig_sigterm)
+            signal.signal(signal.SIGINT, orig_sigint)
+        except Exception:
+            pass
+
+        if ret != 0 and ret != -signal.SIGTERM and ret != -signal.SIGINT:
+            raise subprocess.CalledProcessError(ret, cmd)
+
         live_path = "/checkpoints/live_status.json"
         if os.path.exists(live_path):
             try:
                 import json
                 with open(live_path, "r", encoding="utf-8") as f:
                     st = json.load(f)
-                st["status"] = "completed"
+                if st.get("status") != "interrupted":
+                    st["status"] = "completed"
                 st["completed_at"] = time.time()
                 with open(live_path, "w", encoding="utf-8") as f:
                     json.dump(st, f, indent=2)
@@ -301,11 +328,12 @@ def main(
     per_pulse_bias: bool = True,
     muon_lr: float = 0.02,
     adam_lr: float = 6e-4,
-    eval_every: int = 15,
-    save_every: int = 30,
+    eval_every: int = 250,
+    save_every: int = 500,
     resume: str = None,
     compile: bool = False,
     output_ckpt: str = None,
+    no_milestones: bool = True,
     detach: bool = True,
 ):
     # Calculate invariant hardware-agnostic batch dynamics
@@ -383,6 +411,7 @@ def main(
         "resume": resume,
         "compile": compile,
         "output_ckpt": output_ckpt,
+        "no_milestones": no_milestones,
     }
 
     selected_gpu = gpu.upper()
@@ -403,7 +432,7 @@ def main(
         call = remote_fn.spawn(**kwargs)
         print(f"[Modal Orchestrator] Run successfully spawned in the cloud! FunctionCall ID: {call.object_id}")
         print("[Modal Orchestrator] Safe to disconnect WiFi, close laptop, or exit. Modal cloud container will run independently.")
-        print("[Modal Orchestrator] Monitor logs and progress via Modal dashboard or local web monitor (sync_cloud_monitor.py).")
+        print("[Modal Orchestrator] Graceful Shutdown: Run 'modal app stop pulsar-training' to gracefully finish the step, save latest.pt, and stop.")
         return
     else:
         print(f"[Modal Orchestrator] Launching synchronous training run on NVIDIA {selected_gpu}...")

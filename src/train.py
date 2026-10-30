@@ -565,6 +565,8 @@ def train():
     parser.add_argument("--muon-momentum-fp32", action="store_true",
                         help="Keep Muon momentum in FP32 (default: bf16, matching the weight)")
     parser.add_argument("--compile", action="store_true", default=False, help="Enable torch.compile")
+    parser.add_argument("--no-milestones", action="store_true", default=False,
+                        help="Disable periodic milestone checkpoints (milestone_step_*.pt) to save disk/cloud volume space.")
     parser.add_argument("--thermal-cooldown-every", type=int, default=0, help="Cooldown pause frequency in steps")
     parser.add_argument("--thermal-cooldown-seconds", type=int, default=100, help="Duration of thermal cooldown pause")
     parser.add_argument("--reset-dataset", action="store_true", default=False,
@@ -1386,7 +1388,7 @@ def train():
             print(f"[Pulsar] Saved checkpoint -> {latest_ckpt_path} (step {step})")
 
         # Session Target or Milestone Checkpoint Saving
-        if not args.no_save and ((args.target_step is not None and step == args.target_step) or (step % 1000 == 0)):
+        if not args.no_save and not args.no_milestones and ((args.target_step is not None and step == args.target_step) or (step % 1000 == 0)):
             milestone_path = os.path.join(args.checkpoint_dir, f"milestone_step_{step}.pt")
             save_checkpoint(milestone_path, model, optimizer, cfg, step, tokens_seen, best_val_loss, num_pulses=args.num_pulses)
             print(f"[Pulsar] Milestone Checkpoint Saved -> {milestone_path} (step {step})")

@@ -612,3 +612,115 @@ def test_fused_sr_update_parity():
     got_drift = (dst.float() - 0.02).mean().item()
     lo, hi = 0.85 * expected_drift, 1.15 * expected_drift
     assert lo <= got_drift <= hi
+
+
+# ---------------------------------------------------------------------------
+# Fused Residual-Add + RMSNorm
+# ---------------------------------------------------------------------------
+
+@needs_gpu
+@needs_cuda_ext
+def test_fused_add_rmsnorm_parity():
+    """_FusedAddRMSNormFunction forward and backward match separate addition + RMSNorm."""
+    from src.model import _FusedAddRMSNormFunction, _RMSNormCUDAFunction
+
+    N, D = 32, 1024
+    x1 = _bf16(N, D, seed=101).requires_grad_(True)
+    res1 = _bf16(N, D, seed=102).requires_grad_(True)
+    w1 = torch.randn(D, device="cuda", dtype=torch.float32, requires_grad=True)
+
+    x2 = x1.detach().clone().requires_grad_(True)
+    res2 = res1.detach().clone().requires_grad_(True)
+    w2 = w1.detach().clone().requires_grad_(True)
+
+    # Fused pass
+    x_sum1, y1 = _FusedAddRMSNormFunction.apply(x1, res1, w1, 1e-6)
+    loss1 = (y1 * 2.0).sum() + (x_sum1 * 0.5).sum()
+    loss1.backward()
+
+    # Unfused pass
+    x_sum2 = x2 + res2
+    y2 = _RMSNormCUDAFunction.apply(x_sum2, w2, 1e-6)
+    loss2 = (y2 * 2.0).sum() + (x_sum2 * 0.5).sum()
+    loss2.backward()
+
+    assert_close(x_sum1, x_sum2, atol=1e-3, msg="fused_add_rmsnorm x_sum match")
+    assert_close(y1, y2, atol=1e-3, msg="fused_add_rmsnorm y match")
+    assert_close(x1.grad, x2.grad, atol=3.5e-2, msg="fused_add_rmsnorm dx match")
+    assert_close(res1.grad, res2.grad, atol=3.5e-2, msg="fused_add_rmsnorm dres match")
+    assert_close(w1.grad, w2.grad, atol=2e-2, msg="fused_add_rmsnorm dw match")
+
+
+# ---------------------------------------------------------------------------
+# Fused Chunked Linear + Softcap CE
+# ---------------------------------------------------------------------------
+
+@needs_gpu
+@needs_cuda_ext
+def test_fused_linear_softcap_ce_parity():
+    """_FusedLinearSoftcapCEFunction forward and backward match unfused linear + softcap CE."""
+    from src.model import _FusedLinearSoftcapCEFunction, _softcap_cross_entropy
+
+    N, D, V = 64, 128, 512
+    h1 = _bf16(N, D, seed=201).requires_grad_(True)
+    w1 = _bf16(V, D, seed=202).requires_grad_(True)
+    labels = torch.randint(0, V, (N,), device="cuda", dtype=torch.long)
+    labels[::5] = -100 # some ignored tokens
+
+    h2 = h1.detach().clone().requires_grad_(True)
+    w2 = w1.detach().clone().requires_grad_(True)
+
+    # Fused pass (chunk size = 16 to exercise multiple chunks)
+    loss1 = _FusedLinearSoftcapCEFunction.apply(h1, w1, labels, 30.0, 16, -100)
+    loss1.backward()
+
+    # Reference pass
+    raw2 = torch.nn.functional.linear(h2, w2)
+    loss2 = _softcap_cross_entropy(raw2, labels, 30.0, "mean", -100)
+    loss2.backward()
+
+    assert_close(loss1, loss2, atol=1e-3, msg="fused_linear_ce loss match")
+    assert_close(h1.grad, h2.grad, atol=1e-2, msg="fused_linear_ce dh match")
+    assert_close(w1.grad, w2.grad, atol=1e-2, msg="fused_linear_ce dweight match")
+
+
+# ---------------------------------------------------------------------------
+# Stride-Aware QK-RMSNorm + RoPE
+# ---------------------------------------------------------------------------
+
+@needs_gpu
+@needs_cuda_ext
+def test_qk_rmsnorm_rope_non_contiguous_parity():
+    """_FusedQKRMSNormRoPEFunction handles non-contiguous (transposed) inputs accurately."""
+    from src.model import _FusedQKRMSNormRoPEFunction, _FusedQK_RMSNormFunction, apply_rotary_emb
+
+    B, T, H, D = 2, 16, 4, 64
+    # Create contiguous [B, T, H, D] then transpose to [B, H, T, D]
+    raw1 = _bf16(B, T, H, D, seed=301).requires_grad_(True)
+    raw2 = raw1.detach().clone().requires_grad_(True)
+    w1 = torch.randn(H, D, device="cuda", dtype=torch.float32, requires_grad=True)
+    w2 = w1.detach().clone().requires_grad_(True)
+
+    q1 = raw1.transpose(1, 2) # Non-contiguous! stride(3) == 1, stride(2) == H*D, stride(1) == D
+    assert not q1.is_contiguous()
+
+    q2 = raw2.transpose(1, 2)
+
+    theta = 10000.0
+    inv_freq = 1.0 / (theta ** (torch.arange(0, D, 2, device="cuda").float() / D))
+    t = torch.arange(T, device="cuda", dtype=torch.float32)
+    freqs = torch.outer(t, inv_freq)
+    cos = freqs.cos()
+    sin = freqs.sin()
+
+    out1 = _FusedQKRMSNormRoPEFunction.apply(q1, w1, cos, sin, T, 1e-6)
+    out1.sum().backward()
+
+    q2_c = q2.contiguous()
+    q_norm2 = _FusedQK_RMSNormFunction.apply(q2_c, w2, T, 1e-6)
+    out2 = apply_rotary_emb(q_norm2, cos, sin)
+    out2.sum().backward()
+
+    assert_close(out1, out2, atol=3.5e-2, msg="stride-aware fwd match")
+    assert_close(raw1.grad, raw2.grad, atol=3.5e-2, msg="stride-aware dx match")
+    assert_close(w1.grad, w2.grad, atol=6e-2, msg="stride-aware dw match")

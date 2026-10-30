@@ -995,9 +995,21 @@ def train():
         muon_grad_norm_t = torch.linalg.vector_norm(torch.stack(torch._foreach_norm(m_grads))) if m_grads else None
         adam_grad_norm_t = torch.linalg.vector_norm(torch.stack(torch._foreach_norm(a_grads))) if a_grads else None
 
-        # Global gradient clipping (fused C++ foreach multi-tensor)
+        # Combined total gradient norm from disjoint parameter partitions (avoids duplicate full-model foreach_norm pass)
+        if muon_grad_norm_t is not None and adam_grad_norm_t is not None:
+            total_grad_norm_t = torch.hypot(muon_grad_norm_t, adam_grad_norm_t)
+        elif muon_grad_norm_t is not None:
+            total_grad_norm_t = muon_grad_norm_t
+        elif adam_grad_norm_t is not None:
+            total_grad_norm_t = adam_grad_norm_t
+        else:
+            total_grad_norm_t = torch.tensor(0.0, device=next(model.parameters()).device)
+
+        # Global gradient clipping in-place
         all_trainable = [p for p in model.parameters() if p.grad is not None]
-        total_grad_norm_t = torch.nn.utils.clip_grad_norm_(all_trainable, args.grad_clip, foreach=True)
+        if args.grad_clip > 0 and all_trainable:
+            clip_coef_clamped = torch.clamp(args.grad_clip / (total_grad_norm_t + 1e-6), max=1.0)
+            torch._foreach_mul_([p.grad for p in all_trainable], clip_coef_clamped)
 
         # Optimizer step
         t_opt_start = time.time()

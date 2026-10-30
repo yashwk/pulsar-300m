@@ -5,6 +5,9 @@
 std::vector<torch::Tensor> rmsnorm_forward_cuda(torch::Tensor x, torch::Tensor weight, float eps);
 std::vector<torch::Tensor> rmsnorm_backward_cuda(torch::Tensor dy, torch::Tensor x, torch::Tensor weight, torch::Tensor rsqrt);
 
+std::vector<torch::Tensor> fused_add_rmsnorm_forward_cuda(torch::Tensor x, torch::Tensor residual, torch::Tensor weight, float eps);
+std::vector<torch::Tensor> fused_add_rmsnorm_backward_cuda(torch::Tensor dy_normed, torch::Tensor dx_sum_upstream, torch::Tensor x_sum, torch::Tensor weight, torch::Tensor rsqrt);
+
 
 
 torch::Tensor fused_swiglu_forward_cuda(torch::Tensor gu, int64_t d_ff);
@@ -149,6 +152,10 @@ void fused_sr_update_cuda(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rmsnorm_forward", &rmsnorm_forward_cuda, "RMSNorm Forward (CUDA)");
     m.def("rmsnorm_backward", &rmsnorm_backward_cuda, "RMSNorm Backward (CUDA)");
+    m.def("fused_add_rmsnorm_forward", &fused_add_rmsnorm_forward_cuda, "Fused Add + RMSNorm Forward (CUDA)",
+          py::arg("x"), py::arg("residual"), py::arg("weight"), py::arg("eps") = 1e-6f);
+    m.def("fused_add_rmsnorm_backward", &fused_add_rmsnorm_backward_cuda, "Fused Add + RMSNorm Backward (CUDA)",
+          py::arg("dy_normed"), py::arg("dx_sum_upstream"), py::arg("x_sum"), py::arg("weight"), py::arg("rsqrt"));
 
     m.def("fused_swiglu_forward", &fused_swiglu_forward_cuda, "Fused SwiGLU Forward (CUDA)");
     m.def("fused_swiglu_backward", &fused_swiglu_backward_cuda, "Fused SwiGLU Backward (CUDA)");

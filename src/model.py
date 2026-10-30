@@ -144,11 +144,10 @@ class _FusedQK_RMSNormFunction(torch.autograd.Function):
 class _FusedQKRMSNormRoPEFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor, weight: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, T: int, eps: float):
-        x_c = x.contiguous()
         weight_f = weight.float().contiguous()
         cos_f = cos.float().contiguous()
         sin_f = sin.float().contiguous()
-        y, rsqrt = pulsar_cuda.qk_rmsnorm_rope_forward(x_c, weight_f, cos_f, sin_f, T, eps)
+        y, x_c, rsqrt = pulsar_cuda.qk_rmsnorm_rope_forward(x, weight_f, cos_f, sin_f, T, eps)
         ctx.save_for_backward(x_c, weight, rsqrt, cos, sin)
         ctx.T = T
         return y
@@ -176,6 +175,83 @@ class _FusedAttnGateFunction(torch.autograd.Function):
             grad_out.contiguous(), attn_out.contiguous(), gate_logits.contiguous()
         )
         return d_attn_out, d_gate_logits
+
+
+class _FusedAddRMSNormFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float):
+        weight_f = weight.float().contiguous()
+        x_sum, y, rsqrt = pulsar_cuda.fused_add_rmsnorm_forward(
+            x.contiguous(), residual.contiguous(), weight_f, eps
+        )
+        ctx.save_for_backward(x_sum, weight_f, rsqrt)
+        return x_sum, y
+
+    @staticmethod
+    def backward(ctx, grad_x_sum: torch.Tensor | None, grad_y: torch.Tensor):
+        x_sum, weight_f, rsqrt = ctx.saved_tensors
+        if grad_x_sum is None:
+            grad_x_sum = torch.zeros_like(x_sum)
+        dx, dweight = pulsar_cuda.fused_add_rmsnorm_backward(
+            grad_y.contiguous(), grad_x_sum.contiguous(), x_sum, weight_f, rsqrt
+        )
+        return dx, dx, dweight.to(weight_f.dtype), None
+
+
+class _FusedLinearSoftcapCEFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        h_flat: torch.Tensor,
+        weight: torch.Tensor,
+        labels_flat: torch.Tensor,
+        softcap: float = 30.0,
+        chunk_size: int = 32768,
+        ignore_index: int = -100,
+    ) -> torch.Tensor:
+        n_valid = (labels_flat != ignore_index).sum().clamp_min(1).to(torch.float32)
+        total_loss = torch.zeros((), device=h_flat.device, dtype=torch.float32)
+
+        needs_grad = (ctx.needs_input_grad[0] or ctx.needs_input_grad[1])
+        if not needs_grad:
+            with torch.no_grad():
+                for i in range(0, h_flat.size(0), chunk_size):
+                    hc = h_flat[i : i + chunk_size]
+                    tc = labels_flat[i : i + chunk_size].contiguous()
+                    raw_c = F.linear(hc, weight)
+                    losses_c, _ = pulsar_cuda.fused_softcap_ce_forward(
+                        raw_c.contiguous(), tc, softcap, ignore_index
+                    )
+                    total_loss = total_loss + losses_c.sum()
+            return total_loss / n_valid
+
+        d_h = torch.empty_like(h_flat)
+        d_weight = torch.zeros_like(weight)
+        scale_one = (1.0 / n_valid).contiguous()
+
+        with torch.no_grad():
+            for i in range(0, h_flat.size(0), chunk_size):
+                hc = h_flat[i : i + chunk_size]
+                tc = labels_flat[i : i + chunk_size].contiguous()
+                raw_c = F.linear(hc, weight)
+                losses_c, lse_c = pulsar_cuda.fused_softcap_ce_forward(
+                    raw_c.contiguous(), tc, softcap, ignore_index
+                )
+                total_loss = total_loss + losses_c.sum()
+                d_raw_c = pulsar_cuda.fused_softcap_ce_backward_dev(
+                    raw_c.contiguous(), tc, lse_c.contiguous(), softcap, scale_one, ignore_index
+                )
+                torch.matmul(d_raw_c, weight, out=d_h[i : i + chunk_size])
+                d_weight.addmm_(d_raw_c.t(), hc)
+
+        ctx.save_for_backward(d_h, d_weight)
+        return total_loss / n_valid
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        d_h, d_weight = ctx.saved_tensors
+        g = grad_output.reshape(()).to(torch.float32)
+        return d_h * g.to(d_h.dtype), d_weight * g.to(d_weight.dtype), None, None, None, None
 
 
 class _FusedSoftcapCrossEntropyFunction(torch.autograd.Function):
@@ -1212,9 +1288,25 @@ class PulsarBlock(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor]:
         attn_in = self.attn_norm(x, pulse_idx=pulse_idx)
         attn_out, v_first = self.attn(attn_in, cos, sin, pulse_idx=pulse_idx, v_first=v_first)
-        x = x + attn_out
 
-        mlp_in = self.mlp_norm(x, pulse_idx=pulse_idx)
+        w_mlp = (
+            self.mlp_norm.weight[pulse_idx]
+            if (self.mlp_norm.max_pulses is not None and self.mlp_norm.max_pulses > 1)
+            else self.mlp_norm.weight
+        )
+        if (
+            HAS_PULSAR_CUDA
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and not torch.compiler.is_compiling()
+            and hasattr(pulsar_cuda, "fused_add_rmsnorm_forward")
+            and hasattr(pulsar_cuda, "fused_add_rmsnorm_backward")
+        ):
+            x, mlp_in = _FusedAddRMSNormFunction.apply(x, attn_out, w_mlp, self.mlp_norm.eps)
+        else:
+            x = x + attn_out
+            mlp_in = self.mlp_norm(x, pulse_idx=pulse_idx)
+
         mlp_out, z_loss, gate_weight_mean, bincounts = self.mlp(
             mlp_in, pulse_idx=pulse_idx, routing_mask=routing_mask
         )
@@ -1468,23 +1560,34 @@ class PulsarForCausalLM(nn.Module):
         h_flat = h.reshape(-1, self.cfg.d_model)
         tgt_flat = labels.reshape(-1)
         chunk = getattr(self.cfg, "ce_chunk_size", 32768)
+
+        if (
+            HAS_PULSAR_CUDA
+            and h_flat.is_cuda
+            and h_flat.dtype == torch.bfloat16
+            and not torch.compiler.is_compiling()
+            and hasattr(pulsar_cuda, "fused_softcap_ce_forward")
+            and hasattr(pulsar_cuda, "fused_softcap_ce_backward_dev")
+        ):
+            return _FusedLinearSoftcapCEFunction.apply(
+                h_flat,
+                self.lm_head.weight,
+                tgt_flat,
+                self.cfg.logit_softcap,
+                chunk,
+                -100,
+            )
+
         total = torch.zeros((), device=h_flat.device, dtype=torch.float32)
         for i in range(0, h_flat.size(0), chunk):
-            hc = h_flat[i:i + chunk]
-            tc = tgt_flat[i:i + chunk]
+            hc = h_flat[i : i + chunk]
+            tc = tgt_flat[i : i + chunk]
             raw = F.linear(hc, self.lm_head.weight)
-            if (HAS_PULSAR_CUDA and raw.is_cuda and raw.dtype == torch.bfloat16
-                    and not torch.compiler.is_compiling()
-                    and hasattr(pulsar_cuda, "fused_softcap_ce_forward")):
-                part = _FusedSoftcapCrossEntropyFunction.apply(raw, tc, self.cfg.logit_softcap, "sum", -100)
-            elif raw.is_cuda:
+            if raw.is_cuda:
                 part = _compiled_softcap_ce(raw, tc, self.cfg.logit_softcap, "sum", -100)
             else:
                 part = _softcap_cross_entropy(raw, tc, self.cfg.logit_softcap, "sum", -100)
             total = total + part
-        # Divide by VALID tokens, not the total: ignored (-100) positions contribute
-        # zero to the sum, so dividing by all tokens deflates the loss (and its
-        # gradients). Any batch with padding or ignore_index was affected.
         n_valid = (tgt_flat != -100).sum().clamp_min(1)
         return total / n_valid
 

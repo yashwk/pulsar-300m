@@ -103,7 +103,8 @@ torch::Tensor moe_router_topk_backward_cuda(
     torch::Tensor d_topk_weights,
     torch::Tensor logits,
     torch::Tensor topk_idx,
-    float z_loss_weight = 1e-4f
+    float z_loss_weight = 1e-4f,
+    std::optional<torch::Tensor> d_z_loss = std::nullopt
 );
 
 std::vector<torch::Tensor> qk_rmsnorm_rope_forward_cuda(
@@ -149,6 +150,21 @@ void fused_sr_update_cuda(
     float lr_scale,
     float wd_factor,
     int64_t seed
+);
+
+void adamw_bf16_sr_step_cuda(
+    torch::Tensor p,
+    torch::Tensor g,
+    torch::Tensor m,
+    torch::Tensor v,
+    float lr,
+    float beta1,
+    float beta2,
+    float eps,
+    float weight_decay,
+    int64_t step,
+    int64_t seed,
+    bool stochastic_rounding
 );
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -212,5 +228,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Fused MoE Router Top-K Forward (CUDA) with default top_k=2",
           py::arg("logits"), py::arg("expert_bias"), py::arg("z_loss_weight") = 1e-4f);
     m.def("moe_router_topk_backward", &moe_router_topk_backward_cuda, "Fused MoE Router Top-K Backward (CUDA)",
-          py::arg("d_topk_weights"), py::arg("logits"), py::arg("topk_idx"), py::arg("z_loss_weight") = 1e-4f);
+          py::arg("d_topk_weights"), py::arg("logits"), py::arg("topk_idx"), py::arg("z_loss_weight") = 1e-4f,
+          py::arg("d_z_loss") = py::none());
+    m.def("adamw_bf16_sr_step", &adamw_bf16_sr_step_cuda, "Fused AdamW BF16 SR Step (CUDA)",
+          py::arg("p"), py::arg("g"), py::arg("m"), py::arg("v"),
+          py::arg("lr"), py::arg("beta1"), py::arg("beta2"), py::arg("eps"),
+          py::arg("weight_decay"), py::arg("step"), py::arg("seed"), py::arg("stochastic_rounding"));
 }

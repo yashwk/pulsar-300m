@@ -350,6 +350,20 @@ class AdamWBF16SR(_SROptimizerMixin, _Optimizer):
                 m = state["exp_avg"]
                 v = state["exp_avg_sq"]
 
+                if (
+                    HAS_PULSAR_CUDA
+                    and p.is_cuda
+                    and p.dtype == torch.bfloat16
+                    and g.dtype == torch.bfloat16
+                    and not torch.compiler.is_compiling()
+                    and hasattr(pulsar_cuda, "adamw_bf16_sr_step")
+                ):
+                    seed_val = (self.seed * 1_000_003 + self._step_count + 7) & 0xFFFFFFFF
+                    pulsar_cuda.adamw_bf16_sr_step(
+                        p.data, g.contiguous(), m, v, lr, beta1, beta2, eps, wd, step, seed_val, self.stochastic_rounding
+                    )
+                    continue
+
                 g_f = g.float()
                 m.mul_(beta1).add_(g_f, alpha=1.0 - beta1)
                 v.mul_(beta2).addcmul_(g_f, g_f, value=1.0 - beta2)

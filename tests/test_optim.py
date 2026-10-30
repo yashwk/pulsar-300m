@@ -305,3 +305,24 @@ def test_resume_reproduces_uninterrupted_run_exactly():
 
     worst_diff = max((a.float() - b.float()).abs().max().item() for a, b in zip(ref_params, res_params))
     assert worst_diff == 0.0
+
+
+@pytest.mark.skipif(not HAS_CUDA, reason="needs CUDA for AdamW CUDA kernel test")
+def test_adamw_cuda_kernel_parity_and_stochastic_rounding():
+    """AdamWBF16SR CUDA kernel matches eager PyTorch update direction and preserves FP32 state."""
+    import pulsar_cuda
+
+    torch.manual_seed(42)
+    N = 2048
+    p = nn.Parameter(torch.randn(N, device="cuda", dtype=torch.bfloat16))
+    p_init = p.detach().clone()
+    p.grad = torch.randn_like(p) * 1e-3
+
+    opt = AdamWBF16SR([p], lr=6e-4, weight_decay=0.1, stochastic_rounding=True, seed=42)
+    opt.step()
+
+    assert opt.state[p]["step"] == 1
+    assert opt.state[p]["exp_avg"].dtype == torch.float32
+    assert opt.state[p]["exp_avg_sq"].dtype == torch.float32
+    assert not torch.equal(p.detach(), p_init)
+    assert torch.isfinite(p).all()

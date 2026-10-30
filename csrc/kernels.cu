@@ -47,14 +47,17 @@ __global__ void rmsnorm_forward_vec8_kernel(
     const __nv_bfloat16* x_tok = x + tok * dim;
     __nv_bfloat16* y_tok = y + tok * dim;
     int num_vec = dim / 8;
+    int v = threadIdx.x;
 
+    float x_reg[8];
     float sum_sq = 0.0f;
-    for (int v = threadIdx.x; v < num_vec; v += blockDim.x) {
+    if (v < num_vec) {
         uint4 in_u4 = *reinterpret_cast<const uint4*>(x_tok + v * 8);
         const __nv_bfloat16* in_bf = reinterpret_cast<const __nv_bfloat16*>(&in_u4);
         #pragma unroll
         for (int k = 0; k < 8; ++k) {
             float val = __bfloat162float(in_bf[k]);
+            x_reg[k] = val;
             sum_sq += val * val;
         }
     }
@@ -77,15 +80,12 @@ __global__ void rmsnorm_forward_vec8_kernel(
     __syncthreads();
 
     float rsqrt_val = s_sum[0];
-    for (int v = threadIdx.x; v < num_vec; v += blockDim.x) {
-        uint4 in_u4 = *reinterpret_cast<const uint4*>(x_tok + v * 8);
-        const __nv_bfloat16* in_bf = reinterpret_cast<const __nv_bfloat16*>(&in_u4);
+    if (v < num_vec) {
         __nv_bfloat16 out_bf[8];
         #pragma unroll
         for (int k = 0; k < 8; ++k) {
-            float val = __bfloat162float(in_bf[k]);
             float w = weight[v * 8 + k];
-            out_bf[k] = __float2bfloat16(val * rsqrt_val * w);
+            out_bf[k] = __float2bfloat16(x_reg[k] * rsqrt_val * w);
         }
         *reinterpret_cast<uint4*>(y_tok + v * 8) = *reinterpret_cast<uint4*>(out_bf);
     }
@@ -146,7 +146,16 @@ __global__ void rmsnorm_backward_vec8_kernel(
 ) {
     int num_vec = dim / 8;
     float inv_dim = 1.0f / dim;
-    float dw_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    int v = threadIdx.x;
+    float w_reg[8] = {0.0f};
+    float dw_acc[8] = {0.0f};
+
+    if (v < num_vec) {
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            w_reg[k] = weight[v * 8 + k];
+        }
+    }
 
     for (int tok = blockIdx.x; tok < total_tokens; tok += gridDim.x) {
         const __nv_bfloat16* dy_tok = dy + tok * dim;
@@ -154,8 +163,10 @@ __global__ void rmsnorm_backward_vec8_kernel(
         __nv_bfloat16* dx_tok = dx + tok * dim;
         float rsqrt_val = rsqrt_in[tok];
 
+        float dy_reg[8];
+        float x_reg[8];
         float sum_dy_x_w = 0.0f;
-        for (int v = threadIdx.x; v < num_vec; v += blockDim.x) {
+        if (v < num_vec) {
             uint4 dy_u4 = *reinterpret_cast<const uint4*>(dy_tok + v * 8);
             uint4 x_u4 = *reinterpret_cast<const uint4*>(x_tok + v * 8);
             const __nv_bfloat16* dy_bf = reinterpret_cast<const __nv_bfloat16*>(&dy_u4);
@@ -165,8 +176,9 @@ __global__ void rmsnorm_backward_vec8_kernel(
             for (int k = 0; k < 8; ++k) {
                 float dy_val = __bfloat162float(dy_bf[k]);
                 float x_val = __bfloat162float(x_bf[k]);
-                float w_val = weight[v * 8 + k];
-                sum_dy_x_w += dy_val * x_val * w_val;
+                dy_reg[k] = dy_val;
+                x_reg[k] = x_val;
+                sum_dy_x_w += dy_val * x_val * w_reg[k];
                 dw_acc[k] += dy_val * x_val * rsqrt_val;
             }
         }
@@ -188,20 +200,12 @@ __global__ void rmsnorm_backward_vec8_kernel(
 
         float total_dy_x_w = s_sum[0];
 
-        for (int v = threadIdx.x; v < num_vec; v += blockDim.x) {
-            uint4 dy_u4 = *reinterpret_cast<const uint4*>(dy_tok + v * 8);
-            uint4 x_u4 = *reinterpret_cast<const uint4*>(x_tok + v * 8);
-            const __nv_bfloat16* dy_bf = reinterpret_cast<const __nv_bfloat16*>(&dy_u4);
-            const __nv_bfloat16* x_bf = reinterpret_cast<const __nv_bfloat16*>(&x_u4);
+        if (v < num_vec) {
             __nv_bfloat16 dx_bf[8];
-
             #pragma unroll
             for (int k = 0; k < 8; ++k) {
-                float dy_val = __bfloat162float(dy_bf[k]);
-                float x_val = __bfloat162float(x_bf[k]);
-                float w_val = weight[v * 8 + k];
-                float term1 = w_val * dy_val * rsqrt_val;
-                float term2 = x_val * (rsqrt_val * rsqrt_val * rsqrt_val) * total_dy_x_w * inv_dim;
+                float term1 = w_reg[k] * dy_reg[k] * rsqrt_val;
+                float term2 = x_reg[k] * (rsqrt_val * rsqrt_val * rsqrt_val) * total_dy_x_w * inv_dim;
                 dx_bf[k] = __float2bfloat16(term1 - term2);
             }
             *reinterpret_cast<uint4*>(dx_tok + v * 8) = *reinterpret_cast<uint4*>(dx_bf);
@@ -209,8 +213,7 @@ __global__ void rmsnorm_backward_vec8_kernel(
         __syncthreads();
     }
 
-    // Accumulate dweight once per thread after finishing all tokens assigned to this block
-    for (int v = threadIdx.x; v < num_vec; v += blockDim.x) {
+    if (v < num_vec) {
         #pragma unroll
         for (int k = 0; k < 8; ++k) {
             atomicAdd(&dweight[v * 8 + k], dw_acc[k]);
@@ -233,7 +236,13 @@ std::vector<torch::Tensor> rmsnorm_forward_cuda(torch::Tensor x, torch::Tensor w
     auto y = torch::empty_like(x);
     auto rsqrt_out = torch::empty({total_tokens}, torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
 
-    int threads = (dim >= 256) ? 128 : 32;
+    int num_vec = dim / 8;
+    int threads;
+    if (dim % 8 == 0 && num_vec <= 1024) {
+        threads = std::min(1024, ((std::max(32, num_vec) + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE);
+    } else {
+        threads = (dim >= 256) ? 128 : 32;
+    }
     int blocks = total_tokens;
 
     if (dim % 8 == 0) {
@@ -320,9 +329,11 @@ __global__ void fused_add_rmsnorm_forward_vec8_kernel(
     __nv_bfloat16* x_sum_tok = x_sum + tok * dim;
     __nv_bfloat16* y_tok = y + tok * dim;
     int num_vec = dim / 8;
+    int v = threadIdx.x;
 
+    float sum_reg[8];
     float sum_sq = 0.0f;
-    for (int v = threadIdx.x; v < num_vec; v += blockDim.x) {
+    if (v < num_vec) {
         uint4 x_u4 = *reinterpret_cast<const uint4*>(x_tok + v * 8);
         uint4 res_u4 = *reinterpret_cast<const uint4*>(res_tok + v * 8);
         const __nv_bfloat16* x_bf = reinterpret_cast<const __nv_bfloat16*>(&x_u4);
@@ -334,6 +345,7 @@ __global__ void fused_add_rmsnorm_forward_vec8_kernel(
             float val = __bfloat162float(x_bf[k]) + __bfloat162float(res_bf[k]);
             sum_bf[k] = __float2bfloat16(val);
             float stored = __bfloat162float(sum_bf[k]);
+            sum_reg[k] = stored;
             sum_sq += stored * stored;
         }
         *reinterpret_cast<uint4*>(x_sum_tok + v * 8) = *reinterpret_cast<uint4*>(sum_bf);
@@ -357,15 +369,12 @@ __global__ void fused_add_rmsnorm_forward_vec8_kernel(
     __syncthreads();
 
     float rsqrt_val = s_sum[0];
-    for (int v = threadIdx.x; v < num_vec; v += blockDim.x) {
-        uint4 sum_u4 = *reinterpret_cast<const uint4*>(x_sum_tok + v * 8);
-        const __nv_bfloat16* sum_bf = reinterpret_cast<const __nv_bfloat16*>(&sum_u4);
+    if (v < num_vec) {
         __nv_bfloat16 y_bf[8];
         #pragma unroll
         for (int k = 0; k < 8; ++k) {
-            float val = __bfloat162float(sum_bf[k]);
             float w = weight[v * 8 + k];
-            y_bf[k] = __float2bfloat16(val * rsqrt_val * w);
+            y_bf[k] = __float2bfloat16(sum_reg[k] * rsqrt_val * w);
         }
         *reinterpret_cast<uint4*>(y_tok + v * 8) = *reinterpret_cast<uint4*>(y_bf);
     }
@@ -383,7 +392,16 @@ __global__ void fused_add_rmsnorm_backward_vec8_kernel(
 ) {
     int num_vec = dim / 8;
     float inv_dim = 1.0f / dim;
-    float dw_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    int v = threadIdx.x;
+    float w_reg[8] = {0.0f};
+    float dw_acc[8] = {0.0f};
+
+    if (v < num_vec) {
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            w_reg[k] = weight[v * 8 + k];
+        }
+    }
 
     for (int tok = blockIdx.x; tok < total_tokens; tok += gridDim.x) {
         const __nv_bfloat16* dy_tok = dy_normed + tok * dim;
@@ -392,8 +410,10 @@ __global__ void fused_add_rmsnorm_backward_vec8_kernel(
         __nv_bfloat16* dx_tok = dx + tok * dim;
         float rsqrt_val = rsqrt_in[tok];
 
+        float dy_reg[8];
+        float x_reg[8];
         float sum_dy_x_w = 0.0f;
-        for (int v = threadIdx.x; v < num_vec; v += blockDim.x) {
+        if (v < num_vec) {
             uint4 dy_u4 = *reinterpret_cast<const uint4*>(dy_tok + v * 8);
             uint4 x_u4 = *reinterpret_cast<const uint4*>(x_tok + v * 8);
             const __nv_bfloat16* dy_bf = reinterpret_cast<const __nv_bfloat16*>(&dy_u4);
@@ -403,8 +423,9 @@ __global__ void fused_add_rmsnorm_backward_vec8_kernel(
             for (int k = 0; k < 8; ++k) {
                 float dy_val = __bfloat162float(dy_bf[k]);
                 float x_val = __bfloat162float(x_bf[k]);
-                float w_val = weight[v * 8 + k];
-                sum_dy_x_w += dy_val * x_val * w_val;
+                dy_reg[k] = dy_val;
+                x_reg[k] = x_val;
+                sum_dy_x_w += dy_val * x_val * w_reg[k];
                 dw_acc[k] += dy_val * x_val * rsqrt_val;
             }
         }
@@ -426,12 +447,7 @@ __global__ void fused_add_rmsnorm_backward_vec8_kernel(
 
         float total_dy_x_w = s_sum[0];
 
-        for (int v = threadIdx.x; v < num_vec; v += blockDim.x) {
-            uint4 dy_u4 = *reinterpret_cast<const uint4*>(dy_tok + v * 8);
-            uint4 x_u4 = *reinterpret_cast<const uint4*>(x_tok + v * 8);
-            const __nv_bfloat16* dy_bf = reinterpret_cast<const __nv_bfloat16*>(&dy_u4);
-            const __nv_bfloat16* x_bf = reinterpret_cast<const __nv_bfloat16*>(&x_u4);
-
+        if (v < num_vec) {
             uint4 dx_sum_u4;
             const __nv_bfloat16* dx_sum_bf = nullptr;
             if (dx_sum_tok != nullptr) {
@@ -440,14 +456,10 @@ __global__ void fused_add_rmsnorm_backward_vec8_kernel(
             }
 
             __nv_bfloat16 dx_bf[8];
-
             #pragma unroll
             for (int k = 0; k < 8; ++k) {
-                float dy_val = __bfloat162float(dy_bf[k]);
-                float x_val = __bfloat162float(x_bf[k]);
-                float w_val = weight[v * 8 + k];
-                float term1 = w_val * dy_val * rsqrt_val;
-                float term2 = x_val * (rsqrt_val * rsqrt_val * rsqrt_val) * total_dy_x_w * inv_dim;
+                float term1 = w_reg[k] * dy_reg[k] * rsqrt_val;
+                float term2 = x_reg[k] * (rsqrt_val * rsqrt_val * rsqrt_val) * total_dy_x_w * inv_dim;
                 float dx_val = term1 - term2;
                 if (dx_sum_bf != nullptr) {
                     dx_val += __bfloat162float(dx_sum_bf[k]);
@@ -459,7 +471,7 @@ __global__ void fused_add_rmsnorm_backward_vec8_kernel(
         __syncthreads();
     }
 
-    for (int v = threadIdx.x; v < num_vec; v += blockDim.x) {
+    if (v < num_vec) {
         #pragma unroll
         for (int k = 0; k < 8; ++k) {
             atomicAdd(&dweight[v * 8 + k], dw_acc[k]);
@@ -495,7 +507,13 @@ std::vector<torch::Tensor> fused_add_rmsnorm_forward_cuda(
     auto y = torch::empty_like(x);
     auto rsqrt_out = torch::empty({total_tokens}, torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
 
-    int threads = (dim >= 256) ? 128 : 32;
+    int num_vec = dim / 8;
+    int threads;
+    if (dim % 8 == 0 && num_vec <= 1024) {
+        threads = std::min(1024, ((std::max(32, num_vec) + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE);
+    } else {
+        threads = (dim >= 256) ? 128 : 32;
+    }
     int blocks = total_tokens;
     fused_add_rmsnorm_forward_vec8_kernel<<<blocks, threads>>>(
         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<c10::BFloat16>()),
@@ -1403,57 +1421,87 @@ __global__ void moe_combine_backward_kernel(
     __nv_bfloat16* __restrict__ d_topk_weights,       // [N, K]
     int N, int D, int K, int E, int C
 ) {
-    int idx = blockIdx.x; // Block per (token, k): 0 <= idx < N * K
-    if (idx >= N * K) return;
-
-    int token_idx = idx / K;
-    int expert_id = (int)topk_idx[idx];
-    int slot = token_to_slot[idx];
-
-    if (slot < 0 || slot >= C || expert_id < 0 || expert_id >= E) {
-        if (threadIdx.x == 0) {
-            d_topk_weights[idx] = __float2bfloat16(0.0f);
-        }
-        return;
-    }
-
-    float w = __bfloat162float(topk_weights[idx]);
-    float dot_val = 0.0f;
+    int token_idx = blockIdx.x; // Block per token: 0 <= token_idx < N
+    if (token_idx >= N) return;
 
     const __nv_bfloat16* dy_ptr = d_routed_out + (int64_t)token_idx * D;
-    const __nv_bfloat16* e_out_ptr = expert_outputs + (int64_t)(expert_id * C + slot) * D;
-    __nv_bfloat16* de_out_ptr = d_expert_outputs + (int64_t)(expert_id * C + slot) * D;
-
     int num_vec = D / 8;
-    for (int v = threadIdx.x; v < num_vec; v += blockDim.x) {
-        uint4 dy_u4 = *reinterpret_cast<const uint4*>(dy_ptr + v * 8);
-        uint4 eo_u4 = *reinterpret_cast<const uint4*>(e_out_ptr + v * 8);
-        const __nv_bfloat16* dy_bf = reinterpret_cast<const __nv_bfloat16*>(&dy_u4);
-        const __nv_bfloat16* eo_bf = reinterpret_cast<const __nv_bfloat16*>(&eo_u4);
+    float dot_k[8] = {0.0f};
 
-        __nv_bfloat16 de_bf[8];
-        #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            float dy_f = __bfloat162float(dy_bf[i]);
-            float eo_f = __bfloat162float(eo_bf[i]);
-            dot_val += dy_f * eo_f;
-            de_bf[i] = __float2bfloat16(w * dy_f);
+    if (D % 8 == 0) {
+        for (int v = threadIdx.x; v < num_vec; v += blockDim.x) {
+            uint4 dy_u4 = *reinterpret_cast<const uint4*>(dy_ptr + v * 8);
+            const __nv_bfloat16* dy_bf = reinterpret_cast<const __nv_bfloat16*>(&dy_u4);
+            float dout_f[8];
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                dout_f[j] = __bfloat162float(dy_bf[j]);
+            }
+
+            for (int k = 0; k < K; ++k) {
+                int flat_idx = token_idx * K + k;
+                int slot = token_to_slot[flat_idx];
+                int expert_id = (int)topk_idx[flat_idx];
+
+                if (slot >= 0 && slot < C && expert_id >= 0 && expert_id < E) {
+                    float w = __bfloat162float(topk_weights[flat_idx]);
+                    const __nv_bfloat16* e_out_ptr = expert_outputs + ((int64_t)(expert_id * C + slot) * D + v * 8);
+                    __nv_bfloat16* de_out_ptr = d_expert_outputs + ((int64_t)(expert_id * C + slot) * D + v * 8);
+
+                    uint4 eo_u4 = *reinterpret_cast<const uint4*>(e_out_ptr);
+                    const __nv_bfloat16* eo_bf = reinterpret_cast<const __nv_bfloat16*>(&eo_u4);
+                    __nv_bfloat16 de_bf[8];
+
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        float eo_f = __bfloat162float(eo_bf[j]);
+                        if (k < 8) dot_k[k] += dout_f[j] * eo_f;
+                        de_bf[j] = __float2bfloat16(w * dout_f[j]);
+                    }
+                    *reinterpret_cast<uint4*>(de_out_ptr) = *reinterpret_cast<uint4*>(de_bf);
+                }
+            }
         }
-        *reinterpret_cast<uint4*>(de_out_ptr + v * 8) = *reinterpret_cast<uint4*>(de_bf);
+    } else {
+        for (int d = threadIdx.x; d < D; d += blockDim.x) {
+            float dout = __bfloat162float(dy_ptr[d]);
+            for (int k = 0; k < K; ++k) {
+                int flat_idx = token_idx * K + k;
+                int slot = token_to_slot[flat_idx];
+                int expert_id = (int)topk_idx[flat_idx];
+                if (slot >= 0 && slot < C && expert_id >= 0 && expert_id < E) {
+                    float w = __bfloat162float(topk_weights[flat_idx]);
+                    float eo = __bfloat162float(expert_outputs[((int64_t)(expert_id * C + slot) * D + d)]);
+                    if (k < 8) dot_k[k] += dout * eo;
+                    d_expert_outputs[((int64_t)(expert_id * C + slot) * D + d)] = __float2bfloat16(w * dout);
+                }
+            }
+        }
     }
 
-    dot_val = warp_reduce_sum(dot_val);
-    __shared__ float s_dot[32];
+    __shared__ float s_dot[8][32];
     int lane = threadIdx.x % WARP_SIZE;
     int wid = threadIdx.x / WARP_SIZE;
-    if (lane == 0) s_dot[wid] = dot_val;
+    int num_warps = blockDim.x / WARP_SIZE;
+
+    for (int k = 0; k < K && k < 8; ++k) {
+        float val = warp_reduce_sum(dot_k[k]);
+        if (lane == 0) s_dot[k][wid] = val;
+    }
     __syncthreads();
 
-    if (threadIdx.x == 0) {
-        float total_dot = 0.0f;
-        int num_warps = blockDim.x / WARP_SIZE;
-        for (int i = 0; i < num_warps; ++i) total_dot += s_dot[i];
-        d_topk_weights[idx] = __float2bfloat16(total_dot);
+    if (threadIdx.x < K && threadIdx.x < 8) {
+        int k = threadIdx.x;
+        int flat_idx = token_idx * K + k;
+        int slot = token_to_slot[flat_idx];
+        int expert_id = (int)topk_idx[flat_idx];
+        if (slot >= 0 && slot < C && expert_id >= 0 && expert_id < E) {
+            float total = 0.0f;
+            for (int w = 0; w < num_warps; ++w) total += s_dot[k][w];
+            d_topk_weights[flat_idx] = __float2bfloat16(total);
+        } else {
+            d_topk_weights[flat_idx] = __float2bfloat16(0.0f);
+        }
     }
 }
 
@@ -1610,7 +1658,7 @@ std::vector<torch::Tensor> moe_combine_backward_cuda(
 
     if (N > 0 && K > 0) {
         int threads = (D == 768) ? 96 : 128;
-        int blocks = N * K;
+        int blocks = N;
         moe_combine_backward_kernel<<<blocks, threads>>>(
             reinterpret_cast<const __nv_bfloat16*>(d_routed_out.data_ptr<c10::BFloat16>()),
             reinterpret_cast<const __nv_bfloat16*>(expert_outputs.data_ptr<c10::BFloat16>()),
@@ -2137,7 +2185,7 @@ __global__ void moe_router_topk_forward_kernel(
     }
 
     // 5. Row LogSumExp for z-loss
-    if (z_loss_weight > 0.0f) {
+    if (z_loss_weight > 0.0f && z_loss_out != nullptr) {
         float sum_exp = 0.0f;
         #pragma unroll
         for (int e = 0; e < (E_CONST > 0 ? E_CONST : 32); ++e) {
@@ -2145,9 +2193,17 @@ __global__ void moe_router_topk_forward_kernel(
             sum_exp += __expf(l[e] - max_l);
         }
         float lse = max_l + logf(fmaxf(sum_exp, 1e-20f));
-        z_loss_out[tok] = z_loss_weight * (lse * lse);
-    } else {
-        z_loss_out[tok] = 0.0f;
+        float z_term = z_loss_weight * (lse * lse) / (float)N;
+        unsigned int mask = __activemask();
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            z_term += __shfl_down_sync(mask, z_term, offset);
+        }
+        int lane = threadIdx.x & 31;
+        int leader = __ffs(mask) - 1;
+        if (lane == leader && z_term != 0.0f) {
+            atomicAdd(z_loss_out, z_term);
+        }
     }
 }
 
@@ -2158,6 +2214,7 @@ __global__ void moe_router_topk_backward_kernel(
     const int64_t* __restrict__ topk_idx,             // [N, K]
     logit_t* __restrict__ d_logits,                   // [N, E]
     float z_loss_weight,
+    const float* __restrict__ d_z_loss_ptr,
     int N,
     int E_DYN = 0,
     int K_DYN = 0
@@ -2197,9 +2254,13 @@ __global__ void moe_router_topk_backward_kernel(
     }
 
     // 3. Z-loss gradient
+    float effective_z_weight = z_loss_weight;
+    if (d_z_loss_ptr != nullptr) {
+        effective_z_weight *= d_z_loss_ptr[0];
+    }
     float z_factor = 0.0f;
     float inv_sum_exp = 0.0f;
-    if (z_loss_weight > 0.0f) {
+    if (effective_z_weight > 0.0f) {
         float sum_exp = 0.0f;
         #pragma unroll
         for (int e = 0; e < (E_CONST > 0 ? E_CONST : 32); ++e) {
@@ -2208,7 +2269,7 @@ __global__ void moe_router_topk_backward_kernel(
         }
         inv_sum_exp = 1.0f / fmaxf(sum_exp, 1e-20f);
         float lse = max_l + logf(fmaxf(sum_exp, 1e-20f));
-        z_factor = (2.0f * z_loss_weight / (float)N) * lse;
+        z_factor = (2.0f * effective_z_weight / (float)N) * lse;
     }
 
     // 4. Weight normalization gradient for chosen K experts
@@ -2301,54 +2362,54 @@ std::vector<torch::Tensor> moe_router_topk_forward_cuda(
     auto topk_idx = torch::empty({N, top_k}, torch::TensorOptions().dtype(torch::kInt64).device(logits.device()));
     auto topk_weights = torch::empty(
         {N, top_k}, torch::TensorOptions().dtype(torch::kBFloat16).device(logits.device()));
-    auto z_loss_per_token = torch::empty({N}, torch::TensorOptions().dtype(torch::kFloat32).device(logits.device()));
+    auto z_loss = torch::zeros({}, torch::TensorOptions().dtype(torch::kFloat32).device(logits.device()));
 
     if (N > 0) {
         int threads = 128;
         int blocks = (N + threads - 1) / threads;
         auto* tkw = reinterpret_cast<__nv_bfloat16*>(topk_weights.data_ptr<c10::BFloat16>());
+        float* z_ptr = (z_loss_weight > 0.0f) ? z_loss.data_ptr<float>() : nullptr;
         if (E == 16 && top_k == 4) {
             if (logits.scalar_type() == torch::kFloat32) {
                 moe_router_topk_forward_kernel<float, 16, 4><<<blocks, threads>>>(
                     logits.data_ptr<float>(), expert_bias.data_ptr<float>(),
                     topk_idx.data_ptr<int64_t>(), tkw,
-                    z_loss_per_token.data_ptr<float>(), z_loss_weight, N);
+                    z_ptr, z_loss_weight, N);
             } else {
                 moe_router_topk_forward_kernel<__nv_bfloat16, 16, 4><<<blocks, threads>>>(
                     reinterpret_cast<const __nv_bfloat16*>(logits.data_ptr<c10::BFloat16>()),
                     expert_bias.data_ptr<float>(),
                     topk_idx.data_ptr<int64_t>(), tkw,
-                    z_loss_per_token.data_ptr<float>(), z_loss_weight, N);
+                    z_ptr, z_loss_weight, N);
             }
         } else if (E == 8 && top_k == 2) {
             if (logits.scalar_type() == torch::kFloat32) {
                 moe_router_topk_forward_kernel<float, 8, 2><<<blocks, threads>>>(
                     logits.data_ptr<float>(), expert_bias.data_ptr<float>(),
                     topk_idx.data_ptr<int64_t>(), tkw,
-                    z_loss_per_token.data_ptr<float>(), z_loss_weight, N);
+                    z_ptr, z_loss_weight, N);
             } else {
                 moe_router_topk_forward_kernel<__nv_bfloat16, 8, 2><<<blocks, threads>>>(
                     reinterpret_cast<const __nv_bfloat16*>(logits.data_ptr<c10::BFloat16>()),
                     expert_bias.data_ptr<float>(),
                     topk_idx.data_ptr<int64_t>(), tkw,
-                    z_loss_per_token.data_ptr<float>(), z_loss_weight, N);
+                    z_ptr, z_loss_weight, N);
             }
         } else {
             if (logits.scalar_type() == torch::kFloat32) {
                 moe_router_topk_forward_kernel<float, 0, 0><<<blocks, threads>>>(
                     logits.data_ptr<float>(), expert_bias.data_ptr<float>(),
                     topk_idx.data_ptr<int64_t>(), tkw,
-                    z_loss_per_token.data_ptr<float>(), z_loss_weight, N, E, (int)top_k);
+                    z_ptr, z_loss_weight, N, E, (int)top_k);
             } else {
                 moe_router_topk_forward_kernel<__nv_bfloat16, 0, 0><<<blocks, threads>>>(
                     reinterpret_cast<const __nv_bfloat16*>(logits.data_ptr<c10::BFloat16>()),
                     expert_bias.data_ptr<float>(),
                     topk_idx.data_ptr<int64_t>(), tkw,
-                    z_loss_per_token.data_ptr<float>(), z_loss_weight, N, E, (int)top_k);
+                    z_ptr, z_loss_weight, N, E, (int)top_k);
             }
         }
     }
-    auto z_loss = z_loss_per_token.sum() / (float)std::max(1, N);
     return {topk_idx, topk_weights, z_loss};
 }
 
@@ -2356,7 +2417,8 @@ torch::Tensor moe_router_topk_backward_cuda(
     torch::Tensor d_topk_weights,
     torch::Tensor logits,
     torch::Tensor topk_idx,
-    float z_loss_weight
+    float z_loss_weight,
+    std::optional<torch::Tensor> d_z_loss
 ) {
     TORCH_CHECK(d_topk_weights.is_cuda(), "d_topk_weights must be a CUDA tensor");
     TORCH_CHECK(logits.is_cuda(), "logits must be a CUDA tensor");
@@ -2373,6 +2435,13 @@ torch::Tensor moe_router_topk_backward_cuda(
     TORCH_CHECK(K > 0 && K <= 8 && K <= E, "top_k must be in [1, min(8, E)], got ", K);
     TORCH_CHECK(d_topk_weights.size(0) == N && d_topk_weights.size(1) == K, "d_topk_weights shape mismatch");
 
+    const float* d_z_loss_ptr = nullptr;
+    if (d_z_loss.has_value() && d_z_loss->defined()) {
+        TORCH_CHECK(d_z_loss->is_cuda(), "d_z_loss must be a CUDA tensor");
+        TORCH_CHECK(d_z_loss->scalar_type() == torch::kFloat32, "d_z_loss must be float32");
+        d_z_loss_ptr = d_z_loss->data_ptr<float>();
+    }
+
     auto d_logits = torch::empty_like(logits);
     if (N > 0) {
         int threads = 128;
@@ -2382,40 +2451,40 @@ torch::Tensor moe_router_topk_backward_cuda(
             if (logits.scalar_type() == torch::kFloat32) {
                 moe_router_topk_backward_kernel<float, 16, 4><<<blocks, threads>>>(
                     dtw, logits.data_ptr<float>(), topk_idx.data_ptr<int64_t>(),
-                    d_logits.data_ptr<float>(), z_loss_weight, N);
+                    d_logits.data_ptr<float>(), z_loss_weight, d_z_loss_ptr, N);
             } else {
                 moe_router_topk_backward_kernel<__nv_bfloat16, 16, 4><<<blocks, threads>>>(
                     dtw,
                     reinterpret_cast<const __nv_bfloat16*>(logits.data_ptr<c10::BFloat16>()),
                     topk_idx.data_ptr<int64_t>(),
                     reinterpret_cast<__nv_bfloat16*>(d_logits.data_ptr<c10::BFloat16>()),
-                    z_loss_weight, N);
+                    z_loss_weight, d_z_loss_ptr, N);
             }
         } else if (E == 8 && K == 2) {
             if (logits.scalar_type() == torch::kFloat32) {
                 moe_router_topk_backward_kernel<float, 8, 2><<<blocks, threads>>>(
                     dtw, logits.data_ptr<float>(), topk_idx.data_ptr<int64_t>(),
-                    d_logits.data_ptr<float>(), z_loss_weight, N);
+                    d_logits.data_ptr<float>(), z_loss_weight, d_z_loss_ptr, N);
             } else {
                 moe_router_topk_backward_kernel<__nv_bfloat16, 8, 2><<<blocks, threads>>>(
                     dtw,
                     reinterpret_cast<const __nv_bfloat16*>(logits.data_ptr<c10::BFloat16>()),
                     topk_idx.data_ptr<int64_t>(),
                     reinterpret_cast<__nv_bfloat16*>(d_logits.data_ptr<c10::BFloat16>()),
-                    z_loss_weight, N);
+                    z_loss_weight, d_z_loss_ptr, N);
             }
         } else {
             if (logits.scalar_type() == torch::kFloat32) {
                 moe_router_topk_backward_kernel<float, 0, 0><<<blocks, threads>>>(
                     dtw, logits.data_ptr<float>(), topk_idx.data_ptr<int64_t>(),
-                    d_logits.data_ptr<float>(), z_loss_weight, N, E, K);
+                    d_logits.data_ptr<float>(), z_loss_weight, d_z_loss_ptr, N, E, K);
             } else {
                 moe_router_topk_backward_kernel<__nv_bfloat16, 0, 0><<<blocks, threads>>>(
                     dtw,
                     reinterpret_cast<const __nv_bfloat16*>(logits.data_ptr<c10::BFloat16>()),
                     topk_idx.data_ptr<int64_t>(),
                     reinterpret_cast<__nv_bfloat16*>(d_logits.data_ptr<c10::BFloat16>()),
-                    z_loss_weight, N, E, K);
+                    z_loss_weight, d_z_loss_ptr, N, E, K);
             }
         }
     }
@@ -2432,7 +2501,6 @@ __global__ void qk_rmsnorm_rope_forward_kernel(
     const float* __restrict__ cos_cache,       // [T, 32]
     const float* __restrict__ sin_cache,       // [T, 32]
     __nv_bfloat16* __restrict__ y,             // contiguous [total_vectors, 64]
-    __nv_bfloat16* __restrict__ x_c,           // contiguous copy [total_vectors, 64]
     float* __restrict__ rsqrt_out,             // [total_vectors]
     int64_t sB,
     int64_t sH,
@@ -2453,15 +2521,10 @@ __global__ void qk_rmsnorm_rope_forward_kernel(
     int64_t in_offset = (int64_t)b * sB + (int64_t)h * sH + (int64_t)t * sT;
     const __nv_bfloat16* x_vec = x + in_offset;
     __nv_bfloat16* y_vec = y + (int64_t)warp_id * 64;
-    __nv_bfloat16* xc_vec = x_c + (int64_t)warp_id * 64;
     const float* w_vec = weight + h * 64;
 
     float x1 = __bfloat162float(x_vec[lane]);
     float x2 = __bfloat162float(x_vec[lane + 32]);
-
-    // Save contiguous x_c directly from registers
-    xc_vec[lane] = __float2bfloat16(x1);
-    xc_vec[lane + 32] = __float2bfloat16(x2);
 
     float sum_sq = x1 * x1 + x2 * x2;
     sum_sq = warp_reduce_sum(sum_sq);
@@ -2488,13 +2551,19 @@ __global__ void qk_rmsnorm_rope_forward_kernel(
 
 __global__ void qk_rmsnorm_rope_backward_kernel(
     const __nv_bfloat16* __restrict__ dy,      // [total_vectors, 64]
-    const __nv_bfloat16* __restrict__ x,       // [total_vectors, 64]
+    const __nv_bfloat16* __restrict__ x,       // with strides (x_sB, x_sH, x_sT, 1)
     const float* __restrict__ weight,          // [num_heads, 64]
     const float* __restrict__ rsqrt_in,        // [total_vectors]
     const float* __restrict__ cos_cache,       // [T, 32]
     const float* __restrict__ sin_cache,       // [T, 32]
-    __nv_bfloat16* __restrict__ dx,            // [total_vectors, 64]
+    __nv_bfloat16* __restrict__ dx,            // with strides (dx_sB, dx_sH, dx_sT, 1)
     float* __restrict__ dweight,               // [num_heads, 64]
+    int64_t x_sB,
+    int64_t x_sH,
+    int64_t x_sT,
+    int64_t dx_sB,
+    int64_t dx_sH,
+    int64_t dx_sT,
     int total_vectors,
     int num_heads,
     int T
@@ -2522,8 +2591,8 @@ __global__ void qk_rmsnorm_rope_backward_kernel(
         int64_t vec_idx = ((int64_t)b * num_heads + h) * T + t;
 
         const __nv_bfloat16* dy_vec = dy + vec_idx * 64;
-        const __nv_bfloat16* x_vec = x + vec_idx * 64;
-        __nv_bfloat16* dx_vec = dx + vec_idx * 64;
+        const __nv_bfloat16* x_vec = x + ((int64_t)b * x_sB + (int64_t)h * x_sH + (int64_t)t * x_sT);
+        __nv_bfloat16* dx_vec = dx + ((int64_t)b * dx_sB + (int64_t)h * dx_sH + (int64_t)t * dx_sT);
         float rsqrt_val = rsqrt_in[vec_idx];
 
         float x1 = __bfloat162float(x_vec[lane]);
@@ -2585,7 +2654,6 @@ std::vector<torch::Tensor> qk_rmsnorm_rope_forward_cuda(
     int64_t sT = (x.dim() == 4) ? x.stride(2) : 64;
 
     auto y = torch::empty(x.sizes(), x.options());
-    auto x_c = torch::empty(x.sizes(), x.options());
     auto rsqrt_out = torch::empty({total_vectors}, torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
 
     if (total_vectors > 0) {
@@ -2599,7 +2667,6 @@ std::vector<torch::Tensor> qk_rmsnorm_rope_forward_cuda(
             cos_f.data_ptr<float>(),
             sin_f.data_ptr<float>(),
             reinterpret_cast<__nv_bfloat16*>(y.data_ptr<c10::BFloat16>()),
-            reinterpret_cast<__nv_bfloat16*>(x_c.data_ptr<c10::BFloat16>()),
             rsqrt_out.data_ptr<float>(),
             sB, sH, sT,
             total_vectors,
@@ -2608,7 +2675,7 @@ std::vector<torch::Tensor> qk_rmsnorm_rope_forward_cuda(
             eps
         );
     }
-    return {y, x_c, rsqrt_out};
+    return {y, rsqrt_out};
 }
 
 std::vector<torch::Tensor> qk_rmsnorm_rope_backward_cuda(
@@ -2627,12 +2694,32 @@ std::vector<torch::Tensor> qk_rmsnorm_rope_backward_cuda(
     TORCH_CHECK(head_dim == 64, "qk_rmsnorm_rope requires head_dim == 64, got ", head_dim);
     TORCH_CHECK(dy.is_cuda() && dy.is_contiguous(), "dy must be contiguous CUDA");
     TORCH_CHECK(dy.scalar_type() == torch::kBFloat16, "dy must be bfloat16");
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous(), "x must be contiguous CUDA");
+    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+    TORCH_CHECK(x.stride(-1) == 1, "x must have stride(-1) == 1");
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "x must be bfloat16");
     TORCH_CHECK(weight.is_cuda() && weight.is_contiguous(), "weight must be contiguous CUDA");
     TORCH_CHECK(weight.scalar_type() == torch::kFloat32, "weight must be float32");
 
-    auto dx = torch::empty_like(x);
+    int64_t x_sB = (x.dim() == 4) ? x.stride(0) : (num_heads * T * 64);
+    int64_t x_sH = (x.dim() == 4) ? x.stride(1) : (T * 64);
+    int64_t x_sT = (x.dim() == 4) ? x.stride(2) : 64;
+
+    torch::Tensor dx;
+    int64_t dx_sB, dx_sH, dx_sT;
+    if (x_sH < x_sT && T > 1) {
+        int64_t B = (x.dim() == 4) ? x.size(0) : (total_vectors / (num_heads * T));
+        auto dx_bthd = torch::empty({B, (int64_t)T, (int64_t)num_heads, 64}, x.options());
+        dx = dx_bthd.transpose(1, 2);
+        dx_sB = dx.stride(0);
+        dx_sH = dx.stride(1);
+        dx_sT = dx.stride(2);
+    } else {
+        dx = torch::empty_like(x);
+        dx_sB = (dx.dim() == 4) ? dx.stride(0) : (num_heads * T * 64);
+        dx_sH = (dx.dim() == 4) ? dx.stride(1) : (T * 64);
+        dx_sT = (dx.dim() == 4) ? dx.stride(2) : 64;
+    }
+
     auto dweight = torch::zeros_like(weight);
 
     auto cos_f = (cos.scalar_type() == torch::kFloat32) ? cos.contiguous() : cos.to(torch::kFloat32).contiguous();
@@ -2654,6 +2741,8 @@ std::vector<torch::Tensor> qk_rmsnorm_rope_backward_cuda(
             sin_f.data_ptr<float>(),
             reinterpret_cast<__nv_bfloat16*>(dx.data_ptr<c10::BFloat16>()),
             dweight.data_ptr<float>(),
+            x_sB, x_sH, x_sT,
+            dx_sB, dx_sH, dx_sT,
             total_vectors,
             num_heads,
             (int)T
@@ -2973,6 +3062,102 @@ void fused_sr_update_cuda(
         lr_scale,
         wd_factor,
         (uint32_t)(seed & 0xFFFFFFFF),
+        N
+    );
+}
+
+// ------------------------------------------------------------------------
+// 16. Fused AdamW BF16 with FP32 Master State + Stochastic Rounding
+// ------------------------------------------------------------------------
+
+__global__ void adamw_bf16_sr_step_kernel(
+    __nv_bfloat16* __restrict__ p,
+    const __nv_bfloat16* __restrict__ g,
+    float* __restrict__ m,
+    float* __restrict__ v,
+    float lr,
+    float beta1,
+    float beta2,
+    float eps,
+    float weight_decay,
+    float bc1,
+    float bc2,
+    uint32_t seed,
+    bool stochastic_rounding,
+    int64_t N
+) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+
+    float grad = __bfloat162float(g[idx]);
+    float m_val = beta1 * m[idx] + (1.0f - beta1) * grad;
+    float v_val = beta2 * v[idx] + (1.0f - beta2) * grad * grad;
+    m[idx] = m_val;
+    v[idx] = v_val;
+
+    float m_hat = m_val / bc1;
+    float v_hat = v_val / bc2;
+    float step_dir = m_hat / (sqrtf(v_hat) + eps);
+
+    float p_val = __bfloat162float(p[idx]);
+    float decay = (weight_decay > 0.0f) ? (1.0f - lr * weight_decay) : 1.0f;
+    float w32 = p_val * decay - lr * step_dir;
+
+    if (stochastic_rounding) {
+        uint32_t h = seed ^ (uint32_t)idx;
+        h ^= h >> 16;
+        h *= 0x85ebca6b;
+        h ^= h >> 13;
+        h *= 0xc2b2ae35;
+        h ^= h >> 16;
+        uint32_t noise = h & 0xFFFF;
+
+        uint32_t bits = __float_as_uint(w32);
+        uint32_t rounded = (bits + noise) & ~0xFFFF;
+        p[idx] = __float2bfloat16(__uint_as_float(rounded));
+    } else {
+        p[idx] = __float2bfloat16(w32);
+    }
+}
+
+void adamw_bf16_sr_step_cuda(
+    torch::Tensor p,
+    torch::Tensor g,
+    torch::Tensor m,
+    torch::Tensor v,
+    float lr,
+    float beta1,
+    float beta2,
+    float eps,
+    float weight_decay,
+    int64_t step,
+    int64_t seed,
+    bool stochastic_rounding
+) {
+    int64_t N = p.numel();
+    if (N == 0) return;
+    TORCH_CHECK(p.is_cuda() && g.is_cuda() && m.is_cuda() && v.is_cuda(), "All tensors must be CUDA tensors");
+    TORCH_CHECK(p.is_contiguous() && g.is_contiguous() && m.is_contiguous() && v.is_contiguous(), "All tensors must be contiguous");
+    TORCH_CHECK(p.scalar_type() == torch::kBFloat16, "p must be bfloat16");
+    TORCH_CHECK(g.scalar_type() == torch::kBFloat16, "g must be bfloat16");
+    TORCH_CHECK(m.scalar_type() == torch::kFloat32, "m must be float32");
+    TORCH_CHECK(v.scalar_type() == torch::kFloat32, "v must be float32");
+    TORCH_CHECK(g.numel() == N && m.numel() == N && v.numel() == N, "Tensor sizes must match");
+
+    float bc1 = 1.0f - powf(beta1, (float)step);
+    float bc2 = 1.0f - powf(beta2, (float)step);
+
+    int threads = 256;
+    int64_t blocks = (N + threads - 1) / threads;
+    adamw_bf16_sr_step_kernel<<<blocks, threads>>>(
+        reinterpret_cast<__nv_bfloat16*>(p.data_ptr<c10::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(g.data_ptr<c10::BFloat16>()),
+        m.data_ptr<float>(),
+        v.data_ptr<float>(),
+        lr, beta1, beta2, eps, weight_decay,
+        bc1, bc2,
+        (uint32_t)(seed & 0xFFFFFFFF),
+        stochastic_rounding,
         N
     );
 }

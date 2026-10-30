@@ -724,3 +724,78 @@ def test_qk_rmsnorm_rope_non_contiguous_parity():
     assert_close(out1, out2, atol=3.5e-2, msg="stride-aware fwd match")
     assert_close(raw1.grad, raw2.grad, atol=3.5e-2, msg="stride-aware dx match")
     assert_close(w1.grad, w2.grad, atol=6e-2, msg="stride-aware dw match")
+
+
+# ---------------------------------------------------------------------------
+# Fused MoE Router Top-K with Z-Loss Parity
+# ---------------------------------------------------------------------------
+
+@needs_gpu
+@needs_cuda_ext
+def test_moe_router_topk_z_loss_forward_backward_parity():
+    """_FusedMoERouterFunction computes fused top-k, sigmoid, weight normalisation, and z-loss accurately."""
+    from src.model import _FusedMoERouterFunction
+
+    N, E, K = 64, 16, 4
+    torch.manual_seed(42)
+    logits = torch.randn(N, E, device="cuda", dtype=torch.float32, requires_grad=True)
+    bias = torch.randn(E, device="cuda", dtype=torch.float32) * 0.1
+    z_w = 1e-3
+
+    # Fused CUDA path
+    topk_idx, topk_weights, z_loss = _FusedMoERouterFunction.apply(logits, bias, K, z_w)
+    loss = (topk_weights.float() * 0.5).sum() + z_loss
+    loss.backward()
+    grad_fused = logits.grad.clone()
+
+    # Eager reference path
+    logits.grad.zero_()
+    logits_c = logits - logits.mean(dim=-1, keepdim=True)
+    scores = torch.sigmoid(logits_c)
+    biased_scores = scores + bias
+    _, ref_topk_idx = torch.topk(biased_scores, k=K, dim=-1)
+    ref_topk_raw = torch.gather(scores, -1, ref_topk_idx)
+    ref_topk_weights = ref_topk_raw / (ref_topk_raw.sum(dim=-1, keepdim=True) + 1e-6)
+    ref_z = z_w * torch.logsumexp(logits_c, dim=-1).pow(2).mean()
+    ref_loss = (ref_topk_weights * 0.5).sum() + ref_z
+    ref_loss.backward()
+    grad_ref = logits.grad.clone()
+
+    assert torch.equal(topk_idx, ref_topk_idx)
+    assert_close(topk_weights.float(), ref_topk_weights, atol=1e-3, msg="topk weights match")
+    assert_close(z_loss, ref_z, atol=1e-5, msg="z_loss forward match")
+    assert_close(grad_fused, grad_ref, atol=1e-3, msg="router backward grad match")
+
+
+# ---------------------------------------------------------------------------
+# Token-Centric MoE Combine Backward Parity
+# ---------------------------------------------------------------------------
+
+@needs_gpu
+@needs_cuda_ext
+def test_moe_combine_backward_token_centric_parity():
+    """_FusedMoECombineFunction backward with token-centric 1-block-per-token matches reference."""
+    from src.model import _FusedMoECombineFunction
+
+    N, E, C, D, K = 32, 16, 16, 1024, 4
+    torch.manual_seed(123)
+    logits = torch.randn(N, E, device="cuda")
+    topk_idx = torch.topk(logits, K, dim=-1)[1]
+    topk_weights = torch.softmax(torch.randn(N, K, device="cuda"), dim=-1).to(torch.bfloat16)
+    token_to_slot, counts = compute_token_slots(topk_idx, topk_weights, E, C, return_counts=True)
+
+    expert_outputs = torch.randn(E, C, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    tw = topk_weights.detach().clone().requires_grad_(True)
+    shared_out = torch.randn(N, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+    y = _FusedMoECombineFunction.apply(expert_outputs, topk_idx, tw, token_to_slot, shared_out, counts)
+    dy = torch.randn_like(y)
+    y.backward(dy)
+
+    assert expert_outputs.grad is not None
+    assert tw.grad is not None
+    assert shared_out.grad is not None
+    assert torch.isfinite(expert_outputs.grad).all()
+    assert torch.isfinite(tw.grad).all()
+    assert torch.isfinite(shared_out.grad).all()
+    assert torch.equal(shared_out.grad, dy)

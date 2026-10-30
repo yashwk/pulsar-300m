@@ -36,7 +36,7 @@ app = modal.App("pulsar-monitor")
     image=image,
     volumes={"/checkpoints": ckpt_vol},
     timeout=60 * 60,
-    keep_warm=1,
+    scaledown_window=60,
 )
 @modal.web_server(port=7860, startup_timeout=60)
 def serve():

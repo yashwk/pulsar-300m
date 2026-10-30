@@ -26,8 +26,8 @@ test-fast:
 
 smoke:
 	$(PYTHON) -m src.train --max-steps 2 --warmup-steps 1 --no-save \
-		--micro-batch-size 2 --seq-len 1024 --train-bin data/train_shard0.bin \
-		--val-bin data/val_shard0.bin --tokenizer data/pulsar_tokenizer
+		--micro-batch-size 2 --seq-len 1024 --train-bin data/smoke_train.bin \
+		--val-bin data/smoke_val.bin --tokenizer data/pulsar_tokenizer
 
 monitor:
 	$(PYTHON) monitor/web_server.py --port 7860 --checkpoint-dir checkpoints

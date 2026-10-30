@@ -498,8 +498,14 @@ def save_checkpoint(
 def train():
     found_train = sorted(glob.glob("data/train_shard*.bin"))
     found_val = sorted(glob.glob("data/val_shard*.bin"))
-    default_train_str = ",".join(found_train) if found_train else "data/train_shard0.bin"
-    default_val_str = ",".join(found_val) if found_val else "data/val_shard0.bin"
+    if not found_train and os.path.exists("data/smoke_train.bin"):
+        default_train_str = "data/smoke_train.bin"
+    else:
+        default_train_str = ",".join(found_train) if found_train else "data/train_shard0.bin"
+    if not found_val and os.path.exists("data/smoke_val.bin"):
+        default_val_str = "data/smoke_val.bin"
+    else:
+        default_val_str = ",".join(found_val) if found_val else "data/val_shard0.bin"
 
     parser = argparse.ArgumentParser(description="Pulsar-MoE Recurrent Pretraining Engine")
     parser.add_argument("--train-bin", type=str, default=default_train_str, help="Path to train shard(s), comma-separated")

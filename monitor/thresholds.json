@@ -9,7 +9,7 @@
     "description": "Watch if |train_ce_final - val_ce_final| exceeds 0.15 nats."
   },
   "gradients": {
-    "max_clip_fraction": 0.30,
+    "max_clip_fraction": 0.3,
     "clip_norm_threshold": 1.0,
     "description": "Watch if more than 30% of steps in rolling window exceed the gradient clipping threshold."
   },
@@ -24,10 +24,10 @@
     "description": "Under 2.0% is OK, 2.0% - 5.0% is WATCH, over 5.0% is ALERT."
   },
   "moe_balance": {
-    "worst_expert_share_watch_pct": 25.0,
-    "worst_expert_share_alert_pct": 35.0,
-    "bias_abs_p99_watch": 0.30,
-    "description": "Uniform expert share is 12.5%. Watch if any expert exceeds 25%, Alert if exceeds 35%."
+    "worst_expert_share_watch_pct": 15.0,
+    "worst_expert_share_alert_pct": 25.0,
+    "bias_abs_p99_watch": 0.3,
+    "description": "Uniform expert share is 6.25% across 16 routed experts. Watch if any expert exceeds 15.0%, Alert if exceeds 25.0%."
   },
   "recurrent_loops": {
     "evaluation_start_step": 3000,

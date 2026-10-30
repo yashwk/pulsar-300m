@@ -81,3 +81,22 @@ The lightweight HTTP server (`monitor/web_server.py`) serves the following endpo
 - `GET /api/canaries`: Returns qualitative model completions on standard reasoning, math, coding, and tool-calling probes.
 - `GET /api/checkpoints`: Lists all saved `.pt` files, identifying `latest.pt`, `best.pt`, and milestone checkpoints.
 - `GET /api/stream`: Server-Sent Events (SSE) delivering live updates as steps complete.
+
+---
+
+## 5. Automated Health Checks & Evaluation Rules
+
+The monitor evaluates 9 automated health checks on every step against `monitor/thresholds.json`:
+
+1. **`run_state`**: Evaluates whether active training has stalled (exceeding 3.0x median step duration).
+2. **`numerics`**: Flags any occurrence of NaN or Inf in losses, logits, or gradient norms.
+3. **`loss`**: Monitors the validation-to-train final cross-entropy generalization gap (|train_ce_final - val_ce_final| <= 0.15 nats).
+4. **`gradients`**: Flags excessive gradient clipping (> 30% of steps exceeding clip threshold 1.0).
+5. **`throughput`**: Monitors tokens per second and alerts if peak VRAM exceeds safety ceilings (7.5 GB on 8 GB GPU).
+6. **`moe_drops`**: Evaluates token drop rate due to MoE expert capacity constraints (< 2.0% OK, < 5.0% WATCH, >= 5.0% ALERT).
+7. **`moe_balance`**: Evaluates load concentration across the 16 routed experts against the uniform baseline of 6.25% ($100\% / 16$):
+   - **OK**: Maximum expert share < 15.0%
+   - **WATCH**: Maximum expert share between 15.0% and 25.0%
+   - **ALERT**: Maximum expert share >= 25.0%
+8. **`recurrent_loops`**: Monitors recursive pulse gain ($\Delta L = \mathcal{L}_{p2} - \mathcal{L}_{p3} \ge 0.01$) to ensure the third pulse contributes continuous representation refinement.
+9. **`router_drift`**: Evaluates router bias magnitude ($\max |b| \le 0.30$) to prevent runaway bias accumulation.

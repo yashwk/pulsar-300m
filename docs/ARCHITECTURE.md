@@ -130,7 +130,7 @@ flowchart TD
      - 1 Shared Expert per block: $W_{\text{gate\_up}}$ $[1024 \to 2048]$ (`2,097,152`) + $W_{\text{down}}$ $[1024 \to 1024]$ (`1,048,576`) = `3,145,728` per block
      - 8 blocks $\times 3,145,728 = \mathbf{25,165,824\text{ parameters}}$ (`25.17M`)
    - **16 Routed Experts MLP (8 blocks $\times$ 16 experts = 128 routed experts):**
-     - Each routed expert: $W_{\text{gate\_up}}$ $[512 \to 1024]$ (`1,048,576`) + $W_{\text{down}}$ $[512 \to 1024]$ (`524,288`) = `1,572,864` params
+     - Each routed expert: $W_{\text{gate\_up}}$ $[1024 \to 1024]$ (`1,048,576`) + $W_{\text{down}}$ $[512 \to 1024]$ (`524,288`) = `1,572,864` params
      - 128 experts $\times 1,572,864 = \mathbf{201,326,592\text{ parameters}}$ (`201.33M`)
    - **Per-Pulse Scale, Norm, and Router Banks (8 blocks):**
      - QK-RMSNorm Scales: $8 \times [8 \times (16 \times 64 + 4 \times 64)] = 81,920$ params
@@ -138,8 +138,8 @@ flowchart TD
      - Layer RMSNorm Banks: $8 \times [2 \times 8 \times 1024] = 131,072$ params
      - Pulse-Indexed Routers: $8 \times [8 \times 16 \times 1024] = 1,048,576$ params
      - Per-Pulse Routed Expert Scales: $8 \times [8 \times 1024] = 65,536$ params
-     - Router Biases: $8 \times 16 = 128$ params
-     - Subtotal: $\mathbf{1,327,296\text{ parameters}}$ (`1.33M`)
+     - Subtotal: $\mathbf{1,327,168\text{ parameters}}$ (`1.33M`)
+     *(Note: Router biases are persistent buffers, not trainable parameters)*
 3. **Conditioning & Output Norms:**
    - Harmonic Residual Scale (`pulse_res_scale` $[8 \times 1024]$): $8,192$ params
    - Pulse Step Embeddings: $8 \times 1024 = 8,192$ params
@@ -148,7 +148,7 @@ flowchart TD
    - Final RMSNorm: $1,024$ params
    - Subtotal: $\mathbf{27,648\text{ parameters}}$
 4. **Authoritative Total Parameter Count:**
-   $$\mathbf{33,554,432 + 20,971,520 + 1,049,600 + 25,165,824 + 201,326,592 + 1,327,296 + 27,648 = 283,422,784\text{ params}}\quad (\mathbf{\approx 283.42M})$$
+   $$\mathbf{33,554,432 + 20,971,520 + 1,049,600 + 25,165,824 + 201,326,592 + 1,327,168 + 27,648 = 283,422,784\text{ params}}\quad (\mathbf{\approx 283.42M})$$
 
 ---
 
@@ -182,6 +182,19 @@ The physical 8-layer Transformer core is executed recurrently for $K = 3$ pulses
 
 ---
 
+
+### 4.3 Hybrid Local/Global RoPE & YaRN Temperature Scaling
+Attention layers balance localized dense syntax with sequence-wide causal recall across 3 recurrent passes:
+1. **Local Sliding-Window Layers (Layers 0, 1, 2, 4, 5, 6):**
+   - High-precision base frequency $\theta = 10,000$ with causal sliding window $W = 1024$.
+2. **Global Full-Span Anchor Layers (Layers 3 & 7):**
+   - Base frequency $\theta = 1,000,000$, executing full causal attention up to 32,768 tokens.
+   - **Prefix-Invariant YaRN Temperature Scaling:** To guarantee prefix invariance and KV-cache consistency, query scaling is computed strictly as a function of each query position $t \in [0, T-1]$ (with 1-based index $t+1$) rather than total sequence length $T$:
+     $$\text{scale}[t] = 1.0 + 0.1 \cdot \ln\left(\frac{\max(t + 1, \text{base})}{\text{base}}\right)$$
+     where $\text{base} = 1024$. For $t < 1024$, $\text{scale}[t] = 1.0$.
+
+---
+
 ## 5. Custom Fused CUDA Kernels (`csrc/kernels.cu`)
 
 All latency-critical primitives are implemented in pure CUDA C++ with PyBind11 bindings in `pulsar_cuda`:
@@ -204,7 +217,7 @@ Pulsar uses a dual-optimizer engine (`PulsarDualOptimizer`) specialized for recu
 ### 6.1 Muon Matrix Optimizer (`opt_muon` — 247.46M parameters)
 - **Scope:** Updates all 2D Attention projections ($W_{qkv}, W_o$), shared MLP matrices, and 3D routed expert tensors.
 - **Batched 3D GEMM Orthogonalization:** The 128 routed expert matrices are grouped into 3D tensors:
-  - `w_gate_up`: shape `[128, 512, 1024]`
+  - `w_gate_up`: shape `[128, 1024, 1024]`
   - `w_down`: shape `[128, 512, 1024]`
 - **Newton-Schulz Iteration (Degree 5):**
   For input matrix or batched matrix $G$, compute:

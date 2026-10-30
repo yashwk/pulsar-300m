@@ -39,8 +39,8 @@ DEFAULT_THRESHOLDS = {
         "watch_max_pct": 5.0,
     },
     "moe_balance": {
-        "worst_expert_share_watch_pct": 25.0,
-        "worst_expert_share_alert_pct": 35.0,
+        "worst_expert_share_watch_pct": 15.0,
+        "worst_expert_share_alert_pct": 25.0,
         "bias_abs_p99_watch": 0.30,
     },
     "recurrent_loops": {
@@ -429,7 +429,7 @@ def evaluate_health(
         "max_bias": round(max_bias, 3),
         "status": bal_level,
         "threshold": f"worst share < {w_watch}% OK, < {w_alert}% WATCH",
-        "description": "Single-expert load concentration vs 12.5% balanced baseline."
+        "description": "Single-expert load concentration vs 6.25% balanced baseline."
     }
 
     # 8. Recurrent Loops (Pulse 1 -> 3 Latent Gains)

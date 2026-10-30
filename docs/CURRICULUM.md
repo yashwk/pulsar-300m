@@ -45,9 +45,9 @@ flowchart TD
         S2_DATA --> S2_MIX --> S2_WSD
     end
 
-    subgraph S3 ["Stage 3: 32k Long-Context & Annealing Cooldown (0.7B Tokens)"]
+    subgraph S3 ["Stage 3: 32k Long-Context & Annealing Cooldown (0.5B Tokens)"]
         direction TB
-        S3_DATA["Shard 11 (0.7B Tokens, Context T up to 32,768)"]
+        S3_DATA["Shard 11 (0.5B Tokens, Context T up to 32,768)"]
         S3_MIX["Extended Context Corpus:
         • Full Technical Repositories
         • Monograph Proof Chains
@@ -74,7 +74,7 @@ flowchart TD
   - Micro-Batch Size (MBS): 128
   - Gradient Accumulation Steps: 1
   - Effective Global Batch Tokens: $128 \times 1024 = 131,072$ tokens / step.
-- **Sampler:** **Flat permuted windows** (default for Stage 1). Best-fit packing is reserved for Stage 2, where the 2,048-token context comfortably fits median CoT documents (p50: 1,278 tokens).
+- **Sampler:** **Best-fit document packing** (`--sampler bestfit`) is the production default across all stages, packing variable-length documents into context windows with 0.000% padding waste while preserving strict document boundaries. Flat permuted windows (`--sampler flat`) are supported as an ablation baseline.
 - **Learning Rate Schedule:**
   - Steps 1 $\to$ 300: Linear warmup from 0 to full peak LR (`Muon: 0.02`, `Adam: 6e-4`).
   - Steps 301 $\to$ 28,991: Flat stable plateau at 100% peak LR (`cooldown_steps = 0`).

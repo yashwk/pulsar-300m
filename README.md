@@ -68,6 +68,7 @@ Hand-optimized C++/CUDA kernels in `csrc/kernels.cu` eliminate Python runtime ov
 
 ```
 pulsar-300m/
+├── Makefile                # Unified developer automation targets
 ├── csrc/                   # Native C++ and CUDA kernel implementations
 │   ├── kernels.cu          # Fused CUDA kernels (QK-RoPE, AttnGate, MoE, SR, Softcap CE)
 │   └── pulsar_cuda.cpp     # PyTorch C++ bindings
@@ -81,6 +82,7 @@ pulsar-300m/
 │   ├── modal_train.py      # Modal cloud pretraining harness (B300, B200, H200, H100)
 │   ├── sync_cloud_monitor.py # Background telemetry sync daemon from Modal volume
 │   ├── calc_steps.py       # Exact curriculum and schedule calculator
+│   ├── inspect_checkpoint.py # Comprehensive checkpoint inspector and tensor validator
 │   └── benchmark.py        # Latency, memory, and throughput benchmarking suite
 ├── monitor/                # Real-time web telemetry dashboard
 │   ├── web_server.py       # Lightweight HTTP server for live training dashboard
@@ -131,9 +133,11 @@ uv run pytest tests/
 ### 3. Local Smoke Test Run
 Run a quick 2-step verification run on CPU or GPU without writing checkpoints:
 ```bash
+make smoke
+# Or run manually:
 python -m src.train --max-steps 2 --warmup-steps 1 --no-save \
-    --micro-batch-size 2 --seq-len 1024 --train-bin data/train_shard0.bin \
-    --val-bin data/val_shard0.bin --tokenizer data/pulsar_tokenizer
+    --micro-batch-size 2 --seq-len 1024 --train-bin data/smoke_train.bin \
+    --val-bin data/smoke_val.bin --tokenizer data/pulsar_tokenizer
 ```
 
 ---
@@ -177,6 +181,23 @@ If a cloud run is interrupted or preempted between checkpoint intervals, resumin
 - [Cloud Training & Operations Runbook](docs/CLOUD_TRAINING.md)
 
 ---
+
+
+---
+
+## Inference & Benchmarking
+
+### 1. Interactive Inference
+Generate completions from a trained checkpoint using the recurrent KV-cache engine:
+```bash
+python -m src.infer --checkpoint checkpoints/latest.pt --prompt "def fibonacci(n):"
+```
+
+### 2. Micro-Benchmark Suite
+Benchmark execution speed, memory footprint, and MFU across model configurations:
+```bash
+python scripts/benchmark.py --seq-len 1024 --batch-size 4
+```
 
 ## References & Acknowledgements
 - **Unified Recurrent KV-Cache Dynamics:** Cross-pass recurrent state sharing inspired by UCSD Sandy Research / Fu et al. (*Be-Nice: Recurrent Transformers with Contractive State Attractors*).

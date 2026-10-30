@@ -581,14 +581,17 @@ class PulsarAttention(nn.Module):
 
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2).contiguous()
+        v = v.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
         # Value-Residual skip connection
         if self.layer_idx == 0 and pulse_idx == 0:
-            v_first = v
+            v_first = v.contiguous()
+            v = v_first
         elif v_first is not None:
             lv = torch.sigmoid(self.v_resid_lambda[pulse_idx]).to(v.dtype)
-            v = torch.lerp(v, v_first, lv).contiguous()
+            v = torch.lerp(v_first, v, 1.0 - lv)
+        else:
+            v = v.contiguous()
 
         # Per-Pulse, Per-Head QK-RMSNorm + RoPE (Fused single-warp reduction CUDA kernel).
         # The kernel is written for head_dim == 64: each of the 32 lanes handles one
@@ -815,9 +818,10 @@ class _FusedMoEDispatchFunction(torch.autograd.Function):
         token_to_slot: torch.Tensor,
         num_experts: int,
         capacity: int,
+        expert_counts: torch.Tensor | None = None,
     ):
         (expert_inputs,) = pulsar_cuda.moe_dispatch_forward(
-            x.contiguous(), topk_idx.contiguous(), token_to_slot.contiguous(), num_experts, capacity
+            x.contiguous(), topk_idx.contiguous(), token_to_slot.contiguous(), num_experts, capacity, expert_counts
         )
         ctx.save_for_backward(topk_idx, token_to_slot)
         ctx.N = x.size(0)
@@ -830,7 +834,7 @@ class _FusedMoEDispatchFunction(torch.autograd.Function):
         dx = pulsar_cuda.moe_dispatch_backward(
             d_expert_inputs.contiguous(), topk_idx, token_to_slot, ctx.N, ctx.D
         )
-        return dx, None, None, None, None
+        return dx, None, None, None, None, None
 
 
 class _FusedMoECombineFunction(torch.autograd.Function):
@@ -842,6 +846,7 @@ class _FusedMoECombineFunction(torch.autograd.Function):
         topk_weights: torch.Tensor,
         token_to_slot: torch.Tensor,
         shared_out: torch.Tensor | None = None,
+        expert_counts: torch.Tensor | None = None,
     ):
         sh = shared_out.contiguous() if shared_out is not None else None
         routed_out = pulsar_cuda.moe_combine_forward(
@@ -851,18 +856,26 @@ class _FusedMoECombineFunction(torch.autograd.Function):
             token_to_slot.contiguous(),
             sh,
         )
-        ctx.save_for_backward(expert_outputs, topk_idx, topk_weights, token_to_slot)
+        if expert_counts is not None:
+            ctx.save_for_backward(expert_outputs, topk_idx, topk_weights, token_to_slot, expert_counts)
+        else:
+            ctx.save_for_backward(expert_outputs, topk_idx, topk_weights, token_to_slot)
+        ctx.has_expert_counts = expert_counts is not None
         ctx.has_shared = shared_out is not None
         return routed_out
 
     @staticmethod
     def backward(ctx, d_routed_out: torch.Tensor):
-        expert_outputs, topk_idx, topk_weights, token_to_slot = ctx.saved_tensors
+        if ctx.has_expert_counts:
+            expert_outputs, topk_idx, topk_weights, token_to_slot, expert_counts = ctx.saved_tensors
+        else:
+            expert_outputs, topk_idx, topk_weights, token_to_slot = ctx.saved_tensors
+            expert_counts = None
         d_expert_outputs, d_topk_weights = pulsar_cuda.moe_combine_backward(
-            d_routed_out.contiguous(), expert_outputs, topk_idx, topk_weights.to(torch.bfloat16).contiguous(), token_to_slot
+            d_routed_out.contiguous(), expert_outputs, topk_idx, topk_weights.to(torch.bfloat16).contiguous(), token_to_slot, expert_counts
         )
         d_shared_out = d_routed_out if ctx.has_shared else None
-        return d_expert_outputs, None, d_topk_weights, None, d_shared_out
+        return d_expert_outputs, None, d_topk_weights, None, d_shared_out, None
 
 
 class _FusedMoERouterFunction(torch.autograd.Function):
@@ -1055,6 +1068,7 @@ class PulsarMoEMLP(nn.Module):
         # bincounts only equals that while the slot logic is correct - the fast-path bug
         # discarded ~85% of assignments while this metric read 0%.
         bincounts = None
+        counts_sorted = None
         if valid is None:
             try:
                 res = compute_token_slots(
@@ -1126,7 +1140,7 @@ class PulsarMoEMLP(nn.Module):
                 and not torch.compiler.is_compiling()
                 and hasattr(pulsar_cuda, "moe_dispatch_forward")):
             expert_inputs = _FusedMoEDispatchFunction.apply(
-                x_flat, topk_idx, token_to_slot, self.cfg.n_routed_experts, capacity
+                x_flat, topk_idx, token_to_slot, self.cfg.n_routed_experts, capacity, counts_sorted
             )
 
             # Batched expert projections with ZERO weight stacking
@@ -1137,7 +1151,7 @@ class PulsarMoEMLP(nn.Module):
 
             # Fused combine with shared expert residual initialization (zero extra memory roundtrips)
             out = _FusedMoECombineFunction.apply(
-                expert_out, topk_idx, topk_weights, token_to_slot, shared_out
+                expert_out, topk_idx, topk_weights, token_to_slot, shared_out, counts_sorted
             ).view(B, T, D)
         else:
             # Fallback for CPU, non-bf16, torch.compile, or environments without custom CUDA extension.
@@ -1285,8 +1299,30 @@ class PulsarBlock(nn.Module):
         pulse_idx: int = 0,
         v_first: torch.Tensor | None = None,
         routing_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor]:
-        attn_in = self.attn_norm(x, pulse_idx=pulse_idx)
+        prev_mlp_out: torch.Tensor | None = None,
+        fuse_mlp_out: bool = False,
+    ) -> tuple:
+        w_attn = (
+            self.attn_norm.weight[pulse_idx]
+            if (self.attn_norm.max_pulses is not None and self.attn_norm.max_pulses > 1)
+            else self.attn_norm.weight
+        )
+        if prev_mlp_out is not None:
+            if (
+                HAS_PULSAR_CUDA
+                and x.is_cuda
+                and x.dtype == torch.bfloat16
+                and not torch.compiler.is_compiling()
+                and hasattr(pulsar_cuda, "fused_add_rmsnorm_forward")
+                and hasattr(pulsar_cuda, "fused_add_rmsnorm_backward")
+            ):
+                x, attn_in = _FusedAddRMSNormFunction.apply(x, prev_mlp_out, w_attn, self.attn_norm.eps)
+            else:
+                x = x + prev_mlp_out
+                attn_in = self.attn_norm(x, pulse_idx=pulse_idx)
+        else:
+            attn_in = self.attn_norm(x, pulse_idx=pulse_idx)
+
         attn_out, v_first = self.attn(attn_in, cos, sin, pulse_idx=pulse_idx, v_first=v_first)
 
         w_mlp = (
@@ -1310,8 +1346,10 @@ class PulsarBlock(nn.Module):
         mlp_out, z_loss, gate_weight_mean, bincounts = self.mlp(
             mlp_in, pulse_idx=pulse_idx, routing_mask=routing_mask
         )
-        x = x + mlp_out
-        return x, v_first, z_loss, gate_weight_mean, bincounts
+        if not fuse_mlp_out:
+            x = x + mlp_out
+            return x, v_first, z_loss, gate_weight_mean, bincounts
+        return x, mlp_out, v_first, z_loss, gate_weight_mean, bincounts
 
 
 class PulsarForCausalLM(nn.Module):
@@ -1669,11 +1707,15 @@ class PulsarForCausalLM(nn.Module):
 
             # 2. Core 8-block recurrent pass
             h_curr = h_in
+            prev_mlp_out = None
             for i, block in enumerate(self.core):
                 cos = cos_local if block.attn.is_local else cos_global
                 sin = sin_local if block.attn.is_local else sin_global
                 if self.grad_checkpoint and self.training:
                     from torch.utils.checkpoint import checkpoint
+                    if prev_mlp_out is not None:
+                        h_curr = h_curr + prev_mlp_out
+                        prev_mlp_out = None
 
                     # Blocks mutate MoE counters as a side effect. Recompute during
                     # backward would double-count them, so counters are frozen around
@@ -1691,10 +1733,20 @@ class PulsarForCausalLM(nn.Module):
                         context_fn=lambda: (_set_recomputing(False), _set_recomputing(True)),
                     )
                 else:
-                    h_curr, v_first, z_loss, gate_weight_mean, bincounts = block(
-                        h_curr, cos, sin, pulse_idx=k, v_first=v_first,
-                        routing_mask=routing_mask,
-                    )
+                    is_last_block = (i == len(self.core) - 1)
+                    if not is_last_block:
+                        h_curr, prev_mlp_out, v_first, z_loss, gate_weight_mean, bincounts = block(
+                            h_curr, cos, sin, pulse_idx=k, v_first=v_first,
+                            routing_mask=routing_mask, prev_mlp_out=prev_mlp_out,
+                            fuse_mlp_out=True,
+                        )
+                    else:
+                        h_curr, v_first, z_loss, gate_weight_mean, bincounts = block(
+                            h_curr, cos, sin, pulse_idx=k, v_first=v_first,
+                            routing_mask=routing_mask, prev_mlp_out=prev_mlp_out,
+                            fuse_mlp_out=False,
+                        )
+                        prev_mlp_out = None
                 total_z_loss = total_z_loss + z_loss
                 gate_confidence_accum = gate_confidence_accum + gate_weight_mean
                 global_expert_counts = global_expert_counts + bincounts
@@ -1722,34 +1774,7 @@ class PulsarForCausalLM(nn.Module):
                         offset = (subsample_offset + k) % 4
                         h_sub = h_pulse[:, offset::4, :].contiguous()
                         lbl_sub = labels[:, offset::4].contiguous()
-                        raw_logits_sub = F.linear(self.final_norm(h_sub), self.lm_head.weight)
-                        if (HAS_PULSAR_CUDA and raw_logits_sub.is_cuda
-                                and raw_logits_sub.dtype == torch.bfloat16
-                                and not torch.compiler.is_compiling()
-                                and hasattr(pulsar_cuda, "fused_softcap_ce_forward")):
-                            loss_sub = _FusedSoftcapCrossEntropyFunction.apply(
-                                raw_logits_sub.view(-1, self.cfg.vocab_size),
-                                lbl_sub.view(-1),
-                                self.cfg.logit_softcap,
-                                "mean",
-                                -100,
-                            )
-                        elif raw_logits_sub.is_cuda:
-                            loss_sub = _compiled_softcap_ce(
-                                raw_logits_sub.view(-1, self.cfg.vocab_size),
-                                lbl_sub.view(-1),
-                                self.cfg.logit_softcap,
-                                "mean",
-                                -100,
-                            )
-                        else:
-                            loss_sub = _softcap_cross_entropy(
-                                raw_logits_sub.view(-1, self.cfg.vocab_size),
-                                lbl_sub.view(-1),
-                                self.cfg.logit_softcap,
-                                "mean",
-                                -100,
-                            )
+                        loss_sub = self._chunked_ce(self.final_norm(h_sub), lbl_sub)
 
                     total_loss = total_loss + (pulse_weights[k] * loss_sub)
                     pulse_losses.append(loss_sub)

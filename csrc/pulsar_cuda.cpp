@@ -24,7 +24,8 @@ std::vector<torch::Tensor> moe_dispatch_forward_cuda(
     torch::Tensor topk_idx,
     torch::Tensor token_to_slot,
     int64_t num_experts,
-    int64_t capacity
+    int64_t capacity,
+    std::optional<torch::Tensor> expert_counts = std::nullopt
 );
 
 torch::Tensor moe_dispatch_backward_cuda(
@@ -48,7 +49,8 @@ std::vector<torch::Tensor> moe_combine_backward_cuda(
     torch::Tensor expert_outputs,
     torch::Tensor topk_idx,
     torch::Tensor topk_weights,
-    torch::Tensor token_to_slot
+    torch::Tensor token_to_slot,
+    std::optional<torch::Tensor> expert_counts = std::nullopt
 );
 
 std::vector<torch::Tensor> qk_rmsnorm_forward_cuda(
@@ -161,12 +163,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_swiglu_backward", &fused_swiglu_backward_cuda, "Fused SwiGLU Backward (CUDA)");
     m.def("rope_forward", &rope_forward_cuda, "RoPE Forward (CUDA)");
 
-    m.def("moe_dispatch_forward", &moe_dispatch_forward_cuda, "Fused MoE Dispatch Forward (CUDA)");
+    m.def("moe_dispatch_forward", &moe_dispatch_forward_cuda, "Fused MoE Dispatch Forward (CUDA)",
+          py::arg("x"), py::arg("topk_idx"), py::arg("token_to_slot"),
+          py::arg("num_experts"), py::arg("capacity"), py::arg("expert_counts") = py::none());
     m.def("moe_dispatch_backward", &moe_dispatch_backward_cuda, "Fused MoE Dispatch Backward (CUDA)");
     m.def("moe_combine_forward", &moe_combine_forward_cuda, "Fused MoE Combine Forward (CUDA)",
           py::arg("expert_outputs"), py::arg("topk_idx"), py::arg("topk_weights"),
           py::arg("token_to_slot"), py::arg("shared_out") = py::none());
-    m.def("moe_combine_backward", &moe_combine_backward_cuda, "Fused MoE Combine Backward (CUDA)");
+    m.def("moe_combine_backward", &moe_combine_backward_cuda, "Fused MoE Combine Backward (CUDA)",
+          py::arg("d_routed_out"), py::arg("expert_outputs"), py::arg("topk_idx"),
+          py::arg("topk_weights"), py::arg("token_to_slot"), py::arg("expert_counts") = py::none());
     m.def("qk_rmsnorm_forward", &qk_rmsnorm_forward_cuda, "Fused QK-RMSNorm Forward (CUDA)");
     m.def("qk_rmsnorm_backward", &qk_rmsnorm_backward_cuda, "Fused QK-RMSNorm Backward (CUDA)");
     m.def("qk_rmsnorm_rope_forward", &qk_rmsnorm_rope_forward_cuda, "Fused QK-RMSNorm + RoPE Forward (CUDA)",

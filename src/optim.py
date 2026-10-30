@@ -247,10 +247,13 @@ class Muon(_SROptimizerMixin, Optimizer):
                 # Batched foreach momentum update
                 torch._foreach_mul_(bufs, momentum)
                 torch._foreach_add_(bufs, [g.to(b.dtype) for g, b in zip(grads, bufs)])
-                g_updates = [
-                    g.to(torch.bfloat16).add(buf.to(torch.bfloat16), alpha=momentum)
-                    for g, buf in zip(grads, bufs)
-                ]
+                if grads[0].dtype == torch.bfloat16 and bufs[0].dtype == torch.bfloat16:
+                    g_updates = list(torch._foreach_add(grads, bufs, alpha=momentum))
+                else:
+                    g_updates = [
+                        g.to(torch.bfloat16).add(buf.to(torch.bfloat16), alpha=momentum)
+                        for g, buf in zip(grads, bufs)
+                    ]
 
                 # Batch along dim 0: 2D matrices stack to [N, H, W]; 3D expert tensors cat to [N*E, H, W]
                 is_3d = (len(shape) == 3)

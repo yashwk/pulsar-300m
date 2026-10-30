@@ -1208,6 +1208,39 @@ void adamw_step_cuda(
 // 8. Fused MoE Dispatch & Combine Kernels
 // ------------------------------------------------------------------------
 
+__global__ void moe_tail_zero_kernel(
+    __nv_bfloat16* __restrict__ buf,
+    const int64_t* __restrict__ expert_counts,
+    int E, int C, int D
+) {
+    int e = blockIdx.y;
+    if (e >= E) return;
+
+    int64_t count = expert_counts[e];
+    int start_slot = (count < C) ? (int)((count > 0) ? count : 0) : C;
+    int tail_slots = C - start_slot;
+    if (tail_slots <= 0) return;
+
+    __nv_bfloat16* tail_ptr = buf + ((int64_t)e * C + start_slot) * D;
+    int64_t tid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t stride = (int64_t)gridDim.x * blockDim.x;
+
+    if (D % 8 == 0) {
+        int64_t total_vec = (int64_t)tail_slots * (D / 8);
+        uint4* dst_u4 = reinterpret_cast<uint4*>(tail_ptr);
+        uint4 zero_u4 = make_uint4(0, 0, 0, 0);
+        for (int64_t v = tid; v < total_vec; v += stride) {
+            dst_u4[v] = zero_u4;
+        }
+    } else {
+        int64_t total_elems = (int64_t)tail_slots * D;
+        __nv_bfloat16 zero_bf = __float2bfloat16(0.0f);
+        for (int64_t i = tid; i < total_elems; i += stride) {
+            tail_ptr[i] = zero_bf;
+        }
+    }
+}
+
 __global__ void moe_dispatch_forward_kernel(
     const __nv_bfloat16* __restrict__ x,           // [N, D]
     const int64_t* __restrict__ topk_idx,          // [N, K]
@@ -1429,7 +1462,8 @@ std::vector<torch::Tensor> moe_dispatch_forward_cuda(
     torch::Tensor topk_idx,
     torch::Tensor token_to_slot,
     int64_t num_experts,
-    int64_t capacity
+    int64_t capacity,
+    std::optional<torch::Tensor> expert_counts
 ) {
     int N = x.size(0);
     int D = x.size(1);
@@ -1450,7 +1484,23 @@ std::vector<torch::Tensor> moe_dispatch_forward_cuda(
                 "token_to_slot must be [N, K]");
     TORCH_CHECK(D % 8 == 0, "D must be a multiple of 8 for vectorised dispatch, got ", D);
 
-    auto expert_inputs = torch::zeros({E, C, D}, x.options());
+    torch::Tensor expert_inputs;
+    if (expert_counts.has_value() && expert_counts->defined()) {
+        TORCH_CHECK(expert_counts->is_cuda(), "expert_counts must be a CUDA tensor");
+        TORCH_CHECK(expert_counts->is_contiguous(), "expert_counts must be contiguous");
+        TORCH_CHECK(expert_counts->scalar_type() == torch::kInt64, "expert_counts must be int64");
+        TORCH_CHECK(expert_counts->numel() >= E, "expert_counts must have at least E elements");
+        expert_inputs = torch::empty({E, C, D}, x.options());
+        dim3 grid(4, E);
+        int block = 256;
+        moe_tail_zero_kernel<<<grid, block>>>(
+            reinterpret_cast<__nv_bfloat16*>(expert_inputs.data_ptr<c10::BFloat16>()),
+            expert_counts->data_ptr<int64_t>(),
+            E, C, D
+        );
+    } else {
+        expert_inputs = torch::zeros({E, C, D}, x.options());
+    }
 
     if (N > 0 && K > 0) {
         int threads = (D == 768) ? 96 : 128;
@@ -1530,7 +1580,8 @@ std::vector<torch::Tensor> moe_combine_backward_cuda(
     torch::Tensor expert_outputs,
     torch::Tensor topk_idx,
     torch::Tensor topk_weights,
-    torch::Tensor token_to_slot
+    torch::Tensor token_to_slot,
+    std::optional<torch::Tensor> expert_counts
 ) {
     int N = topk_idx.size(0);
     int K = topk_idx.size(1);
@@ -1538,7 +1589,23 @@ std::vector<torch::Tensor> moe_combine_backward_cuda(
     int C = expert_outputs.size(1);
     int D = expert_outputs.size(2);
 
-    auto d_expert_outputs = torch::zeros_like(expert_outputs);
+    torch::Tensor d_expert_outputs;
+    if (expert_counts.has_value() && expert_counts->defined()) {
+        TORCH_CHECK(expert_counts->is_cuda(), "expert_counts must be a CUDA tensor");
+        TORCH_CHECK(expert_counts->is_contiguous(), "expert_counts must be contiguous");
+        TORCH_CHECK(expert_counts->scalar_type() == torch::kInt64, "expert_counts must be int64");
+        TORCH_CHECK(expert_counts->numel() >= E, "expert_counts must have at least E elements");
+        d_expert_outputs = torch::empty({E, C, D}, expert_outputs.options());
+        dim3 grid(4, E);
+        int block = 256;
+        moe_tail_zero_kernel<<<grid, block>>>(
+            reinterpret_cast<__nv_bfloat16*>(d_expert_outputs.data_ptr<c10::BFloat16>()),
+            expert_counts->data_ptr<int64_t>(),
+            E, C, D
+        );
+    } else {
+        d_expert_outputs = torch::zeros_like(expert_outputs);
+    }
     auto d_topk_weights = torch::empty_like(topk_weights);
 
     if (N > 0 && K > 0) {

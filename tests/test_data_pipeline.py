@@ -236,6 +236,35 @@ def test_jev_quality_gate_decision_and_budget_circuit_breaker():
             assert res3 == [True, True]
 
 
+def test_jev_quality_gate_response_key_parsing_variants_and_fail_open():
+    """Verify parsing of 'results', 'decisions', 'prompt_tokens', and fail-open on missing keys."""
+    gate = JevQualityGate(api_key="mock_key", enabled=True)
+
+    # 1. Test 'results' key with 'prompt_tokens'
+    resp_results = {
+        "results": {
+            "doc_0": {"type": "score", "score": 2.1},
+            # doc_1 is deliberately omitted to test fail-open
+        },
+        "usage": {"prompt_tokens": 1000},
+    }
+    gate._post_with_retry = MagicMock(return_value=resp_results)
+    res = gate.evaluate_batch(["Snippet 1", "Snippet 2 missing in response"])
+    assert res == [True, True]  # doc_0 passed (2.1 >= 1.65), doc_1 failed-open (True)
+    assert gate.total_cost > 0.0
+
+    # 2. Test 'decisions' key
+    resp_decisions = {
+        "decisions": {
+            "doc_0": {"type": "score", "score": 1.1},
+        },
+        "usage": {"input_tokens": 500, "cost": 0.0001},
+    }
+    gate._post_with_retry = MagicMock(return_value=resp_decisions)
+    res2 = gate.evaluate_batch(["Snippet 3"])
+    assert res2 == [False]
+
+
 def test_jev_quality_gate_multi_doc_batching():
     """Verify packing of up to 32 candidate document digests into a single non-causal isolated request."""
     gate = JevQualityGate(

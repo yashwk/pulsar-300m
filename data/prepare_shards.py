@@ -25,8 +25,15 @@ Universal Schema Formatter:
 """
 
 import os
-# Disable experimental xet chunk downloader to prevent unhandled socket deadlocks
-os.environ.pop("HF_XET_HIGH_PERFORMANCE", None)
+import warnings
+
+# Suppress noisy library deprecation and PyTorch missing warnings in CPU tokenizer worker
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# Enable modern high-performance Xet transfer in huggingface_hub
+os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
+os.environ.pop("HF_HUB_ENABLE_HF_TRANSFER", None)
 
 import argparse
 import ast
@@ -1188,7 +1195,7 @@ def make_substream_stream(
     while True:
         for f_idx in assigned_indices:
             fname = all_files[f_idx]
-            print(f"[{substream_id}] Downloading/loading parquet file ({f_idx + 1}/{len(assigned_indices)}): {fname}...", flush=True)
+            print(f"[Shard {shard_idx} | {substream_id}] Loading parquet ({f_idx + 1}/{len(assigned_indices)}): {fname}...", flush=True)
             # Download or reuse cached parquet file with resilient retry
             fpath = None
             for attempt in range(5):
@@ -1198,10 +1205,10 @@ def make_substream_stream(
                 except Exception as e:
                     if attempt == 4:
                         raise e
-                    print(f"[Warning] hf_hub_download failed for {fname} (attempt {attempt+1}/5): {e}. Retrying...", flush=True)
+                    print(f"[Shard {shard_idx} | {substream_id}] Warning: download failed for {fname} (attempt {attempt+1}/5): {e}. Retrying...", flush=True)
                     time.sleep(2 * (attempt + 1))
             pf = pq.ParquetFile(fpath)
-            print(f"[{substream_id}] Opened {fname} ({pf.metadata.num_rows:,} rows, {pf.metadata.serialized_size / 1e6:.1f} MB)", flush=True)
+            print(f"[Shard {shard_idx} | {substream_id}] Opened {fname} ({pf.metadata.num_rows:,} rows, {pf.metadata.serialized_size / 1e6:.1f} MB)", flush=True)
             doc_counter = 0
 
             for batch in pf.iter_batches(batch_size=batch_size):
@@ -1606,7 +1613,7 @@ def build_shard(
 
                 total_now = train_tokens + val_tokens
                 now = time.time()
-                if now - last_print >= 5.0 or total_now >= total_tokens:
+                if now - last_print >= 10.0 or total_now >= total_tokens:
                     dt = now - t_start
                     speed = total_now / max(dt, 0.01)
                     pct = 100.0 * total_now / total_tokens
@@ -1618,8 +1625,9 @@ def build_shard(
                         last_health_check = total_now
 
                     print(
-                        f"  [{pct:5.1f}%] {total_now / 1e6:6.2f}M / {total_tokens / 1e6:.1f}M tokens "
-                        f"({speed / 1e6:4.2f}M tok/s, ETA: {eta_sec / 60:4.1f}m) | Docs: {doc_idx:,}"
+                        f"[Shard {shard_idx}] [{pct:5.1f}%] {total_now / 1e6:6.2f}M / {total_tokens / 1e6:.1f}M tokens "
+                        f"| Rate: {speed / 1e6:4.2f}M tok/s | ETA: {eta_sec / 60:4.1f}m | Docs: {doc_idx:,}",
+                        flush=True
                     )
                     last_print = now
 

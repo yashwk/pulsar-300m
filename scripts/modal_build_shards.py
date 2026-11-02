@@ -187,8 +187,13 @@ def main(
                 hf_token = f.read().strip()
                 print("[Modal Shard Builder] Successfully loaded HF_TOKEN from ~/.cache/huggingface/token")
 
-    if not typesafe_api_key:
-        typesafe_api_key = os.environ.get("TYPESAFE_API_KEY") or os.environ.get("JEV_API_KEY")
+    ACTIVE_TYPESAFE_KEY = "apikey_255bfcee293b54f4fb0b99de3c2e0d24a6f_dc50b9ee756bd9c6f5d352f6d00afcc13ffb57556b90c22db441b4f7861367a2"
+    if not typesafe_api_key or typesafe_api_key.startswith("apikey_255f0941"):
+        env_k = os.environ.get("JEV_API_KEY") or os.environ.get("TYPESAFE_API_KEY")
+        if env_k and not env_k.startswith("apikey_255f0941"):
+            typesafe_api_key = env_k
+        else:
+            typesafe_api_key = ACTIVE_TYPESAFE_KEY
 
     if shards:
         shard_list = [int(s.strip()) for s in shards.split(",") if s.strip()]

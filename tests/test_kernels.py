@@ -799,3 +799,33 @@ def test_moe_combine_backward_token_centric_parity():
     assert torch.isfinite(tw.grad).all()
     assert torch.isfinite(shared_out.grad).all()
     assert torch.equal(shared_out.grad, dy)
+
+
+@needs_gpu
+@needs_cuda_ext
+def test_causal_depthwise_conv1d_k4_cuda_parity_and_gradients():
+    """uint4 C++ CUDA canon_conv1d_k4 forward and backward match PyTorch F.conv1d reference."""
+    import pulsar_cuda
+    from src.model import causal_depthwise_conv1d_k4_ref
+
+    B, T, D = 4, 32, 1024
+    torch.manual_seed(42)
+    x = torch.randn(B, T, D, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(D, 4, device="cuda", dtype=torch.float32)
+
+    # Forward parity
+    y_cuda = pulsar_cuda.causal_depthwise_conv1d_k4_forward(x, weight)
+    y_ref = causal_depthwise_conv1d_k4_ref(x, weight)
+    assert_close(y_cuda, y_ref, atol=2e-2, msg="canon conv1d forward parity")
+
+    # Backward parity
+    dout = torch.randn_like(y_cuda)
+    dx_cuda, dw_cuda = pulsar_cuda.causal_depthwise_conv1d_k4_backward(dout, x, weight)
+
+    xr = x.float().clone().requires_grad_(True)
+    wr = weight.clone().requires_grad_(True)
+    yr = causal_depthwise_conv1d_k4_ref(xr, wr)
+    yr.backward(dout.float())
+
+    assert_close(dx_cuda, xr.grad.bfloat16(), atol=2e-2, msg="canon conv1d backward dx parity")
+    assert_close(dw_cuda, wr.grad, atol=1e-4, msg="canon conv1d backward dweight parity")

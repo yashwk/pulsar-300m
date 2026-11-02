@@ -313,6 +313,12 @@ def plan_epoch(
         else:
             break
 
+    # Global window shuffling: uniformly interleave whole-document windows and
+    # over-length filler windows across the entire epoch so there is no phase cliff.
+    if len(windows) > 1:
+        perm = rng.permutation(len(windows))
+        windows = [windows[int(k)] for k in perm]
+
     # Documents longer than seq_len are emitted in full by the filler phase; whole-able
     # documents are all emitted too. Track the accounting so callers can assert that no
     # token was silently dropped.

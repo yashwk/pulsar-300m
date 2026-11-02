@@ -307,7 +307,14 @@ def test_resume_reproduces_uninterrupted_run_exactly():
     assert worst_diff == 0.0
 
 
-@pytest.mark.skipif(not HAS_CUDA, reason="needs CUDA for AdamW CUDA kernel test")
+try:
+    import pulsar_cuda
+    HAS_PULSAR_CUDA = True
+except ImportError:
+    HAS_PULSAR_CUDA = False
+
+
+@pytest.mark.skipif(not (HAS_CUDA and HAS_PULSAR_CUDA), reason="needs CUDA and compiled pulsar_cuda extension")
 def test_adamw_cuda_kernel_parity_and_stochastic_rounding():
     """AdamWBF16SR CUDA kernel matches eager PyTorch update direction and preserves FP32 state."""
     import pulsar_cuda

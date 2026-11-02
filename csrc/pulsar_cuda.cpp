@@ -167,6 +167,17 @@ void adamw_bf16_sr_step_cuda(
     bool stochastic_rounding
 );
 
+torch::Tensor causal_depthwise_conv1d_k4_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor weight
+);
+
+std::vector<torch::Tensor> causal_depthwise_conv1d_k4_backward_cuda(
+    torch::Tensor dout,
+    torch::Tensor x,
+    torch::Tensor weight
+);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rmsnorm_forward", &rmsnorm_forward_cuda, "RMSNorm Forward (CUDA)");
     m.def("rmsnorm_backward", &rmsnorm_backward_cuda, "RMSNorm Backward (CUDA)");
@@ -234,4 +245,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("p"), py::arg("g"), py::arg("m"), py::arg("v"),
           py::arg("lr"), py::arg("beta1"), py::arg("beta2"), py::arg("eps"),
           py::arg("weight_decay"), py::arg("step"), py::arg("seed"), py::arg("stochastic_rounding"));
+    m.def("causal_depthwise_conv1d_k4_forward", &causal_depthwise_conv1d_k4_forward_cuda,
+          "Fused Causal Depthwise Conv1D K=4 Forward (CUDA)",
+          py::arg("x"), py::arg("weight"));
+    m.def("causal_depthwise_conv1d_k4_backward", &causal_depthwise_conv1d_k4_backward_cuda,
+          "Fused Causal Depthwise Conv1D K=4 Backward (CUDA)",
+          py::arg("dout"), py::arg("x"), py::arg("weight"));
 }

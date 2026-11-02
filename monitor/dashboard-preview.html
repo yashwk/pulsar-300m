@@ -1,0 +1,703 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Pulsar — Training Monitor Preview</title>
+  <style>
+    :root {
+      color-scheme:light; --bg:#f5f7fa; --surface:#fff; --raised:#f9fafb; --soft:#f2f4f7;
+      --border:#e4e7ec; --strong:#d0d5dd; --text:#101828; --muted:#475467; --dim:#667085;
+      --accent:#175cd3; --accent-soft:rgba(23,92,211,.08); --cyan:#1570ef; --purple:#6941c6;
+      --amber:#b54708; --red:#b42318; --green:#027a48; --grid:rgba(16,24,40,.09);
+      --mono:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace;
+      --sans:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+      --radius:8px; background:var(--bg);
+    }
+    [data-theme="light"] { color-scheme:light; }
+    [data-theme="dark"] {
+      color-scheme:dark; --bg:#101828; --surface:#182230; --raised:#1d2939; --soft:#253247;
+      --border:#344054; --strong:#475467; --text:#f2f4f7; --muted:#c0c7d0; --dim:#98a2b3;
+      --accent:#84adff; --accent-soft:rgba(132,173,255,.12); --cyan:#7cc4ff; --purple:#c3b5fd;
+      --amber:#fdb022; --red:#f97066; --green:#75e0a7; --grid:rgba(242,244,247,.11);
+    }
+    * { box-sizing:border-box; }
+    html { min-width:320px; scroll-behavior:smooth; }
+    body { margin:0; min-height:100vh; color:var(--text); background:var(--bg); font-family:var(--sans); font-size:14px; line-height:1.5; }
+    button { font:inherit; }
+    .shell { width:min(1400px,100% - 48px); margin:auto; }
+    .topbar { position:sticky; top:0; z-index:5; border-bottom:1px solid var(--border); background:var(--surface); }
+    .topbar-inner { min-height:64px; display:flex; align-items:center; justify-content:space-between; gap:20px; }
+    .brand { display:flex; align-items:center; gap:12px; min-width:0; }
+    .brand-mark { width:32px; height:32px; display:grid; place-items:center; border:1px solid var(--border); border-radius:8px; color:var(--accent); background:var(--raised); }
+    .brand-mark svg { width:18px; height:18px; }
+    .brand-name { font-size:13px; font-weight:700; letter-spacing:.08em; }
+    .brand-divider { padding:0 3px; color:var(--dim); font-weight:400; }
+    .brand-sub { margin-top:1px; color:var(--dim); font-size:10px; }
+    .top-actions { display:flex; align-items:center; justify-content:flex-end; gap:9px; }
+    .connection,.preview-tag,.state-pill { display:inline-flex; align-items:center; gap:7px; white-space:nowrap; border:1px solid var(--border); border-radius:6px; padding:6px 9px; color:var(--muted); background:var(--surface); font:11px var(--sans); }
+    .connection i,.state-dot { width:7px; height:7px; border-radius:50%; background:var(--dim); }
+    .connection.live i,.state-pill.running .state-dot { background:var(--green); }
+    .connection.offline i,.state-pill.crashed .state-dot,.state-pill.error .state-dot { background:var(--red); }
+    .state-pill.cooling .state-dot { background:var(--amber); }
+    .state-pill.completed .state-dot { background:var(--purple); }
+    .state-pill.running { color:var(--green); border-color:color-mix(in srgb,var(--green) 28%,var(--border)); background:color-mix(in srgb,var(--green) 5%,var(--surface)); }
+    .state-pill.cooling { color:var(--amber); }
+    .state-pill.crashed,.state-pill.error { color:var(--red); }
+    .state-pill.completed { color:var(--purple); }
+    .preview-tag { color:var(--dim); border:0; padding:0 4px; background:transparent; }
+    .button { min-height:34px; display:inline-flex; align-items:center; justify-content:center; gap:7px; border:1px solid var(--border); border-radius:6px; padding:0 11px; color:var(--muted); background:var(--surface); cursor:pointer; transition:.16s ease; }
+    .button:hover { color:var(--text); border-color:var(--strong); background:var(--raised); }
+    .button svg { width:14px; height:14px; }
+    main { padding:20px 0 32px; }
+    .page-heading { display:flex; align-items:flex-end; justify-content:space-between; gap:14px; margin-bottom:12px; }
+    .eyebrow,.kicker { color:var(--dim); font:10px var(--mono); letter-spacing:.11em; text-transform:uppercase; }
+    h1 { margin:7px 0 0; font-size:clamp(24px,3vw,30px); line-height:1.2; letter-spacing:-.035em; font-weight:620; }
+    .subtitle { margin:9px 0 0; color:var(--muted); font-size:13px; }
+    .page-meta { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:8px; }
+    .meta-chip { border:1px solid var(--border); border-radius:6px; padding:6px 9px; color:var(--muted); background:var(--surface); font:10px var(--mono); }
+    .health-banner { display:flex; align-items:flex-start; gap:10px; margin:0 0 14px; border:1px solid var(--border); border-radius:8px; padding:11px 13px; background:var(--surface); }
+    .health-banner[hidden] { display:none; }
+    .health-banner.alert { border-color:color-mix(in srgb,var(--red) 45%,var(--border)); background:color-mix(in srgb,var(--red) 8%,var(--surface)); }
+    .health-banner.watch { border-color:color-mix(in srgb,var(--amber) 42%,var(--border)); background:color-mix(in srgb,var(--amber) 7%,var(--surface)); }
+    .banner-icon { flex:none; width:20px; height:20px; display:grid; place-items:center; border-radius:50%; color:var(--red); background:color-mix(in srgb,var(--red) 15%,transparent); font-weight:800; }
+    .health-banner.watch .banner-icon { color:var(--amber); background:color-mix(in srgb,var(--amber) 15%,transparent); }
+    .banner-title { font-size:12px; font-weight:700; }
+    .banner-detail { margin-top:2px; color:var(--muted); font-size:12px; }
+    .panel,.run-card,.metric-card { border:1px solid var(--border); border-radius:var(--radius); background:var(--surface); }
+    .run-card { overflow:hidden; margin-bottom:8px; }
+    .run-main { display:grid; grid-template-columns:minmax(190px,.8fr) minmax(260px,1.8fr) minmax(145px,.6fr); align-items:center; gap:18px; padding:12px 14px; }
+    .step-reading { display:flex; flex-direction:column; align-items:flex-start; }
+    .step-value { margin-top:2px; font:500 clamp(26px,3vw,34px)/1.1 var(--mono); letter-spacing:-.045em; font-variant-numeric:tabular-nums; }
+    .step-total { margin-top:5px; color:var(--muted); font:12px var(--mono); }
+    .progress-head,.progress-foot { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+    .progress-head { margin-bottom:9px; color:var(--muted); font-size:12px; }
+    .progress-head strong { color:var(--accent); font:600 12px var(--mono); }
+    .progress-track { position:relative; height:5px; border-radius:99px; background:var(--soft); overflow:visible; }
+    .progress-fill { height:100%; width:0; border-radius:99px; background:var(--accent); transition:width .5s ease; }
+    .warmup-mark { position:absolute; top:-4px; left:0; width:1px; height:16px; background:var(--muted); opacity:.75; }
+    .progress-foot { margin-top:10px; color:var(--dim); font:10px var(--mono); }
+    .progress-foot span:first-child { color:var(--muted); }
+    .eta-box { min-height:54px; display:flex; flex-direction:column; justify-content:center; border-left:1px solid var(--border); padding-left:16px; }
+    .eta-box strong { margin-top:2px; font:500 17px var(--mono); letter-spacing:-.02em; }
+    .eta-box small { margin-top:4px; color:var(--dim); font:10px var(--mono); }
+    .run-secondary { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); align-items:center; gap:10px; border-top:1px solid var(--border); padding:8px 14px; background:var(--raised); }
+    .dataset-fact { grid-column:span 2; min-width:0; }
+    .dataset-meta { display:flex; justify-content:space-between; gap:10px; margin-bottom:5px; color:var(--muted); font-size:10px; }
+    .dataset-meta strong { color:var(--text); font:11px var(--mono); }
+    .dataset-track { height:4px; overflow:hidden; border-radius:6px; background:var(--border); }
+    .dataset-fill { width:0; height:100%; border-radius:6px; background:var(--accent); transition:width .5s ease; }
+    .run-fact { min-width:0; color:var(--dim); font-size:10px; }
+    .run-fact strong { display:block; overflow:hidden; margin-top:2px; color:var(--text); font:10px var(--mono); text-overflow:ellipsis; white-space:nowrap; }
+    .metric-grid { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:0; margin:8px 0 10px; overflow:hidden; border:1px solid var(--border); border-radius:6px; background:var(--surface); }
+    .metric-card { min-width:0; padding:9px 11px; border:0; border-right:1px solid var(--border); border-radius:0; }
+    .metric-card:last-child { border-right:0; }
+    .metric-label { display:flex; align-items:center; justify-content:space-between; gap:5px; color:var(--dim); font:10px var(--sans); }
+    .metric-value { overflow:hidden; margin-top:5px; color:var(--text); font:500 clamp(16px,1.5vw,20px)/1.15 var(--mono); letter-spacing:-.03em; text-overflow:ellipsis; white-space:nowrap; font-variant-numeric:tabular-nums; }
+    .metric-value.green,.metric-value.cyan,.metric-value.purple { color:var(--text); }
+    .metric-sub { min-height:14px; margin-top:4px; overflow:hidden; color:var(--dim); font-size:10px; text-overflow:ellipsis; white-space:nowrap; }
+    .content-grid { display:grid; grid-template-columns:minmax(0,1.55fr) minmax(330px,.9fr); gap:8px; }
+    .panel { min-width:0; padding:12px; }
+    .panel-head { display:flex; align-items:flex-start; justify-content:space-between; gap:10px; margin-bottom:8px; }
+    h2 { margin:3px 0 0; font-size:14px; font-weight:620; letter-spacing:-.01em; }
+    .panel-note { margin:2px 0 0; color:var(--dim); font-size:11px; }
+    .range-group { display:flex; gap:2px; border:1px solid var(--border); border-radius:6px; padding:2px; background:var(--raised); }
+    .range-btn { border:0; border-radius:4px; padding:5px 8px; color:var(--muted); background:transparent; font:10px var(--sans); cursor:pointer; }
+    .range-btn:hover { color:var(--text); }
+    .range-btn.active { color:var(--accent); background:var(--accent-soft); }
+    .legend { display:flex; flex-wrap:wrap; gap:12px; margin:1px 0 5px; color:var(--muted); font-size:10px; }
+    .legend span { display:inline-flex; align-items:center; gap:6px; }
+    .legend i { width:15px; height:2px; border-radius:4px; background:var(--accent); }
+    .legend .val i { background:var(--purple); }
+    .legend .aux i { background:var(--dim); }
+    .chart-wrap { position:relative; width:100%; height:185px; }
+    .chart-wrap.compact { height:125px; }
+    canvas { display:block; width:100%; height:100%; touch-action:pan-y; }
+    .chart-tooltip { position:absolute; z-index:2; display:none; max-width:220px; pointer-events:none; border:1px solid var(--border); border-radius:6px; padding:8px 10px; color:var(--text); background:var(--surface); box-shadow:0 4px 14px rgba(16,24,40,.12); font:10px/1.55 var(--mono); white-space:pre-line; }
+    .health-summary { color:var(--muted); font:11px var(--sans); }
+    .health-list { display:grid; gap:0; }
+    .health-item { display:grid; grid-template-columns:7px minmax(72px,.72fr) minmax(0,1.28fr); align-items:center; gap:7px; min-height:25px; border-bottom:1px solid var(--border); padding:3px 1px; }
+    .health-item:last-child { border-bottom:0; }
+    .health-indicator { width:7px; height:7px; border-radius:50%; background:var(--green); }
+    .health-indicator.watch { background:var(--amber); }
+    .health-indicator.alert { background:var(--red); }
+    .health-indicator.unknown { background:var(--dim); }
+    .health-name { color:var(--muted); font-size:10px; }
+    .health-value { overflow:hidden; color:var(--text); font:10px var(--mono); text-align:right; text-overflow:ellipsis; white-space:nowrap; }
+    .health-threshold { grid-column:2 / -1; margin-top:-2px; color:var(--dim); font:9px var(--mono); }
+    .panel-footnote { margin:6px 0 0; color:var(--dim); font-size:9px; }
+    .table-caption { margin:7px 0 3px; color:var(--dim); font:9px var(--sans); letter-spacing:.05em; text-transform:uppercase; }
+    .table-scroll { width:100%; overflow-x:auto; }
+    .dense-table { width:100%; border-collapse:collapse; table-layout:fixed; color:var(--text); font:10px var(--mono); font-variant-numeric:tabular-nums; }
+    .dense-table th,.dense-table td { overflow:hidden; border-bottom:1px solid var(--border); padding:4px 6px; text-overflow:ellipsis; white-space:nowrap; }
+    .dense-table thead th { color:var(--dim); background:var(--raised); font:10px var(--sans); font-weight:500; text-align:right; }
+    .dense-table thead th:first-child { text-align:left; }
+    .dense-table tbody th { color:var(--muted); font:10px var(--sans); font-weight:500; text-align:left; }
+    .dense-table td { text-align:right; }
+    .dense-table tr:last-child th,.dense-table tr:last-child td { border-bottom:0; }
+    .runtime-table { margin-top:4px; }
+    .runtime-table tbody th:nth-child(1),.runtime-table tbody th:nth-child(3) { width:17%; }
+    .runtime-table tbody td:nth-child(2),.runtime-table tbody td:nth-child(4) { width:33%; }
+    .pulse-table td,.pulse-table thead th { text-align:right; }
+    .pulse-table { min-width:440px; }
+    .pulse-table tbody th { text-align:left; }
+    .runtime-table { min-width:570px; }
+    .table-empty { color:var(--dim)!important; text-align:center!important; }
+    .secondary-grid { display:grid; grid-template-columns:minmax(0,1.12fr) minmax(0,.88fr); gap:8px; margin-top:8px; }
+    .routing-summary { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:7px 12px; margin:0 0 8px; }
+    .routing-stat { color:var(--dim); font-size:10px; }
+    .routing-stat strong { display:block; margin-top:1px; color:var(--text); font:11px var(--mono); }
+    .scale-summary { display:flex; flex-wrap:wrap; gap:14px; margin:4px 0 8px; color:var(--dim); font:10px var(--sans); }
+    .scale-summary strong { margin-left:4px; color:var(--text); font:10px var(--mono); }
+    .expert-list { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:7px 15px; }
+    .expert-row { display:grid; grid-template-columns:36px minmax(0,1fr) 42px; align-items:center; gap:8px; color:var(--muted); font:10px var(--mono); }
+    .expert-bar { position:relative; height:6px; overflow:hidden; border-radius:5px; background:var(--soft); }
+    .expert-bar::after { position:absolute; top:-2px; bottom:-2px; left:var(--ideal,42%); width:1px; content:""; background:var(--text); opacity:.48; }
+    .expert-fill { height:100%; width:0; border-radius:5px; background:var(--cyan); }
+    .expert-row.worst .expert-fill { background:var(--amber); }
+    .expert-value { color:var(--text); text-align:right; }
+    .activity-list { display:grid; gap:4px; }
+    .activity-item { display:grid; grid-template-columns:62px minmax(0,1fr) auto; align-items:center; gap:9px; border-bottom:1px solid var(--border); padding:5px 0; }
+    .activity-item:last-child { border-bottom:0; }
+    .activity-type { color:var(--cyan); font:10px var(--mono); text-transform:uppercase; }
+    .activity-item.note .activity-type { color:var(--purple); }
+    .activity-item.checkpoint .activity-type { color:var(--accent); }
+    .activity-label { overflow:hidden; color:var(--text); font-size:10px; text-overflow:ellipsis; white-space:nowrap; }
+    .activity-step { color:var(--dim); font:10px var(--mono); white-space:nowrap; }
+    .probe-tabs { display:flex; flex-wrap:wrap; gap:5px; margin:0 0 12px; }
+    .probe-tab { border:1px solid var(--border); border-radius:6px; padding:5px 8px; color:var(--muted); background:var(--raised); font:10px var(--sans); cursor:pointer; }
+    .probe-tab.active { color:var(--accent); border-color:color-mix(in srgb,var(--accent) 48%,var(--border)); background:var(--accent-soft); }
+    .probe-label { margin:10px 0 5px; color:var(--dim); font:9px var(--mono); letter-spacing:.08em; text-transform:uppercase; }
+    .probe-text { max-height:92px; overflow:auto; border:1px solid var(--border); border-radius:6px; padding:10px; color:var(--muted); background:var(--raised); font:11px/1.55 var(--mono); white-space:pre-wrap; overflow-wrap:anywhere; }
+    .probe-text.answer { max-height:150px; color:var(--text); }
+    .model-strip { display:grid; grid-template-columns:1fr 1fr 1fr 1fr; gap:10px; margin-top:10px; border:1px solid var(--border); border-radius:8px; padding:14px 17px; background:var(--surface); }
+    .model-fact { color:var(--dim); font-size:10px; }
+    .model-fact strong { display:block; margin-top:4px; color:var(--muted); font:10px var(--mono); }
+    .footer { display:flex; justify-content:space-between; gap:12px; padding:16px 2px 0; color:var(--dim); font:10px var(--sans); }
+    .empty { padding:22px 8px; color:var(--dim); font-size:12px; text-align:center; }
+    @media (max-width:1100px) { .metric-grid { grid-template-columns:repeat(3,minmax(0,1fr)); } .metric-card:nth-child(3) { border-right:0; } .metric-card:nth-child(-n+3) { border-bottom:1px solid var(--border); } .run-secondary { grid-template-columns:repeat(4,minmax(0,1fr)); } .model-strip { grid-template-columns:repeat(3,minmax(0,1fr)); } .content-grid { grid-template-columns:minmax(0,1.35fr) minmax(290px,.9fr); } }
+    @media (max-width:820px) { .shell { width:calc(100% - 28px); } .run-main { grid-template-columns:1fr 1.6fr; } .eta-box { grid-column:1 / -1; min-height:0; flex-direction:row; align-items:center; justify-content:space-between; border-top:1px solid var(--border); border-left:0; padding:8px 0 0; } .run-secondary { grid-template-columns:1fr 1fr; } .dataset-fact { grid-column:1 / -1; } .content-grid,.secondary-grid { grid-template-columns:1fr; } }
+    @media (max-width:560px) { .shell { width:calc(100% - 20px); } .topbar-inner { min-height:56px; } .preview-tag { display:none; } .top-actions { gap:5px; } .connection { padding:6px 7px; } .button { min-height:30px; padding:0 8px; } main { padding-top:14px; } .page-heading { align-items:flex-start; flex-direction:column; gap:8px; } .page-meta { justify-content:flex-start; gap:5px; } .run-main { grid-template-columns:1fr; gap:10px; padding:10px; } .step-reading { display:grid; grid-template-columns:1fr auto; align-items:end; } .step-reading .eyebrow { grid-column:1 / -1; } .step-value { font-size:28px; } .step-total { margin:0 0 4px; } .eta-box { grid-column:auto; } .run-secondary { padding:8px 10px; } .metric-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } .metric-card { padding:8px; } .metric-card:nth-child(2n) { border-right:0; } .metric-card:nth-child(-n+4) { border-bottom:1px solid var(--border); } .metric-value { font-size:16px; } .panel { padding:10px; } .panel-head { flex-wrap:wrap; } .chart-wrap { height:175px; } .chart-wrap.compact { height:115px; } .model-strip { grid-template-columns:repeat(2,minmax(0,1fr)); } .footer { flex-direction:column; } }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="shell topbar-inner">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">P</div>
+        <div><div class="brand-name">PULSAR <span class="brand-divider">/</span> MONITOR</div><div class="brand-sub">Pretraining telemetry</div></div>
+      </div>
+      <div class="top-actions">
+        <span class="preview-tag">Preview · read only</span>
+        <span class="connection" id="connection"><i></i><span id="connectionText">Connecting</span></span>
+        <button class="button" id="themeButton" type="button" title="Toggle color theme">Theme</button>
+        <button class="button" id="refreshButton" type="button"><svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M13 5V2.5M13 5h-2.5M13 5a5.5 5.5 0 1 0 1 4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>Refresh</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="shell">
+    <section class="page-heading">
+      <div>
+        <div class="eyebrow">Training / live run</div>
+        <h1>Pretraining</h1>
+        <p class="subtitle" id="modelSubtitle">Pulsar · recurrent mixture-of-experts</p>
+      </div>
+      <div class="page-meta">
+        <span class="state-pill running" id="runState"><i class="state-dot"></i><span id="runStateText">Training</span></span>
+        <span class="meta-chip" id="deviceChip">GPU · detecting</span>
+        <span class="meta-chip" id="lastUpdated">Waiting for telemetry</span>
+      </div>
+    </section>
+
+    <div class="health-banner" id="healthBanner" hidden role="status">
+      <span class="banner-icon" id="bannerIcon">!</span>
+      <div><div class="banner-title" id="bannerTitle"></div><div class="banner-detail" id="bannerDetail"></div></div>
+    </div>
+
+    <section class="run-card" aria-label="Training progress">
+      <div class="run-main">
+        <div class="step-reading">
+          <div class="eyebrow">Global step</div>
+          <div class="step-value" id="currentStep">—</div>
+          <div class="step-total" id="targetStep">/ —</div>
+        </div>
+        <div>
+          <div class="progress-head"><span>Run target</span><strong id="runPercent">—</strong></div>
+          <div class="progress-track"><div class="progress-fill" id="runProgress"></div><i class="warmup-mark" id="warmupMark" title="Warmup boundary"></i></div>
+          <div class="progress-foot"><span id="phaseText">Waiting for run state</span><span id="elapsedText">— elapsed</span></div>
+        </div>
+        <div class="eta-box"><span class="eyebrow">Estimated time left</span><strong id="etaText">—</strong><small id="finishHint">Based on current throughput</small></div>
+      </div>
+      <div class="run-secondary">
+        <div class="dataset-fact">
+          <div class="dataset-meta"><span>Dataset horizon</span><strong id="datasetText">—</strong></div>
+          <div class="dataset-track"><div class="dataset-fill" id="datasetProgress"></div></div>
+        </div>
+        <div class="run-fact">Active data shards<strong id="shardsText">—</strong></div>
+        <div class="run-fact">Global batch<strong id="batchText">—</strong></div>
+        <div class="run-fact">Sequence length<strong id="seqLenText">—</strong></div>
+        <div class="run-fact">LR schedule<strong id="scheduleText">—</strong></div>
+        <div class="run-fact">Warmup<strong id="warmupText">—</strong></div>
+      </div>
+    </section>
+
+    <section class="metric-grid" aria-label="Key metrics">
+      <article class="metric-card"><div class="metric-label">Train CE · pulse 3</div><div class="metric-value green" id="trainCeValue">—</div><div class="metric-sub" id="trainCeSub">Final-pulse cross-entropy</div></article>
+      <article class="metric-card"><div class="metric-label">Validation CE</div><div class="metric-value purple" id="valCeValue">—</div><div class="metric-sub" id="valCeSub">Final-pulse validation</div></article>
+      <article class="metric-card"><div class="metric-label">Pulse refinement</div><div class="metric-value" id="gainValue">—</div><div class="metric-sub" id="gainSub">P1 → P3 validation gain</div></article>
+      <article class="metric-card"><div class="metric-label">Throughput</div><div class="metric-value cyan" id="throughputValue">—</div><div class="metric-sub" id="throughputSub">Tokens per second</div></article>
+      <article class="metric-card"><div class="metric-label">GPU utilization · MFU</div><div class="metric-value" id="mfuValue">—</div><div class="metric-sub" id="mfuSub">Model FLOPs utilization</div></article>
+      <article class="metric-card"><div class="metric-label">Peak VRAM</div><div class="metric-value" id="vramValue">—</div><div class="metric-sub" id="vramSub">Peak / total capacity</div></article>
+    </section>
+
+    <div class="content-grid">
+      <section class="panel">
+        <div class="panel-head">
+          <div><div class="kicker">Learning signal</div><h2>Loss convergence</h2><p class="panel-note">Final-pulse training CE against validation evaluations</p></div>
+          <div class="range-group" aria-label="Chart range">
+            <button class="range-btn" data-range="250" type="button">250</button>
+            <button class="range-btn active" data-range="1000" type="button">1k</button>
+            <button class="range-btn" data-range="all" type="button">All</button>
+          </div>
+        </div>
+        <div class="legend"><span><i></i>Train CE · P3</span><span class="val"><i></i>Validation CE</span><span class="aux"><i></i>Weighted train loss</span></div>
+        <div class="chart-wrap"><canvas id="lossChart" aria-label="Training and validation loss by step" role="img"></canvas><div class="chart-tooltip" id="lossTooltip"></div></div>
+        <div class="table-caption">Pulse loss · nats</div>
+        <div class="table-scroll"><table class="dense-table pulse-table">
+          <thead><tr><th>Pass</th><th>Depth</th><th>Train CE</th><th>Val CE</th><th>Val PPL</th><th>Δ CE</th></tr></thead>
+          <tbody id="pulseRows"><tr><td colspan="6" class="table-empty">Waiting for pulse metrics…</td></tr></tbody>
+        </table></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head"><div><div class="kicker">Automated checks</div><h2>Run health</h2><p class="panel-note">Threshold evaluation from the monitor API</p></div><span class="health-summary" id="healthSummary">—</span></div>
+        <div class="health-list" id="healthList"><div class="empty">Waiting for health telemetry…</div></div>
+        <p class="panel-footnote">Values and thresholds are reported by <code>/api/health</code>.</p>
+      </section>
+    </div>
+
+    <div class="secondary-grid">
+      <section class="panel">
+        <div class="panel-head"><div><div class="kicker">Compute / optimizer</div><h2>Runtime signals</h2><p class="panel-note">Throughput trend and current step diagnostics</p></div><span class="health-summary" id="throughputRange">—</span></div>
+        <div class="chart-wrap compact"><canvas id="throughputChart" aria-label="Training throughput by step" role="img"></canvas><div class="chart-tooltip" id="throughputTooltip"></div></div>
+        <div class="table-scroll"><table class="dense-table runtime-table">
+          <tbody>
+            <tr><th>Gradient norms</th><td id="gradSignal">—</td><th>Clip rate</th><td id="clipSignal">—</td></tr>
+            <tr><th>Learning rates</th><td id="lrSignal">—</td><th>GPU step</th><td id="stepSignal">—</td></tr>
+            <tr><th>Memory</th><td id="memSignal">—</td><th>Compute</th><td id="computeSignal">—</td></tr>
+            <tr><th>Time / token</th><td id="tokenTimeSignal">—</td><th>Optimizer</th><td>Muon + AdamW</td></tr>
+          </tbody>
+        </table></div>
+      </section>
+      <section class="panel">
+        <div class="panel-head"><div><div class="kicker">Sparse routing</div><h2>Expert load balance</h2><p class="panel-note" id="routingNote">Ideal share — · watch >15% · bars show current expert_pcts</p></div><span class="health-summary" id="expertCount">— experts</span></div>
+        <div class="routing-summary">
+          <div class="routing-stat">Reported max share<strong id="worstShare">—</strong></div>
+          <div class="routing-stat">Token drops<strong id="dropRate">—</strong></div>
+          <div class="routing-stat">Max router bias<strong id="routerBias">—</strong></div>
+          <div class="routing-stat">Capacity<strong id="moeCapacity">—</strong></div>
+          <div class="routing-stat">Confidence<strong id="routerConfidence">—</strong></div>
+          <div class="routing-stat">Anchor mix λ<strong id="anchorMix">—</strong></div>
+        </div>
+        <div class="scale-summary"><span>Residual scale <strong id="residualScale">—</strong></span><span>Routed scale <strong id="routedScale">—</strong></span></div>
+        <div class="expert-list" id="expertList"><div class="empty">Waiting for routing telemetry…</div></div>
+        <div class="table-caption">Token drops by recurrent pass</div>
+        <table class="dense-table drops-table"><thead><tr><th>Pass</th><th>Assigned tokens</th><th>Drop rate</th></tr></thead><tbody id="dropRows"><tr><td colspan="3" class="table-empty">—</td></tr></tbody></table>
+      </section>
+    </div>
+
+    <div class="secondary-grid">
+      <section class="panel">
+        <div class="panel-head"><div><div class="kicker">Run timeline</div><h2>Recent activity</h2><p class="panel-note">Validation evaluations, checkpoints, and notes</p></div><span class="health-summary" id="eventCount">—</span></div>
+        <div class="activity-list" id="activityList"><div class="empty">Waiting for timeline events…</div></div>
+      </section>
+      <section class="panel">
+        <div class="panel-head"><div><div class="kicker">Qualitative evals</div><h2>Capability probes</h2><p class="panel-note" id="probeMeta">Latest generated canaries</p></div></div>
+        <div class="probe-tabs" id="probeTabs"></div>
+        <div class="probe-label">Prompt</div><div class="probe-text" id="probePrompt">Waiting for probe output…</div>
+        <div class="probe-label">Completion</div><div class="probe-text answer" id="probeCompletion">—</div>
+      </section>
+    </div>
+
+    <section class="model-strip" aria-label="Model and run configuration">
+      <div class="model-fact">Model configuration<strong id="modelParams">—</strong></div>
+      <div class="model-fact">Recurrent depth<strong id="modelDepth">—</strong></div>
+      <div class="model-fact">MoE routing<strong id="modelRouting">—</strong></div>
+      <div class="model-fact">Sequence / schedule<strong id="modelSchedule">—</strong></div>
+      <div class="model-fact">Attention<strong id="modelAttention">—</strong></div>
+      <div class="model-fact">Vocabulary / context<strong id="modelContext">—</strong></div>
+    </section>
+    <footer class="footer"><span>Preview · read-only · default dashboard unchanged</span><span id="apiOriginLabel">API · 127.0.0.1:7860</span></footer>
+  </main>
+  <script>
+    (() => {
+      const params = new URLSearchParams(location.search);
+      const API = params.get('api') || (location.protocol === 'http:' || location.protocol === 'https:' ? location.origin : 'http://127.0.0.1:7860');
+      const $ = id => document.getElementById(id);
+      const state = { status:null, health:null, history:[], events:[], milestones:[], range:1000, probeIndex:0 };
+      const nf = new Intl.NumberFormat('en-US');
+      const number = value => value === null || value === undefined || value === '' || !Number.isFinite(Number(value)) ? null : Number(value);
+      const fixed = (value, digits=2) => number(value) === null ? '—' : Number(value).toFixed(digits);
+      const int = value => number(value) === null ? '—' : nf.format(Math.round(Number(value)));
+      const compact = value => {
+        const n=number(value); if(n===null) return '—';
+        if(Math.abs(n)>=1e9) return `${(n/1e9).toFixed(2)}B`;
+        if(Math.abs(n)>=1e6) return `${(n/1e6).toFixed(1)}M`;
+        if(Math.abs(n)>=1e3) return `${(n/1e3).toFixed(1)}k`;
+        return nf.format(Math.round(n));
+      };
+      const pct = value => number(value) === null ? '—' : `${Number(value).toFixed(1)}%`;
+      const set = (id, value) => { if($(id)) $(id).textContent = value ?? '—'; };
+      const clampPct = value => Math.max(0, Math.min(100, number(value) || 0));
+
+      $('apiOriginLabel').textContent = `API · ${API.replace(/^https?:\/\//,'')}`;
+      try { document.documentElement.dataset.theme=localStorage.getItem('pulsar-professional-theme')||'light'; } catch { document.documentElement.dataset.theme='light'; }
+
+      async function getJson(path) {
+        const response = await fetch(`${API}${path}`, { cache:'no-store' });
+        if(!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+        return response.json();
+      }
+      function connection(online, text) {
+        $('connection').classList.toggle('live', online);
+        $('connection').classList.toggle('offline', !online);
+        set('connectionText', text);
+      }
+      function renderStatus(data) {
+        state.status = data;
+        const step=number(data.step)||0;
+        const target=number(data.active_target ?? data.target_steps ?? data.target_step ?? data.max_steps)||0;
+        const progress=target ? clampPct(step/target*100) : 0;
+        const runState=String(data.status||'running').toLowerCase();
+        const pillState=runState==='training'||runState==='running' ? 'running' : runState;
+        $('runState').className=`state-pill ${pillState}`;
+        set('runStateText',runState==='running'?'Training':runState[0].toUpperCase()+runState.slice(1));
+        set('currentStep',int(step)); set('targetStep',`/ ${int(target)}`);
+        set('runPercent',`${progress.toFixed(1)}%`);
+        $('runProgress').style.width=`${progress}%`;
+        const warmup=number(data.warmup_steps)||0;
+        $('warmupMark').style.left=`${clampPct(target ? warmup/target*100 : 0)}%`;
+        $('warmupMark').hidden=!warmup;
+        set('phaseText',data.phase||'Training'); set('elapsedText',`${data.elapsed_str||'—'} elapsed`);
+        set('etaText',data.eta_str||'—');
+
+        const seen=number(data.tokens_seen)||0, corpus=number(data.train_dataset_tokens)||0;
+        const corpusPct=corpus?clampPct(seen/corpus*100):0;
+        set('datasetText',`${compact(seen)} / ${compact(corpus)} tokens · ${corpusPct.toFixed(1)}%`);
+        $('datasetProgress').style.width=`${corpusPct}%`;
+        const shards=Array.isArray(data.train_shards)?data.train_shards.length:number(data.num_train_shards);
+        set('shardsText',shards===null?'—':`${int(shards)} active${shards===1?' shard':' shards'}`);
+        set('batchText',`${int(data.global_batch_tokens)} tokens / step`);
+        set('seqLenText',`${int(data.seq_len)} tokens`);
+        set('scheduleText',data.lr_schedule||'—');
+        set('warmupText',`${int(warmup)} steps`);
+
+        const pulses=Array.isArray(data.pulse_losses)?data.pulse_losses:[];
+        const valPulses=Array.isArray(data.val_pulse_losses)?data.val_pulse_losses:[];
+        const trainCe=number(pulses[pulses.length-1]) ?? number(data.train_ce_final);
+        const valCe=number(data.val_ce_final) ?? number(data.val_loss);
+        const gain=number(data.latent_gain) ?? (valPulses.length>=3 ? valPulses[0]-valPulses[valPulses.length-1] : null);
+        const p23=valPulses.length>=3 ? valPulses[1]-valPulses[2] : null;
+        set('trainCeValue',fixed(trainCe,4));
+        set('trainCeSub',`Weighted train loss ${fixed(data.train_loss,4)} · PPL ${fixed(data.train_ppl,2)}`);
+        set('valCeValue',fixed(valCe,4));
+        set('valCeSub',`PPL ${fixed(data.val_ppl,2)} · best ${fixed(data.best_val_loss,4)}`);
+        set('gainValue',gain===null?'—':`+${gain.toFixed(4)} nats`);
+        set('gainSub',p23===null?'Pulse 1 → 3 validation gain':`P2 → P3 adds ${p23.toFixed(4)} nats`);
+        set('throughputValue',number(data.tok_per_sec)===null?'—':`${compact(data.tok_per_sec)} tok/s`);
+        set('throughputSub',`${fixed(data.gpu_step_ms,0)} ms / step`);
+        set('mfuValue',number(data.mfu_pct)===null?'—':pct(data.mfu_pct));
+        set('mfuSub',`${fixed(data.achieved_tflops,1)} TFLOP/s achieved`);
+        set('vramValue',number(data.vram_peak)===null?'—':`${fixed(data.vram_peak,1)} GB`);
+        set('vramSub',`${fixed(data.vram_peak,1)} / ${fixed(data.total_vram_gb,1)} GB reported`);
+
+        const model=data.model_config||{};
+        const params=number(model.total_params);
+        set('modelSubtitle',`${model.model_name||'Pulsar'} · ${params?compact(params)+'-parameter ':''}recurrent mixture-of-experts`);
+        set('deviceChip',`GPU · ${data.device_name||'unknown'}`);
+        set('modelParams',`${compact(model.active_params)} active / ${compact(model.total_params)} total`);
+        set('modelDepth',`${int(model.n_core)} core layers × ${int(model.num_pulses||data.num_pulses)} passes = ${int(model.effective_layers)} effective`);
+        set('modelRouting',`${int(model.n_routed_experts)} routed · top-${int(model.top_k)}`);
+        set('modelSchedule',`${int(data.seq_len)} tokens · ${data.lr_schedule||'—'}`);
+        set('modelAttention',`d${int(model.d_model)} · ${int(model.n_heads)} heads / ${int(model.n_kv_heads)} KV`);
+        set('modelContext',`${int(model.vocab_size)} vocab · ${int(model.max_seq_len)} tokens`);
+        set('lastUpdated',`Updated ${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})}`);
+        renderPulseRows(pulses,valPulses,data.val_pulse_ppls||[],model.n_core);
+        renderRuntime(data);
+        renderRouting(data);
+      }
+
+      function renderPulseRows(train,val,ppl,core) {
+        const body=$('pulseRows'); body.replaceChildren();
+        for(let i=0;i<Math.max(3,train.length,val.length);i++) {
+          const values=[`P${i+1}`,number(core)?`${int(core*(i+1))}L`:'—',fixed(train[i],4),fixed(val[i],4),fixed(ppl[i],2),i?fixed(number(val[i-1])===null||number(val[i])===null?null:val[i-1]-val[i],4):'—'];
+          const row=document.createElement('tr');
+          values.forEach((text,index)=>{ const cell=document.createElement(index<2?'th':'td'); cell.textContent=text; row.append(cell); });
+          body.append(row);
+        }
+      }
+      function renderRuntime(data) {
+        const decimal=value=>number(value)===null?'—':String(Number(value));
+        set('gradSignal',`T ${fixed(data.grad_norm_total,3)} · M ${fixed(data.grad_norm_muon,3)} · A ${fixed(data.grad_norm_adam,3)}`);
+        set('lrSignal',`Muon ${decimal(data.lr_muon)} · Adam ${decimal(data.lr_adam)}`);
+        set('stepSignal',`${fixed(data.gpu_step_ms,0)} ms · F ${fixed(data.gpu_fwd_ms,0)} / B ${fixed(data.gpu_bwd_ms,0)} / O ${fixed(data.gpu_opt_ms,0)}`);
+        set('memSignal',`${fixed(data.vram_peak,1)} / ${fixed(data.vram_reserved,1)} / ${fixed(data.total_vram_gb,1)} GB`);
+        set('computeSignal',`${fixed(data.achieved_tflops,1)} / ${fixed(data.peak_tflops,0)} TF · ${pct(data.mfu_pct)}`);
+        set('tokenTimeSignal',`${fixed(data.time_per_token_us,2)} μs`);
+      }
+
+      const checkNames={run_state:'Run state',progress:'Progress',loss:'Learning gap',gradients:'Gradients',throughput:'Throughput / VRAM',moe_drops:'MoE token drops',moe_balance:'Expert balance',recurrent_loops:'Pulse gain',numerics:'Numerics'};
+      function healthDetail(key, item) {
+        switch(key) {
+          case 'run_state': return String(item.value??'—');
+          case 'progress': return String(item.value??'—');
+          case 'loss': return `gap ${fixed(item.loss_gap,4)} nats`;
+          case 'gradients': return `${(number(item.clip_fraction)*100||0).toFixed(1)}% clipped · norm ${fixed(item.grad_norm_total,2)}`;
+          case 'throughput': return `${compact(item.tok_per_sec)} tok/s · ${fixed(item.vram_peak,2)} GB VRAM`;
+          case 'moe_drops': return `${fixed(item.drop_rate_pct,2)}% dropped`;
+          case 'moe_balance': return `${fixed(item.worst_expert_share_pct,2)}% worst share`;
+          case 'recurrent_loops': return `gain ${fixed(item.latent_gain,4)} nats`;
+          case 'numerics': return item.nan_inf_found?'NaN / Inf found':'No NaN / Inf';
+          default: return String(item.value??'—');
+        }
+      }
+      function renderHealth(data) {
+        state.health=data;
+        const checks=data?.checks||{};
+        const gradients=checks.gradients||{};
+        const clip=number(gradients.clip_fraction);
+        set('clipSignal',clip===null?'—':`${(clip*100).toFixed(1)}% · clip ${fixed(gradients.clip_norm_threshold,1)}`);
+        const entries=Object.entries(checks);
+        const problems=entries.filter(([,v])=>String(v.status).toUpperCase()==='ALERT'||String(v.status).toUpperCase()==='WATCH');
+        const overall=String(data?.status||'OK').toUpperCase();
+        set('healthSummary',`${problems.length} flagged · ${entries.length} checks`);
+        const banner=$('healthBanner');
+        banner.hidden=overall==='OK'&&problems.length===0;
+        banner.classList.toggle('alert',overall==='ALERT'); banner.classList.toggle('watch',overall==='WATCH');
+        if(!banner.hidden) {
+          const count=problems.length||1;
+          set('bannerTitle',`Server health: ${overall} · ${count} flagged check${count===1?'':'s'}`);
+          const messages=problems.map(([key,item])=>`${checkNames[key]||key}: ${healthDetail(key,item)}${item.threshold?` (limit ${item.threshold})`:''}`);
+          set('bannerDetail',messages.join(' · ')||'The health endpoint reported a non-OK state.');
+        }
+        const list=$('healthList'); list.replaceChildren();
+        for(const [key,item] of entries) {
+          const level=String(item.status||'UNKNOWN').toLowerCase();
+          const row=document.createElement('div'); row.className='health-item';
+          row.title=`${level.toUpperCase()}${item.threshold?` · ${item.threshold}`:''}`;
+          const dot=document.createElement('i'); dot.className=`health-indicator ${['ok','watch','alert'].includes(level)?level:'unknown'}`;
+          const name=document.createElement('span'); name.className='health-name'; name.textContent=checkNames[key]||key;
+          const value=document.createElement('span'); value.className='health-value'; value.textContent=healthDetail(key,item);
+          row.append(dot,name,value);
+          if(item.threshold&&level!=='ok') { const threshold=document.createElement('small'); threshold.className='health-threshold'; threshold.textContent=`${level.toUpperCase()} · ${item.threshold}`; row.append(threshold); }
+          list.append(row);
+        }
+        if(!entries.length) list.innerHTML='<div class="empty">No health checks returned.</div>';
+      }
+      function renderRouting(data) {
+        const shares=Array.isArray(data.expert_pcts)?data.expert_pcts.map(number):[];
+        const model=data.model_config||{};
+        const count=shares.length||number(model.n_routed_experts)||0;
+        const ideal=count?100/count:0;
+        const max=Math.max(15,...shares.filter(v=>v!==null));
+        set('expertCount',`${count||'—'} experts`);
+        set('routingNote',`Ideal ${ideal?ideal.toFixed(2):'—'}% · watch >15% · bars show current expert_pcts`);
+        set('worstShare',`${fixed(data.worst_expert_share_pct,2)}%`);
+        set('dropRate',`${((number(data.moe_drop_rate)||0)*100).toFixed(2)}%`);
+        set('routerBias',fixed(data.router_max_bias,3));
+        set('moeCapacity',int(data.moe_capacity));
+        set('routerConfidence',fixed(data.router_confidence,3));
+        set('anchorMix',number(data.mix_lambda)===null?'—':`${(Number(data.mix_lambda)*100).toFixed(1)}%`);
+        set('residualScale',Array.isArray(data.pulse_res_scale_mean)?data.pulse_res_scale_mean.map(v=>fixed(v,3)).join(' / '):'—');
+        set('routedScale',Array.isArray(data.routed_scale_mean)?data.routed_scale_mean.map(v=>fixed(v,3)).join(' / '):'—');
+        const dropRows=$('dropRows'); dropRows.replaceChildren();
+        const drops=Array.isArray(data.moe_drop_per_pulse)?data.moe_drop_per_pulse:[];
+        for(const item of drops) {
+          const row=document.createElement('tr');
+          for(const value of [`P${int(item.pulse)}`,int(item.assigned),number(item.drop_rate)===null?'—':`${(Number(item.drop_rate)*100).toFixed(2)}%`]) {
+            const cell=document.createElement('td'); cell.textContent=value; row.append(cell);
+          }
+          dropRows.append(row);
+        }
+        if(!drops.length) { const row=document.createElement('tr'); row.innerHTML='<td colspan="3" class="table-empty">No per-pulse drop data.</td>'; dropRows.append(row); }
+        const list=$('expertList'); list.replaceChildren();
+        if(!shares.length) { list.innerHTML='<div class="empty">Waiting for routing telemetry…</div>'; return; }
+        for(let i=0;i<shares.length;i++) {
+          const share=shares[i];
+          const row=document.createElement('div'); row.className='expert-row';
+          if(share===Math.max(...shares.filter(v=>v!==null))) row.classList.add('worst');
+          const name=document.createElement('span'); name.textContent=`E${String(i).padStart(2,'0')}`;
+          const track=document.createElement('div'); track.className='expert-bar'; track.style.setProperty('--ideal',`${ideal/max*100}%`);
+          const fill=document.createElement('div'); fill.className='expert-fill'; fill.style.width=`${clampPct((share||0)/max*100)}%`; track.append(fill);
+          const value=document.createElement('span'); value.className='expert-value'; value.textContent=share===null?'—':`${share.toFixed(2)}%`;
+          row.append(name,track,value); list.append(row);
+        }
+      }
+
+      function drawChart(canvas, rows, series, kind, hoverIndex=null) {
+        const rect=canvas.getBoundingClientRect();
+        if(!rect.width||!rect.height) return;
+        const dpr=window.devicePixelRatio||1, w=rect.width, h=rect.height;
+        canvas.width=Math.round(w*dpr); canvas.height=Math.round(h*dpr);
+        const ctx=canvas.getContext('2d'); ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,w,h);
+        const css=getComputedStyle(document.documentElement);
+        const textColor=css.getPropertyValue('--dim').trim(), gridColor=css.getPropertyValue('--grid').trim();
+        const left=54,right=10,top=12,bottom=28,plotW=w-left-right,plotH=h-top-bottom;
+        canvas.__chart={rows,series,kind};
+        if(!rows.length) { ctx.fillStyle=textColor; ctx.font='11px '+getComputedStyle(document.body).fontFamily; ctx.textAlign='center'; ctx.fillText('Waiting for metrics…',w/2,h/2); return; }
+        const values=[];
+        for(const s of series) for(const row of rows) { const v=number(s.value(row)); if(v!==null) values.push(v); }
+        if(!values.length) { ctx.fillStyle=textColor; ctx.font='11px '+getComputedStyle(document.body).fontFamily; ctx.textAlign='center'; ctx.fillText('No values in selected range',w/2,h/2); return; }
+        let min=Math.min(...values), max=Math.max(...values);
+        const spread=max-min; const pad=spread?spread*.12:Math.max(Math.abs(max)*.02,.01);
+        min=kind==='throughput'?Math.max(0,min-pad):min-pad;
+        max+=pad;
+        const yOf=value=>top+(max-value)/(max-min||1)*plotH;
+        ctx.font=`9px ${css.getPropertyValue('--mono').trim()}`;
+        ctx.textBaseline='middle'; ctx.textAlign='right'; ctx.lineWidth=1;
+        for(let i=0;i<=4;i++) {
+          const y=top+plotH*i/4, value=max-(max-min)*i/4;
+          ctx.strokeStyle=gridColor; ctx.beginPath(); ctx.moveTo(left,y); ctx.lineTo(w-right,y); ctx.stroke();
+          ctx.fillStyle=textColor; ctx.fillText(kind==='throughput'?`${(value/1000).toFixed(value<10000?1:0)}k`:value.toFixed(3),left-8,y);
+        }
+        const indices=[0,Math.floor((rows.length-1)/2),rows.length-1];
+        ctx.textAlign='center'; ctx.textBaseline='top'; ctx.fillStyle=textColor;
+        for(const i of [...new Set(indices)]) {
+          const x=left+(rows.length===1?0:i/(rows.length-1)*plotW);
+          ctx.fillText(int(rows[i].step),x,h-bottom+9);
+        }
+        for(const s of series) {
+          ctx.beginPath(); let pen=false;
+          for(let i=0;i<rows.length;i++) {
+            const v=number(s.value(rows[i]));
+            if(v===null) { if(!s.connect) pen=false; continue; }
+            const x=left+(rows.length===1?0:i/(rows.length-1)*plotW), y=yOf(v);
+            if(!pen) { ctx.moveTo(x,y); pen=true; } else ctx.lineTo(x,y);
+          }
+          ctx.strokeStyle=s.color; ctx.lineWidth=s.width||1.8; ctx.setLineDash(s.dash||[]); ctx.stroke(); ctx.setLineDash([]);
+          if(s.points) for(let i=0;i<rows.length;i++) {
+            const v=number(s.value(rows[i])); if(v===null) continue;
+            const x=left+(rows.length===1?0:i/(rows.length-1)*plotW), y=yOf(v);
+            ctx.beginPath(); ctx.arc(x,y,2.6,0,Math.PI*2); ctx.fillStyle=s.color; ctx.fill();
+          }
+        }
+        if(hoverIndex!==null&&rows[hoverIndex]) {
+          const x=left+(rows.length===1?0:hoverIndex/(rows.length-1)*plotW);
+          ctx.beginPath(); ctx.moveTo(x,top); ctx.lineTo(x,top+plotH); ctx.strokeStyle=textColor; ctx.setLineDash([3,4]); ctx.stroke(); ctx.setLineDash([]);
+        }
+        if(!canvas.dataset.bound) {
+          canvas.dataset.bound='1';
+          canvas.addEventListener('pointermove',event=>{
+            const cfg=canvas.__chart; if(!cfg?.rows.length) return;
+            const box=canvas.getBoundingClientRect(), px=event.clientX-box.left;
+            const idx=Math.max(0,Math.min(cfg.rows.length-1,Math.round((px-left)/Math.max(1,box.width-left-right)*(cfg.rows.length-1))));
+            const tip=canvas.parentElement.querySelector('.chart-tooltip'), row=cfg.rows[idx];
+            const lines=[`STEP ${int(row.step)}`];
+            for(const item of cfg.series) { const v=number(item.value(row)); if(v!==null) lines.push(`${item.label}: ${cfg.kind==='throughput'?`${int(v)} tok/s`:v.toFixed(4)}`); }
+            tip.textContent=lines.join('\n'); tip.style.display='block';
+            tip.style.left=`${Math.max(5,Math.min(px+12,box.width-225))}px`; tip.style.top='8px';
+            drawChart(canvas,cfg.rows,cfg.series,cfg.kind,idx);
+          });
+          canvas.addEventListener('pointerleave',()=>{
+            const cfg=canvas.__chart; const tip=canvas.parentElement.querySelector('.chart-tooltip'); tip.style.display='none';
+            if(cfg) drawChart(canvas,cfg.rows,cfg.series,cfg.kind);
+          });
+        }
+      }
+
+      function renderCharts() {
+        let rows=state.history;
+        if(state.range!=='all') rows=rows.slice(-Number(state.range));
+        const styles=getComputedStyle(document.documentElement);
+        const color=name=>styles.getPropertyValue(name).trim();
+        const lossSeries=[
+          {label:'Train CE · P3',color:color('--accent'),value:r=>number(r.train_ce_final)??(Array.isArray(r.pulse_losses)?number(r.pulse_losses.at(-1)):null)},
+          {label:'Validation CE',color:color('--purple'),width:1.5,points:true,connect:true,value:r=>r.val_loss===null||r.val_loss===undefined?null:(number(r.val_pulse_losses?.at(-1))??number(r.val_ce_final)??number(r.val_loss))},
+          {label:'Weighted train loss',color:color('--dim'),width:1.2,dash:[4,4],value:r=>number(r.train_loss)}
+        ];
+        drawChart($('lossChart'),rows,lossSeries,'loss');
+        drawChart($('throughputChart'),rows,[{label:'Throughput',color:color('--cyan'),width:2,value:r=>number(r.tok_per_sec)}],'throughput');
+        set('throughputRange',`${rows.length} samples`);
+      }
+      function renderEvents(data) {
+        state.events=Array.isArray(data?.events)?data.events:[];
+        const list=$('activityList'); list.replaceChildren();
+        const recent=state.events.slice(-6).reverse();
+        set('eventCount',`${state.events.length} events`);
+        if(!recent.length) { list.innerHTML='<div class="empty">No timeline events yet.</div>'; return; }
+        for(const event of recent) {
+          const type=String(event.type||'event').toLowerCase();
+          const row=document.createElement('div'); row.className=`activity-item ${type}`;
+          const kind=document.createElement('span'); kind.className='activity-type'; kind.textContent=type;
+          const label=document.createElement('span'); label.className='activity-label'; label.textContent=event.label||event.text||'Run event';
+          const step=document.createElement('span'); step.className='activity-step'; step.textContent=`${int(event.step)}`;
+          row.append(kind,label,step); list.append(row);
+        }
+      }
+      function renderCanaries() {
+        const milestone=state.milestones.at(-1);
+        const canaries=state.status?.canaries?.length?state.status.canaries:(milestone?.canaries||[]);
+        const step=canaries.reduce((max,item)=>Math.max(max,number(item.generated_at_step)||0),number(milestone?.step)||0);
+        set('probeMeta',canaries.length?`${canaries.length} probes · step ${int(step)}`:'No canary output in this run');
+        const tabs=$('probeTabs');
+        const key=canaries.map(c=>`${c.id}:${c.generated_at_step}:${c.tag}`).join('|');
+        if(key!==state.probeKey) {
+          state.probeKey=key; tabs.replaceChildren(); state.probeIndex=0;
+          canaries.forEach((item,index)=>{
+            const button=document.createElement('button'); button.type='button'; button.className=`probe-tab${index===state.probeIndex?' active':''}`;
+            button.textContent=item.tag||item.category||`Probe ${index+1}`;
+            button.addEventListener('click',()=>{state.probeIndex=index;renderCanaries();});
+            tabs.append(button);
+          });
+        } else [...tabs.children].forEach((button,index)=>button.classList.toggle('active',index===state.probeIndex));
+        if(!canaries.length) { set('probePrompt','Waiting for probe output…'); set('probeCompletion','—'); return; }
+        state.probeIndex=Math.min(state.probeIndex,canaries.length-1);
+        [...tabs.children].forEach((button,index)=>button.classList.toggle('active',index===state.probeIndex));
+        const item=canaries[state.probeIndex], prompt=String(item.prompt||'');
+        let completion=String(item.completion||'');
+        if(prompt&&completion.startsWith(prompt)) completion=completion.slice(prompt.length).trim();
+        set('probePrompt',prompt||'—'); set('probeCompletion',completion||'No completion captured.');
+      }
+      async function loadStatus() {
+        try {
+          const data=await getJson('/api/status');
+          renderStatus(data); renderCanaries(); connection(true,'API live');
+        } catch(error) { connection(false,'API offline'); set('lastUpdated','Could not reach monitor API'); }
+      }
+      async function loadHealth() { try { renderHealth(await getJson('/api/health')); } catch { set('healthSummary','Unavailable'); } }
+      async function loadHistory() {
+        const last=state.range==='all'?0:Number(state.range);
+        try {
+          const data=await getJson(`/api/history?last_n=${last}&max_points=1800`);
+          state.history=Array.isArray(data.history)?data.history:[]; renderCharts();
+        } catch { state.history=[]; renderCharts(); }
+      }
+      async function loadTimeline() {
+        try { renderEvents(await getJson('/api/events')); } catch { set('eventCount','Unavailable'); }
+        try { const data=await getJson('/api/canaries'); state.milestones=Array.isArray(data.milestones)?data.milestones:[]; renderCanaries(); } catch {}
+      }
+      async function refreshAll() { await Promise.allSettled([loadStatus(),loadHealth(),loadHistory(),loadTimeline()]); }
+
+      $('refreshButton').addEventListener('click',refreshAll);
+      $('themeButton').addEventListener('click',()=>{
+        const light=document.documentElement.dataset.theme!=='light';
+        document.documentElement.dataset.theme=light?'light':'dark';
+        try { localStorage.setItem('pulsar-professional-theme',light?'light':'dark'); } catch {}
+        renderCharts();
+      });
+      document.querySelectorAll('.range-btn').forEach(button=>button.addEventListener('click',()=>{
+        document.querySelectorAll('.range-btn').forEach(item=>item.classList.toggle('active',item===button));
+        state.range=button.dataset.range; loadHistory();
+      }));
+      window.addEventListener('resize',renderCharts);
+      refreshAll();
+      setInterval(loadStatus,3000);
+      setInterval(loadHealth,15000);
+      setInterval(loadHistory,20000);
+      setInterval(loadTimeline,30000);
+    })();
+  </script>
+</body>
+</html>

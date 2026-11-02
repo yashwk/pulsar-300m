@@ -57,6 +57,7 @@ from src.model import (  # noqa: E402
     PulsarForCausalLM,
     apply_rotary_emb,
     _FusedSwiGLUFunction,
+    causal_depthwise_conv1d_k4,
 )
 
 
@@ -246,7 +247,11 @@ class PulsarInferenceEngine:
         B, T, _ = x.shape  # B=1, T=1
 
         # 1. Projections
+        if attn.canon_weight is not None:
+            x = x + causal_depthwise_conv1d_k4(x, attn.canon_weight)
         qkv = attn.wqkv(x)
+        if attn.wqkv_adapter is not None:
+            qkv = qkv + attn.wqkv_adapter(x, pulse_idx, num_pulses=self.model.cfg.default_pulses)
         q, k, v = qkv.split([attn.q_dim, attn.kv_dim, attn.kv_dim], dim=-1)
 
         q = q.view(B, T, attn.n_heads, attn.head_dim).transpose(1, 2)
@@ -299,7 +304,10 @@ class PulsarInferenceEngine:
         out = out * g.transpose(1, 2).unsqueeze(-1)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
 
-        return attn.wo(out), v_first
+        out_proj = attn.wo(out)
+        if attn.wo_adapter is not None:
+            out_proj = out_proj + attn.wo_adapter(out, pulse_idx, num_pulses=self.model.cfg.default_pulses)
+        return out_proj, v_first
 
     @torch.inference_mode()
     def _step_moe(self, block_idx: int, x: torch.Tensor, pulse_idx: int) -> torch.Tensor:
@@ -356,8 +364,18 @@ class PulsarInferenceEngine:
             if k == 0:
                 h_in = h_0_norm + step_emb
             else:
-                mix_k = torch.sigmoid(self.model.input_mix_logit[k]).to(h_pulse.dtype)
-                h_in = (1.0 - mix_k) * self.model.pulse_state_norm(h_pulse) + mix_k * h_0_norm + step_emb
+                r_norm = self.model.pulse_state_norm(h_pulse)
+                e_norm = h_0_norm
+                er_cat = torch.cat([e_norm, r_norm], dim=-1)
+                g_hidden = F.linear(er_cat, self.model.reinject_gate_down[k].to(er_cat.dtype))
+                mix_k = torch.sigmoid(
+                    F.linear(
+                        g_hidden,
+                        self.model.reinject_gate_up[k].to(er_cat.dtype),
+                        self.model.reinject_gate_bias[k].to(er_cat.dtype),
+                    )
+                )
+                h_in = torch.lerp(r_norm, e_norm, mix_k) + step_emb
 
             h_curr = h_in
             v_first = None
@@ -366,7 +384,11 @@ class PulsarInferenceEngine:
 
                 # Custom prefill attention that populates kv_cache
                 attn = block.attn
+                if attn.canon_weight is not None:
+                    attn_in = attn_in + causal_depthwise_conv1d_k4(attn_in, attn.canon_weight)
                 qkv = attn.wqkv(attn_in)
+                if attn.wqkv_adapter is not None:
+                    qkv = qkv + attn.wqkv_adapter(attn_in, k, num_pulses=self.model.cfg.default_pulses)
                 q, k_vec, v_vec = qkv.split([attn.q_dim, attn.kv_dim, attn.kv_dim], dim=-1)
 
                 q = q.view(B, T, attn.n_heads, attn.head_dim).transpose(1, 2)
@@ -407,7 +429,10 @@ class PulsarInferenceEngine:
                 g = torch.sigmoid(F.linear(attn_in, gate_w, gate_b))
                 attn_out = attn_out * g.transpose(1, 2).unsqueeze(-1)
                 attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, -1)
-                attn_out = attn.wo(attn_out)
+                attn_proj = attn.wo(attn_out)
+                if attn.wo_adapter is not None:
+                    attn_proj = attn_proj + attn.wo_adapter(attn_out, k, num_pulses=self.model.cfg.default_pulses)
+                attn_out = attn_proj
 
                 h_curr = h_curr + attn_out
 
@@ -445,8 +470,18 @@ class PulsarInferenceEngine:
             h_0_norm = h_0_norm_cached
             h_prev = h_pulse_prev
             step_emb = self.model.pulse_step_emb.weight[pulse_idx].to(h_0_norm.dtype).view(1, 1, -1)
-            mix_k = torch.sigmoid(self.model.input_mix_logit[pulse_idx]).to(h_prev.dtype)
-            h_in = (1.0 - mix_k) * self.model.pulse_state_norm(h_prev) + mix_k * h_0_norm + step_emb
+            r_norm = self.model.pulse_state_norm(h_prev)
+            e_norm = h_0_norm
+            er_cat = torch.cat([e_norm, r_norm], dim=-1)
+            g_hidden = F.linear(er_cat, self.model.reinject_gate_down[pulse_idx].to(er_cat.dtype))
+            mix_k = torch.sigmoid(
+                F.linear(
+                    g_hidden,
+                    self.model.reinject_gate_up[pulse_idx].to(er_cat.dtype),
+                    self.model.reinject_gate_bias[pulse_idx].to(er_cat.dtype),
+                )
+            )
+            h_in = torch.lerp(r_norm, e_norm, mix_k) + step_emb
 
         h_curr = h_in
         v_first = None

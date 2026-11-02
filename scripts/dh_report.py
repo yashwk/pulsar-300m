@@ -47,8 +47,18 @@ def measure(model: PulsarForCausalLM, x: torch.Tensor, num_pulses: int) -> list[
         if k == 0:
             h_in = h_0_norm + step_emb
         else:
-            mix_k = torch.sigmoid(model.input_mix_logit[k]).to(h_pulse.dtype)
-            h_in = (1.0 - mix_k) * model.pulse_state_norm(h_pulse) + mix_k * h_0_norm + step_emb
+            r_norm = model.pulse_state_norm(h_pulse)
+            e_norm = h_0_norm
+            er_cat = torch.cat([e_norm, r_norm], dim=-1)
+            g_hidden = F.linear(er_cat, model.reinject_gate_down[k].to(er_cat.dtype))
+            mix_k = torch.sigmoid(
+                F.linear(
+                    g_hidden,
+                    model.reinject_gate_up[k].to(er_cat.dtype),
+                    model.reinject_gate_bias[k].to(er_cat.dtype),
+                )
+            )
+            h_in = torch.lerp(r_norm, e_norm, mix_k) + step_emb
 
         h_curr = h_in
         for block in model.core:

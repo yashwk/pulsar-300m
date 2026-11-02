@@ -3161,3 +3161,325 @@ void adamw_bf16_sr_step_cuda(
         N
     );
 }
+
+// ------------------------------------------------------------------------
+// Causal Depthwise 1D Conv (Kernel Size = 4) with Residual
+// out[b, t, d] = x[b, t, d] + sum_{k=0..3} w[d, k] * (x[b, t - k, d] if t >= k else 0)
+// ------------------------------------------------------------------------
+
+__global__ void causal_depthwise_conv1d_k4_forward_vec8_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const float* __restrict__ weight,
+    __nv_bfloat16* __restrict__ y,
+    int64_t B, int64_t T, int64_t D
+) {
+    int64_t tok = blockIdx.x;
+    int64_t total_tokens = B * T;
+    if (tok >= total_tokens) return;
+
+    int64_t t = tok % T;
+    int v = threadIdx.x;
+    int num_vec = D / 8;
+    if (v >= num_vec) return;
+
+    int d_offset = v * 8;
+    int64_t tok_offset = tok * D + d_offset;
+
+    uint4 x0_u4 = *reinterpret_cast<const uint4*>(x + tok_offset);
+    const __nv_bfloat16* x0_bf = reinterpret_cast<const __nv_bfloat16*>(&x0_u4);
+
+    uint4 x1_u4, x2_u4, x3_u4;
+    const __nv_bfloat16 *x1_bf = nullptr, *x2_bf = nullptr, *x3_bf = nullptr;
+
+    if (t >= 1) {
+        x1_u4 = *reinterpret_cast<const uint4*>(x + (tok - 1) * D + d_offset);
+        x1_bf = reinterpret_cast<const __nv_bfloat16*>(&x1_u4);
+    }
+    if (t >= 2) {
+        x2_u4 = *reinterpret_cast<const uint4*>(x + (tok - 2) * D + d_offset);
+        x2_bf = reinterpret_cast<const __nv_bfloat16*>(&x2_u4);
+    }
+    if (t >= 3) {
+        x3_u4 = *reinterpret_cast<const uint4*>(x + (tok - 3) * D + d_offset);
+        x3_bf = reinterpret_cast<const __nv_bfloat16*>(&x3_u4);
+    }
+
+    __nv_bfloat16 out_bf[8];
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        int d = d_offset + k;
+        float x0 = __bfloat162float(x0_bf[k]);
+        float x1 = (x1_bf != nullptr) ? __bfloat162float(x1_bf[k]) : 0.0f;
+        float x2 = (x2_bf != nullptr) ? __bfloat162float(x2_bf[k]) : 0.0f;
+        float x3 = (x3_bf != nullptr) ? __bfloat162float(x3_bf[k]) : 0.0f;
+
+        float w0 = weight[d * 4 + 0];
+        float w1 = weight[d * 4 + 1];
+        float w2 = weight[d * 4 + 2];
+        float w3 = weight[d * 4 + 3];
+
+        float res = w0 * x0 + w1 * x1 + w2 * x2 + w3 * x3;
+        out_bf[k] = __float2bfloat16(res);
+    }
+
+    *reinterpret_cast<uint4*>(y + tok_offset) = *reinterpret_cast<uint4*>(out_bf);
+}
+
+__global__ void causal_depthwise_conv1d_k4_forward_scalar_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const float* __restrict__ weight,
+    __nv_bfloat16* __restrict__ y,
+    int64_t B, int64_t T, int64_t D
+) {
+    int64_t tok = blockIdx.x;
+    int64_t total_tokens = B * T;
+    if (tok >= total_tokens) return;
+    int64_t t = tok % T;
+
+    for (int64_t d = threadIdx.x; d < D; d += blockDim.x) {
+        float x0 = __bfloat162float(x[tok * D + d]);
+        float x1 = (t >= 1) ? __bfloat162float(x[(tok - 1) * D + d]) : 0.0f;
+        float x2 = (t >= 2) ? __bfloat162float(x[(tok - 2) * D + d]) : 0.0f;
+        float x3 = (t >= 3) ? __bfloat162float(x[(tok - 3) * D + d]) : 0.0f;
+
+        float w0 = weight[d * 4 + 0];
+        float w1 = weight[d * 4 + 1];
+        float w2 = weight[d * 4 + 2];
+        float w3 = weight[d * 4 + 3];
+
+        float res = w0 * x0 + w1 * x1 + w2 * x2 + w3 * x3;
+        y[tok * D + d] = __float2bfloat16(res);
+    }
+}
+
+__global__ void causal_depthwise_conv1d_k4_backward_dx_vec8_kernel(
+    const __nv_bfloat16* __restrict__ dout,
+    const float* __restrict__ weight,
+    __nv_bfloat16* __restrict__ dx,
+    int64_t B, int64_t T, int64_t D
+) {
+    int64_t tok = blockIdx.x;
+    int64_t total_tokens = B * T;
+    if (tok >= total_tokens) return;
+
+    int64_t t = tok % T;
+    int v = threadIdx.x;
+    int num_vec = D / 8;
+    if (v >= num_vec) return;
+
+    int d_offset = v * 8;
+    int64_t tok_offset = tok * D + d_offset;
+
+    uint4 d0_u4 = *reinterpret_cast<const uint4*>(dout + tok_offset);
+    const __nv_bfloat16* d0_bf = reinterpret_cast<const __nv_bfloat16*>(&d0_u4);
+
+    uint4 d1_u4, d2_u4, d3_u4;
+    const __nv_bfloat16 *d1_bf = nullptr, *d2_bf = nullptr, *d3_bf = nullptr;
+
+    if (t + 1 < T) {
+        d1_u4 = *reinterpret_cast<const uint4*>(dout + (tok + 1) * D + d_offset);
+        d1_bf = reinterpret_cast<const __nv_bfloat16*>(&d1_u4);
+    }
+    if (t + 2 < T) {
+        d2_u4 = *reinterpret_cast<const uint4*>(dout + (tok + 2) * D + d_offset);
+        d2_bf = reinterpret_cast<const __nv_bfloat16*>(&d2_u4);
+    }
+    if (t + 3 < T) {
+        d3_u4 = *reinterpret_cast<const uint4*>(dout + (tok + 3) * D + d_offset);
+        d3_bf = reinterpret_cast<const __nv_bfloat16*>(&d3_u4);
+    }
+
+    __nv_bfloat16 dx_bf[8];
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        int d = d_offset + k;
+        float dy0 = __bfloat162float(d0_bf[k]);
+        float dy1 = (d1_bf != nullptr) ? __bfloat162float(d1_bf[k]) : 0.0f;
+        float dy2 = (d2_bf != nullptr) ? __bfloat162float(d2_bf[k]) : 0.0f;
+        float dy3 = (d3_bf != nullptr) ? __bfloat162float(d3_bf[k]) : 0.0f;
+
+        float w0 = weight[d * 4 + 0];
+        float w1 = weight[d * 4 + 1];
+        float w2 = weight[d * 4 + 2];
+        float w3 = weight[d * 4 + 3];
+
+        float val = dy0 * w0 + dy1 * w1 + dy2 * w2 + dy3 * w3;
+        dx_bf[k] = __float2bfloat16(val);
+    }
+
+    *reinterpret_cast<uint4*>(dx + tok_offset) = *reinterpret_cast<uint4*>(dx_bf);
+}
+
+__global__ void causal_depthwise_conv1d_k4_backward_dx_scalar_kernel(
+    const __nv_bfloat16* __restrict__ dout,
+    const float* __restrict__ weight,
+    __nv_bfloat16* __restrict__ dx,
+    int64_t B, int64_t T, int64_t D
+) {
+    int64_t tok = blockIdx.x;
+    int64_t total_tokens = B * T;
+    if (tok >= total_tokens) return;
+    int64_t t = tok % T;
+
+    for (int64_t d = threadIdx.x; d < D; d += blockDim.x) {
+        float dy0 = __bfloat162float(dout[tok * D + d]);
+        float dy1 = (t + 1 < T) ? __bfloat162float(dout[(tok + 1) * D + d]) : 0.0f;
+        float dy2 = (t + 2 < T) ? __bfloat162float(dout[(tok + 2) * D + d]) : 0.0f;
+        float dy3 = (t + 3 < T) ? __bfloat162float(dout[(tok + 3) * D + d]) : 0.0f;
+
+        float w0 = weight[d * 4 + 0];
+        float w1 = weight[d * 4 + 1];
+        float w2 = weight[d * 4 + 2];
+        float w3 = weight[d * 4 + 3];
+
+        float val = dy0 * w0 + dy1 * w1 + dy2 * w2 + dy3 * w3;
+        dx[tok * D + d] = __float2bfloat16(val);
+    }
+}
+
+__global__ void causal_depthwise_conv1d_k4_backward_dw_kernel(
+    const __nv_bfloat16* __restrict__ dout,
+    const __nv_bfloat16* __restrict__ x,
+    float* __restrict__ dweight,
+    int64_t B, int64_t T, int64_t D
+) {
+    int64_t d = blockIdx.x;
+    if (d >= D) return;
+
+    int64_t total_tokens = B * T;
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    float sum2 = 0.0f;
+    float sum3 = 0.0f;
+
+    for (int64_t tok = threadIdx.x; tok < total_tokens; tok += blockDim.x) {
+        int64_t t = tok % T;
+        float dy = __bfloat162float(dout[tok * D + d]);
+        sum0 += dy * __bfloat162float(x[tok * D + d]);
+        if (t >= 1) sum1 += dy * __bfloat162float(x[(tok - 1) * D + d]);
+        if (t >= 2) sum2 += dy * __bfloat162float(x[(tok - 2) * D + d]);
+        if (t >= 3) sum3 += dy * __bfloat162float(x[(tok - 3) * D + d]);
+    }
+
+    sum0 = warp_reduce_sum(sum0);
+    sum1 = warp_reduce_sum(sum1);
+    sum2 = warp_reduce_sum(sum2);
+    sum3 = warp_reduce_sum(sum3);
+
+    __shared__ float s_sum0[32];
+    __shared__ float s_sum1[32];
+    __shared__ float s_sum2[32];
+    __shared__ float s_sum3[32];
+
+    int lane = threadIdx.x % WARP_SIZE;
+    int wid = threadIdx.x / WARP_SIZE;
+    if (lane == 0) {
+        s_sum0[wid] = sum0;
+        s_sum1[wid] = sum1;
+        s_sum2[wid] = sum2;
+        s_sum3[wid] = sum3;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        int num_warps = blockDim.x / WARP_SIZE;
+        float tot0 = 0.0f, tot1 = 0.0f, tot2 = 0.0f, tot3 = 0.0f;
+        for (int w = 0; w < num_warps; ++w) {
+            tot0 += s_sum0[w];
+            tot1 += s_sum1[w];
+            tot2 += s_sum2[w];
+            tot3 += s_sum3[w];
+        }
+        dweight[d * 4 + 0] = tot0;
+        dweight[d * 4 + 1] = tot1;
+        dweight[d * 4 + 2] = tot2;
+        dweight[d * 4 + 3] = tot3;
+    }
+}
+
+torch::Tensor causal_depthwise_conv1d_k4_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor weight
+) {
+    TORCH_CHECK(x.is_cuda() && weight.is_cuda(), "Inputs must be CUDA tensors");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
+    TORCH_CHECK(x.dtype() == torch::kBFloat16, "x must be bfloat16");
+    TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
+    TORCH_CHECK(x.dim() == 3, "x must be [B, T, D]");
+    TORCH_CHECK(weight.dim() == 2 && weight.size(1) == 4, "weight must be [D, 4]");
+
+    int64_t B = x.size(0);
+    int64_t T = x.size(1);
+    int64_t D = x.size(2);
+    TORCH_CHECK(weight.size(0) == D, "weight dim 0 must match D");
+
+    auto y = torch::empty_like(x);
+    int64_t total_tokens = B * T;
+    if (total_tokens == 0) return y;
+
+    const __nv_bfloat16* x_ptr = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<c10::BFloat16>());
+    const float* w_ptr = weight.data_ptr<float>();
+    __nv_bfloat16* y_ptr = reinterpret_cast<__nv_bfloat16*>(y.data_ptr<c10::BFloat16>());
+
+    if (D % 8 == 0 && D / 8 <= 1024) {
+        int threads = D / 8;
+        threads = ((threads + 31) / 32) * 32;
+        causal_depthwise_conv1d_k4_forward_vec8_kernel<<<total_tokens, threads>>>(
+            x_ptr, w_ptr, y_ptr, B, T, D
+        );
+    } else {
+        int threads = std::min((int64_t)256, D);
+        causal_depthwise_conv1d_k4_forward_scalar_kernel<<<total_tokens, threads>>>(
+            x_ptr, w_ptr, y_ptr, B, T, D
+        );
+    }
+    return y;
+}
+
+std::vector<torch::Tensor> causal_depthwise_conv1d_k4_backward_cuda(
+    torch::Tensor dout,
+    torch::Tensor x,
+    torch::Tensor weight
+) {
+    TORCH_CHECK(dout.is_cuda() && x.is_cuda() && weight.is_cuda(), "Inputs must be CUDA tensors");
+    TORCH_CHECK(dout.is_contiguous() && x.is_contiguous() && weight.is_contiguous(), "Inputs must be contiguous");
+    TORCH_CHECK(dout.dtype() == torch::kBFloat16 && x.dtype() == torch::kBFloat16, "dout and x must be bfloat16");
+    TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
+
+    int64_t B = x.size(0);
+    int64_t T = x.size(1);
+    int64_t D = x.size(2);
+
+    auto dx = torch::empty_like(x);
+    auto dweight = torch::zeros_like(weight);
+
+    int64_t total_tokens = B * T;
+    if (total_tokens == 0) return {dx, dweight};
+
+    const __nv_bfloat16* dout_ptr = reinterpret_cast<const __nv_bfloat16*>(dout.data_ptr<c10::BFloat16>());
+    const __nv_bfloat16* x_ptr = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<c10::BFloat16>());
+    const float* w_ptr = weight.data_ptr<float>();
+    __nv_bfloat16* dx_ptr = reinterpret_cast<__nv_bfloat16*>(dx.data_ptr<c10::BFloat16>());
+    float* dw_ptr = dweight.data_ptr<float>();
+
+    if (D % 8 == 0 && D / 8 <= 1024) {
+        int threads = D / 8;
+        threads = ((threads + 31) / 32) * 32;
+        causal_depthwise_conv1d_k4_backward_dx_vec8_kernel<<<total_tokens, threads>>>(
+            dout_ptr, w_ptr, dx_ptr, B, T, D
+        );
+    } else {
+        int threads = std::min((int64_t)256, D);
+        causal_depthwise_conv1d_k4_backward_dx_scalar_kernel<<<total_tokens, threads>>>(
+            dout_ptr, w_ptr, dx_ptr, B, T, D
+        );
+    }
+
+    int threads_dw = 256;
+    causal_depthwise_conv1d_k4_backward_dw_kernel<<<D, threads_dw>>>(
+        dout_ptr, x_ptr, dw_ptr, B, T, D
+    );
+
+    return {dx, dweight};
+}

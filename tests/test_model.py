@@ -22,7 +22,7 @@ import torch
 import torch.nn.functional as F
 
 from conftest import make_cfg, assert_close, needs_gpu, HAS_CUDA
-from src.model import PulsarConfig, PulsarForCausalLM, PulsarMoEMLP, compute_token_slots
+from src.model import PulsarConfig, PulsarForCausalLM, PulsarMoEMLP, compute_token_slots, LoopMatrixAdapter
 import src.model as M
 from src.train import generate_canary
 from data.prepare_shards import format_toucan_messages
@@ -48,7 +48,7 @@ def test_model_meta_summary_and_parameter_counts():
     assert summary["d_shared"] == 1024
     assert summary["d_expert"] == 512
     assert summary["active_ffn_dim"] == 3072  # 1024 shared + 4 * 512 routed
-    assert 280_000_000 <= summary["total_params"] <= 285_000_000
+    assert 280_000_000 <= summary["total_params"] <= 287_000_000
     assert 95_000_000 <= summary["non_embed_active_params"] <= 105_000_000
 
 
@@ -532,3 +532,58 @@ def test_generate_canary_compilation_unwrap():
     if hasattr(torch, "compile"):
         for blk in model.core:
             assert hasattr(blk, "_orig_mod"), "Compiled core block was not restored"
+
+
+def test_reinject_gate_init_and_gradient_flow():
+    """Rank-8 Linear Re-Injection Gate starts at exact 0.50 mix at Step 0 and flows gradients."""
+    cfg = make_cfg(d_model=128, n_core=2, d_expert=64, d_shared=128, n_routed_experts=4, top_k=2, default_pulses=3)
+    model = PulsarForCausalLM(cfg).float()
+
+    x = torch.randint(0, cfg.vocab_size, (2, 8))
+    y = torch.randint(0, cfg.vocab_size, (2, 8))
+
+    # 1. Step 0 identity: mix_k must be exact 0.50 since up=0, bias=0
+    _, loss, metrics = model(x, labels=y)
+    assert abs(metrics["input_mix_lambda"].item() - 0.50) < 1e-6, (
+        f"Step 0 mixture was {metrics['input_mix_lambda'].item()}, expected exact 0.50"
+    )
+
+    # 2. Gradient flow to reinject_gate_down, reinject_gate_up, reinject_gate_bias
+    with torch.no_grad():
+        model.reinject_gate_up.normal_(0, 0.02)
+
+    _, loss, _ = model(x, labels=y)
+    loss.backward()
+
+    assert model.reinject_gate_down.grad is not None and model.reinject_gate_down.grad.abs().sum() > 0
+    assert model.reinject_gate_up.grad is not None and model.reinject_gate_up.grad.abs().sum() > 0
+    assert model.reinject_gate_bias.grad is not None and model.reinject_gate_bias.grad.abs().sum() > 0
+
+
+def test_loop_matrix_adapter_flattened_gemm_parity_and_gradients():
+    """Flattened 2-GEMM Loop Matrix (q=8) matches explicit sum_j M[k, j] * (x @ A_j.T @ B_j.T) to < 1e-5."""
+    d_in, d_out, q, alpha, max_pulses = 128, 192, 8, 16.0, 3
+    adapter = LoopMatrixAdapter(d_in=d_in, d_out=d_out, q=q, alpha=alpha, max_pulses=max_pulses)
+
+    with torch.no_grad():
+        adapter.lora_B.normal_(0, 0.02)
+        adapter.loop_M.normal_(0, 0.5)
+
+    x = torch.randn(2, 8, d_in, requires_grad=True)
+
+    # Parity check across all pulses
+    for p in range(max_pulses):
+        fast = adapter(x, pulse_idx=p, num_pulses=max_pulses)
+        ref = torch.zeros(2, 8, d_out)
+        for j in range(max_pulses):
+            out_j = F.linear(F.linear(x, adapter.lora_A[j]), adapter.lora_B[j])
+            ref = ref + adapter.loop_M[p, j] * out_j
+        ref = ref * (alpha / q)
+        diff = (fast - ref).abs().max().item()
+        assert diff < 1e-5, f"Pulse {p} LoopMatrixAdapter diff {diff} exceeded 1e-5"
+
+    # Gradient check
+    fast.sum().backward()
+    assert adapter.lora_A.grad is not None and adapter.lora_A.grad.abs().sum() > 0
+    assert adapter.lora_B.grad is not None and adapter.lora_B.grad.abs().sum() > 0
+    assert adapter.loop_M.grad is not None and adapter.loop_M.grad.abs().sum() > 0

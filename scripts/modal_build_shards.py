@@ -47,6 +47,11 @@ def generate_single_shard(
     total_tokens: int = 500_000_000,
     batch_size: int = 2048,
     hf_token: str = None,
+    min_doc_tokens: int = 64,
+    max_doc_tokens: int = 2048,
+    use_jev: bool = False,
+    jev_max_usd: float = 0.60,
+    typesafe_api_key: str = None,
 ) -> dict:
     """Generates a single pretraining shard with isolated file paths and commits to volume."""
     import os
@@ -62,6 +67,9 @@ def generate_single_shard(
     if hf_token:
         env["HF_TOKEN"] = hf_token
         env["HUGGING_FACE_HUB_TOKEN"] = hf_token
+    if typesafe_api_key:
+        env["TYPESAFE_API_KEY"] = typesafe_api_key
+        env["JEV_API_KEY"] = typesafe_api_key
     env["HF_XET_HIGH_PERFORMANCE"] = "0"
     env["PYTHONUNBUFFERED"] = "1"
 
@@ -71,6 +79,9 @@ def generate_single_shard(
     print(f"\n{'='*70}")
     print(f"[Modal Worker] Generating Shard {shard_idx} (Stage {stage})")
     print(f"   Target Tokens: {total_tokens:,} | Batch Size: {batch_size}")
+    print(f"   Doc Length Bounds: [{min_doc_tokens}, {max_doc_tokens}] tokens")
+    if use_jev:
+        print(f"   TypeSafe Jev: Enabled | Per-Shard Worker Cap: ${jev_max_usd:.4f} USD")
     print(f"   Output: {train_path} & {val_path}")
     print(f"{'='*70}\n")
 
@@ -83,7 +94,13 @@ def generate_single_shard(
         "--val-path", val_path,
         "--tokenizer", "/root/pulsar_tokenizer",
         "--batch-size", str(batch_size),
+        "--min-doc-tokens", str(min_doc_tokens),
+        "--max-doc-tokens", str(max_doc_tokens),
     ]
+    if use_jev:
+        cmd.extend(["--use-jev", "--jev-max-usd", f"{jev_max_usd:.4f}"])
+        if typesafe_api_key:
+            cmd.extend(["--jev-api-key", typesafe_api_key])
 
     subprocess.run(cmd, env=env, check=True)
 
@@ -155,6 +172,11 @@ def main(
     parallel: bool = True,
     skip_existing: bool = True,
     hf_token: str = None,
+    min_doc_tokens: int = 64,
+    max_doc_tokens: int = 2048,
+    use_jev: bool = False,
+    jev_max_usd: float = 4.80,
+    typesafe_api_key: str = None,
 ):
     import os
     if not hf_token:
@@ -163,6 +185,9 @@ def main(
             with open(token_path, "r", encoding="utf-8") as f:
                 hf_token = f.read().strip()
                 print("[Modal Shard Builder] Successfully loaded HF_TOKEN from ~/.cache/huggingface/token")
+
+    if not typesafe_api_key:
+        typesafe_api_key = os.environ.get("TYPESAFE_API_KEY") or os.environ.get("JEV_API_KEY")
 
     if shards:
         shard_list = [int(s.strip()) for s in shards.split(",") if s.strip()]
@@ -191,8 +216,25 @@ def main(
         aggregate_manifests.remote(start_shard, end_shard)
         return
 
+    # Divide Jev USD budget evenly across active shard workers so total spend is strictly capped
+    num_workers = max(1, len(shard_list))
+    per_worker_jev_usd = jev_max_usd / num_workers
+    if use_jev:
+        print(f"[Modal Orchestrator] TypeSafe Jev enabled. Total Budget: ${jev_max_usd:.2f} | Workers: {num_workers} | Budget per Worker: ${per_worker_jev_usd:.4f}")
+
     tasks = [
-        (s, stage if stage is not None else (1 if s <= 7 else (2 if s <= 10 else 3)), total_tokens, batch_size, hf_token)
+        (
+            s,
+            stage if stage is not None else (1 if s <= 7 else (2 if s <= 10 else 3)),
+            total_tokens,
+            batch_size,
+            hf_token,
+            min_doc_tokens,
+            max_doc_tokens,
+            use_jev,
+            per_worker_jev_usd,
+            typesafe_api_key,
+        )
         for s in shard_list
     ]
 

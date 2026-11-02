@@ -409,6 +409,10 @@ class PulsarDualOptimizer:
                 or "lm_head" in name
                 or "pulse_step_emb" in name
                 or "input_mix_logit" in name
+                or "reinject_gate" in name
+                or "lora_" in name
+                or "loop_M" in name
+                or "canon_weight" in name
                 or "norm" in name
                 or "router" in name
                 or "v_resid_lambda" in name

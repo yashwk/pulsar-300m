@@ -27,6 +27,7 @@ import gc
 import json
 import os
 import random
+import re
 import time
 import numpy as np
 import pyarrow.parquet as pq
@@ -53,6 +54,44 @@ SPECIAL_TOKENS = [
 # GPT-4 / Llama-3 regex pattern with strict individual digit splitting (\p{N}{1})
 # and multi-space indentation preservation
 REGEX_PATTERN = r"""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}]+|\p{N}{1}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"""
+
+# Strict English/ASCII & Math/Box Unicode Gate
+FOREIGN_SCRIPT_RE = re.compile(
+    r"[\u0400-\u05FF\u0600-\u06FF\u0900-\u097F\u0E00-\u0E7F\u3000-\u9FFF\uAC00-\uD7AF]"
+)
+ALLOWED_MATH_BOX_UNICODE = set(
+    "≤≥≠≈×÷±√∑∏∫∞αβγδεζηθικλμνξοπρστυφχψωΓΔΘΛΞΠΣΦΨΩ⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿ₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎∈∉⊂⊆∪∩∀∃→←⇒⇔−–—‘’“”…•│─┌┐└┘├┤┬┴┼"
+)
+
+CHATBOT_FLUFF_PATTERNS = [
+    re.compile(r"^(certainly!?|sure!?|of course!?|absolutely!?)(?:,?\s*(?:here is|here's|i'd be happy to help|i can help|below is).*?[:\n]+)", re.IGNORECASE),
+    re.compile(r"^as an ai (?:language )?model,?\s*", re.IGNORECASE),
+    re.compile(r"^(?:hello|hi|hey)!(?:\s*how can i help you today\??)?\s*", re.IGNORECASE),
+    re.compile(r"^(?:i hope this helps!?|let me know if you need anything else!?)\s*$", re.IGNORECASE | re.MULTILINE),
+]
+
+
+def is_strict_english_technical(text: str, min_ascii_ratio: float = 0.985) -> bool:
+    """Fast-reject non-English/non-technical scripts and enforce printable ASCII + math symbols."""
+    if not text:
+        return False
+    if FOREIGN_SCRIPT_RE.search(text):
+        return False
+    allowed = sum(
+        1 for c in text
+        if (0x20 <= ord(c) <= 0x7E) or c in "\n\r\t" or c in ALLOWED_MATH_BOX_UNICODE
+    )
+    return (allowed / max(1, len(text))) >= min_ascii_ratio
+
+
+def strip_chatbot_fluff(text: str) -> str:
+    """Strip sycophantic greetings and boilerplate openings/closings from assistant turns."""
+    if not text:
+        return text
+    cleaned = text
+    for pattern in CHATBOT_FLUFF_PATTERNS:
+        cleaned = pattern.sub("", cleaned).lstrip()
+    return cleaned
 
 
 def format_row_to_text(row: dict) -> str:
@@ -166,7 +205,9 @@ def stream_parquet_to_file(fpath: str, out_file, max_bytes: int, batch_size: int
         for i in range(num_rows):
             row = {k: pydict[k][i] for k in keys}
             text = format_row_to_text(row)
-            if text and len(text) > 10:
+            if text:
+                text = strip_chatbot_fluff(text)
+            if text and len(text) > 10 and is_strict_english_technical(text):
                 t_bytes = len(text.encode("utf-8"))
                 out_file.write(text + "\n<|endoftext|>\n")
                 written_bytes += t_bytes

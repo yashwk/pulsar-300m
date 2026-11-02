@@ -1,3 +1,4 @@
+import inspect
 import json
 import math
 import os
@@ -21,6 +22,11 @@ class PulsarConfig:
     n_core: int = 8  # 8 core layers recurrently looped K times
     max_pulses: int = 8
     default_pulses: int = 3
+    reinject_gate_rank: int = 8  # Meta arXiv:2610.40325 rank-8 linear re-injection gate
+    loop_lora_rank: int = 8  # Meta arXiv:2610.40325 Loop Matrix adapter rank q
+    loop_lora_alpha: float = 16.0  # Meta arXiv:2610.40325 Loop Matrix adapter scaling alpha
+    use_canon_conv: bool = True  # Lightweight causal depthwise conv (k=4) vision
+    canon_kernel_size: int = 4
     base_seq_len: int = 1024  # Base pretraining context window
     max_seq_len: int = 32768  # 32k context support
     rope_theta_local: float = 10000.0  # 10k theta for 6 local high-precision layers
@@ -432,6 +438,11 @@ def _get_local_block_mask(B: int, H: int, T: int, window: int, device) -> object
 
 
 _FLEX_COMPILED = None
+try:
+    from torch.nn.attention.flex_attention import flex_attention
+    _FLEX_HAS_ENABLE_GQA = "enable_gqa" in inspect.signature(flex_attention).parameters
+except Exception:
+    _FLEX_HAS_ENABLE_GQA = False
 
 
 def _compiled_flex_attention():
@@ -453,21 +464,25 @@ def _compiled_flex_attention():
 
 
 def _local_attn_flex(q, k, v, window: int, enable_gqa: bool):
-    """Sliding-window attention via flex_attention (no dense mask, no T x T allocation).
-
-    This torch build's flex_attention does not support GQA, so K/V are expanded with
-    repeat_interleave when head counts differ. K/V are the small side (n_kv_heads), so
-    the expansion is cheap relative to the query side.
-    """
+    """Sliding-window attention via flex_attention with native GQA."""
     B, H, T, D = q.shape
-    KVH = k.shape[1]
-    if enable_gqa and KVH != H:
-        rep = H // KVH
-        k = torch.repeat_interleave(k, rep, dim=1)
-        v = torch.repeat_interleave(v, rep, dim=1)
-
     block_mask = _get_local_block_mask(B, H, T, window, q.device)
-    return _compiled_flex_attention()(q, k, v, block_mask=block_mask)
+    return _compiled_flex_attention()(q, k, v, block_mask=block_mask, enable_gqa=enable_gqa)
+
+
+_YARN_SCALE_CACHE: dict[tuple[int, int, torch.device, torch.dtype], torch.Tensor] = {}
+
+
+def _get_yarn_scale(base: int, T: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    key = (base, T, device, dtype)
+    scale = _YARN_SCALE_CACHE.get(key)
+    if scale is None:
+        pos = torch.arange(1, T + 1, device=device, dtype=torch.float32)
+        scale = (1.0 + 0.1 * torch.log(pos.clamp_min(base) / float(base))).view(1, 1, T, 1).to(dtype)
+        if len(_YARN_SCALE_CACHE) > 64:
+            _YARN_SCALE_CACHE.clear()
+        _YARN_SCALE_CACHE[key] = scale
+    return scale
 
 
 class RotaryEmbedding(nn.Module):
@@ -536,6 +551,74 @@ def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> t
     return torch.cat([x1 * cos_f - x2 * sin_f, x2 * cos_f + x1 * sin_f], dim=-1).to(x.dtype)
 
 
+def causal_depthwise_conv1d_k4_ref(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Reference causal depthwise 1D conv (kernel_size=4) in PyTorch.
+
+    x: [B, T, D]
+    weight: [D, 4]
+    Computes out[b, t, d] = sum_{k=0..3} weight[d, k] * (x[b, t - k, d] if t >= k else 0)
+    """
+    x_pad = F.pad(x.float().transpose(1, 2), (3, 0))
+    w_flipped = weight.unsqueeze(1).flip(-1)
+    y = F.conv1d(x_pad, w_flipped, groups=x.shape[2]).transpose(1, 2)
+    return y.to(x.dtype)
+
+
+class _CausalDepthwiseConv1dK4Function(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, weight: torch.Tensor):
+        ctx.save_for_backward(x, weight)
+        return pulsar_cuda.causal_depthwise_conv1d_k4_forward(x.contiguous(), weight.contiguous())
+
+    @staticmethod
+    def backward(ctx, dout: torch.Tensor):
+        x, weight = ctx.saved_tensors
+        return tuple(pulsar_cuda.causal_depthwise_conv1d_k4_backward(
+            dout.contiguous(), x.contiguous(), weight.contiguous()
+        ))
+
+
+def causal_depthwise_conv1d_k4(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    if x.is_cuda and x.dtype == torch.bfloat16 and hasattr(pulsar_cuda, "causal_depthwise_conv1d_k4_forward"):
+        return _CausalDepthwiseConv1dK4Function.apply(x, weight)
+    return causal_depthwise_conv1d_k4_ref(x, weight)
+
+
+class LoopMatrixAdapter(nn.Module):
+    """Meta arXiv:2610.40325 Loop Matrix Adapter (Section 3.3, Appendix F, Definition 12).
+
+    Delta W^(k) = (alpha / q) * sum_{j=0}^{K-1} M[k, j] * (B_j @ A_j)
+    Evaluated in 2 flat GEMMs without a Python loop over j:
+        A_all = self.lora_A[:K].to(x.dtype).reshape(K * q, d_in)
+        B_scaled = (self.loop_M[pulse_idx, :K].view(K, 1, 1).to(x.dtype) * self.lora_B[:K].to(x.dtype)).permute(1, 0, 2).reshape(d_out, K * q)
+        delta = F.linear(F.linear(x, A_all), B_scaled) * (alpha / q)
+    """
+
+    def __init__(self, d_in: int, d_out: int, q: int = 8, alpha: float = 16.0, max_pulses: int = 8):
+        super().__init__()
+        self.d_in = d_in
+        self.d_out = d_out
+        self.q = q
+        self.alpha = alpha
+        self.max_pulses = max_pulses
+
+        self.lora_A = nn.Parameter(torch.empty(max_pulses, q, d_in, dtype=torch.float32))
+        self.lora_B = nn.Parameter(torch.zeros(max_pulses, d_out, q, dtype=torch.float32))
+        self.loop_M = nn.Parameter(torch.eye(max_pulses, dtype=torch.float32))
+
+        nn.init.normal_(self.lora_A, mean=0.0, std=1.0 / math.sqrt(d_in))
+        # lora_B is initialized to zeros, so Delta W == 0 at Step 0, preserving initial activation variance
+
+    def forward(self, x: torch.Tensor, pulse_idx: int, num_pulses: int = 3) -> torch.Tensor:
+        K = num_pulses
+        q = self.q
+        A_all = self.lora_A[:K].to(x.dtype).reshape(K * q, self.d_in)
+        B_scaled = (
+            self.loop_M[pulse_idx, :K].view(K, 1, 1).to(x.dtype) * self.lora_B[:K].to(x.dtype)
+        ).permute(1, 0, 2).reshape(self.d_out, K * q)
+        return F.linear(F.linear(x, A_all), B_scaled) * (self.alpha / q)
+
+
 class PulsarAttention(nn.Module):
     def __init__(self, cfg: PulsarConfig, layer_idx: int):
         super().__init__()
@@ -555,6 +638,32 @@ class PulsarAttention(nn.Module):
         self.wqkv = nn.Linear(cfg.d_model, q_dim + 2 * kv_dim, bias=False)
         self.wo = nn.Linear(q_dim, cfg.d_model, bias=False)
         self.wo.is_residual_out = True
+
+        # Lightweight causal depthwise conv (k=4) vision before wqkv
+        if cfg.use_canon_conv:
+            self.canon_weight = nn.Parameter(torch.zeros(cfg.d_model, cfg.canon_kernel_size, dtype=torch.float32))
+        else:
+            self.canon_weight = None
+
+        # Meta arXiv:2610.40325 Loop Matrix Adapter on wqkv and wo
+        if cfg.loop_lora_rank > 0:
+            self.wqkv_adapter = LoopMatrixAdapter(
+                d_in=cfg.d_model,
+                d_out=q_dim + 2 * kv_dim,
+                q=cfg.loop_lora_rank,
+                alpha=cfg.loop_lora_alpha,
+                max_pulses=cfg.max_pulses,
+            )
+            self.wo_adapter = LoopMatrixAdapter(
+                d_in=q_dim,
+                d_out=cfg.d_model,
+                q=cfg.loop_lora_rank,
+                alpha=cfg.loop_lora_alpha,
+                max_pulses=cfg.max_pulses,
+            )
+        else:
+            self.wqkv_adapter = None
+            self.wo_adapter = None
 
         # Per-Pulse, Per-Head QK-RMSNorm weights in FP32
         self.q_norm_weight = nn.Parameter(torch.ones(cfg.max_pulses, cfg.n_heads, cfg.head_dim, dtype=torch.float32))
@@ -576,7 +685,12 @@ class PulsarAttention(nn.Module):
         v_first: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         B, T, _ = x.shape
+        if self.canon_weight is not None:
+            x = x + causal_depthwise_conv1d_k4(x, self.canon_weight)
+
         qkv = self.wqkv(x)
+        if self.wqkv_adapter is not None:
+            qkv = qkv + self.wqkv_adapter(x, pulse_idx, num_pulses=self.cfg.default_pulses)
         q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
 
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
@@ -623,10 +737,8 @@ class PulsarAttention(nn.Module):
         # Using T made a query's scaling depend on how many tokens followed it, so the
         # model was not prefix-invariant and a KV cache would have been incorrect.
         if not self.is_local and T > self.cfg.base_seq_len:
-            base = self.cfg.base_seq_len
-            pos = torch.arange(1, T + 1, device=q.device, dtype=torch.float32)
-            scale = 1.0 + 0.1 * torch.log(pos.clamp_min(base) / base)
-            q = q * scale.view(1, 1, T, 1).to(q.dtype)
+            scale = _get_yarn_scale(self.cfg.base_seq_len, T, q.device, q.dtype)
+            q = q * scale
 
         enable_gqa = (self.num_queries_per_kv > 1)
         if self.is_local and T > self.cfg.sliding_window:
@@ -662,7 +774,10 @@ class PulsarAttention(nn.Module):
         else:
             g = torch.sigmoid(gate_logits)  # [B, T, n_heads]
             out = (out.transpose(1, 2) * g.unsqueeze(-1)).reshape(B, T, -1)
-        return self.wo(out), v_first
+        out_proj = self.wo(out)
+        if self.wo_adapter is not None:
+            out_proj = out_proj + self.wo_adapter(out, pulse_idx, num_pulses=self.cfg.default_pulses)
+        return out_proj, v_first
 
 
 class _FusedSwiGLUFunction(torch.autograd.Function):
@@ -1374,6 +1489,10 @@ class PulsarForCausalLM(nn.Module):
         "bias",
         "router",
         "mix_logit",
+        "reinject_gate",
+        "lora_",
+        "loop_M",
+        "canon_weight",
         "res_scale",
         "routed_scale",
         "attn_gate",
@@ -1451,15 +1570,20 @@ class PulsarForCausalLM(nn.Module):
         # Gradient checkpointing for long context: recompute each core block in
         # backward instead of retaining activations. Off by default.
         self.grad_checkpoint = False
-        # Initialized to -1.3863 so sigmoid(-1.3863) = 0.200 exact
-        self.input_mix_logit = nn.Parameter(torch.full((cfg.max_pulses, cfg.d_model), -1.3863, dtype=torch.float32))
+        # Meta arXiv:2610.40325 Token-Dependent Rank-8 Linear Re-Injection Gate (50/50 Init)
+        self.reinject_gate_down = nn.Parameter(
+            torch.empty(cfg.max_pulses, cfg.reinject_gate_rank, 2 * cfg.d_model, dtype=torch.float32)
+        )
+        self.reinject_gate_up = nn.Parameter(
+            torch.zeros(cfg.max_pulses, cfg.d_model, cfg.reinject_gate_rank, dtype=torch.float32)
+        )
+        self.reinject_gate_bias = nn.Parameter(
+            torch.zeros(cfg.max_pulses, cfg.d_model, dtype=torch.float32)
+        )
+        nn.init.normal_(self.reinject_gate_down, mean=0.0, std=0.02)
 
-        # Harmonic Per-Pulse Learnable Residual Scale [max_pulses, d_model]
-        # Initialized harmonically: 1.0 / (k + 1.0) -> Pulse 1: 1.0, Pulse 2: 0.5, Pulse 3: 0.33
-        init_res_scales = torch.empty(cfg.max_pulses, cfg.d_model, dtype=torch.float32)
-        for k in range(cfg.max_pulses):
-            init_res_scales[k].fill_(1.0 / (k + 1.0))
-        self.pulse_res_scale = nn.Parameter(init_res_scales)
+        # Undamped Learnable Residual Scale (LatentLoop arXiv:2610.19975 & Meta Page 127)
+        self.pulse_res_scale = nn.Parameter(torch.ones(cfg.max_pulses, cfg.d_model, dtype=torch.float32))
 
         # Output projection head (tied with token embedding)
         self.final_norm = RMSNorm(cfg.d_model, cfg.rms_eps)
@@ -1699,6 +1823,7 @@ class PulsarForCausalLM(nn.Module):
             device=input_ids.device, dtype=torch.float32,
         )
         logits = None
+        last_mix_k = None
 
         for k in range(K):
             # 1. Unit-Normalized Prompt Anchor Mixing (h_0_norm cached across pulses)
@@ -1710,8 +1835,19 @@ class PulsarForCausalLM(nn.Module):
             if k == 0:
                 h_in = h_0_norm + step_emb
             else:
-                mix_k = torch.sigmoid(self.input_mix_logit[k]).to(h_pulse.dtype)
-                h_in = torch.lerp(self.pulse_state_norm(h_pulse), h_0_norm, mix_k) + step_emb
+                r_norm = self.pulse_state_norm(h_pulse)
+                e_norm = h_0_norm
+                er_cat = torch.cat([e_norm, r_norm], dim=-1)
+                g_hidden = F.linear(er_cat, self.reinject_gate_down[k].to(er_cat.dtype))
+                mix_k = torch.sigmoid(
+                    F.linear(
+                        g_hidden,
+                        self.reinject_gate_up[k].to(er_cat.dtype),
+                        self.reinject_gate_bias[k].to(er_cat.dtype),
+                    )
+                )
+                h_in = torch.lerp(r_norm, e_norm, mix_k) + step_emb
+                last_mix_k = mix_k
 
             # 2. Core 8-block recurrent pass
             h_curr = h_in
@@ -1847,7 +1983,11 @@ class PulsarForCausalLM(nn.Module):
             "worst_expert_share_pct": worst_expert_share,
             "mean_block_spread_pct": mean_block_spread,
             "max_block_spread_pct": max_block_spread,
-            "input_mix_lambda": torch.sigmoid(self.input_mix_logit[min(1, K - 1)]).detach().mean(),
+            "input_mix_lambda": (
+                last_mix_k.detach().mean()
+                if last_mix_k is not None
+                else torch.tensor(0.5, device=input_ids.device)
+            ),
             # Legacy scalar accessors
             "loss_pulse_1": pulse_loss_t[0] if pulse_loss_t else zero,
             "loss_pulse_2": pulse_loss_t[1] if len(pulse_loss_t) >= 2 else (pulse_loss_t[0] if pulse_loss_t else zero),

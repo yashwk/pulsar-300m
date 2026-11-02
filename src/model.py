@@ -46,6 +46,7 @@ class PulsarConfig:
     # Raised from 1e-4 because centring the logits and slowing the router reduced the
     # only remaining regulariser on router magnitude.
     router_z_loss_weight: float = 1e-3
+    router_balance_loss_weight: float = 0.01
     aux_loss_weight_1: float = 0.15
     aux_loss_weight_2: float = 0.25
     final_loss_weight: float = 0.60
@@ -552,16 +553,16 @@ def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> t
 
 
 def causal_depthwise_conv1d_k4_ref(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """Reference causal depthwise 1D conv (kernel_size=4) in PyTorch.
+    """Reference causal depthwise 1D conv (kernel_size=4) with fused residual in PyTorch.
 
     x: [B, T, D]
     weight: [D, 4]
-    Computes out[b, t, d] = sum_{k=0..3} weight[d, k] * (x[b, t - k, d] if t >= k else 0)
+    Computes out[b, t, d] = x[b, t, d] + sum_{k=0..3} weight[d, k] * (x[b, t - k, d] if t >= k else 0)
     """
     x_pad = F.pad(x.float().transpose(1, 2), (3, 0))
     w_flipped = weight.unsqueeze(1).flip(-1)
     y = F.conv1d(x_pad, w_flipped, groups=x.shape[2]).transpose(1, 2)
-    return y.to(x.dtype)
+    return (x + y).to(x.dtype)
 
 
 class _CausalDepthwiseConv1dK4Function(torch.autograd.Function):
@@ -599,8 +600,10 @@ class LoopMatrixAdapter(nn.Module):
         self.d_in = d_in
         self.d_out = d_out
         self.q = q
+        self.rank = q
         self.alpha = alpha
         self.max_pulses = max_pulses
+        self.default_pulses = 3
 
         self.lora_A = nn.Parameter(torch.empty(max_pulses, q, d_in, dtype=torch.float32))
         self.lora_B = nn.Parameter(torch.zeros(max_pulses, d_out, q, dtype=torch.float32))
@@ -608,6 +611,21 @@ class LoopMatrixAdapter(nn.Module):
 
         nn.init.normal_(self.lora_A, mean=0.0, std=1.0 / math.sqrt(d_in))
         # lora_B is initialized to zeros, so Delta W == 0 at Step 0, preserving initial activation variance
+
+    def get_merged_weight(self, base_weight: torch.Tensor, pulse_idx: int = 0, K: int | None = None) -> torch.Tensor:
+        """Merge rank-q adapter into base weight before F.linear for 750x lower HBM traffic:
+
+        W_merged = base_weight + (alpha / q) * sum_{j=0}^{K-1} M[pulse_idx, j] * (B_j @ A_j)
+        """
+        k_use = K if K is not None else self.default_pulses
+        q = self.rank
+        scale = self.alpha / q
+        A_all = self.lora_A[:k_use].to(base_weight.dtype).reshape(k_use * q, self.d_in)
+        B_scaled = (
+            (self.loop_M[pulse_idx, :k_use] * scale).view(k_use, 1, 1).to(base_weight.dtype)
+            * self.lora_B[:k_use].to(base_weight.dtype)
+        ).permute(1, 0, 2).reshape(self.d_out, k_use * q)
+        return torch.addmm(base_weight, B_scaled, A_all)
 
     def forward(self, x: torch.Tensor, pulse_idx: int, num_pulses: int = 3) -> torch.Tensor:
         K = num_pulses
@@ -686,11 +704,14 @@ class PulsarAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         B, T, _ = x.shape
         if self.canon_weight is not None:
-            x = x + causal_depthwise_conv1d_k4(x, self.canon_weight)
+            x = causal_depthwise_conv1d_k4(x, self.canon_weight)
 
-        qkv = self.wqkv(x)
-        if self.wqkv_adapter is not None:
-            qkv = qkv + self.wqkv_adapter(x, pulse_idx, num_pulses=self.cfg.default_pulses)
+        wqkv_w = (
+            self.wqkv_adapter.get_merged_weight(self.wqkv.weight, pulse_idx, K=self.cfg.default_pulses)
+            if self.wqkv_adapter is not None
+            else self.wqkv.weight
+        )
+        qkv = F.linear(x, wqkv_w, self.wqkv.bias)
         q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
 
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
@@ -741,7 +762,7 @@ class PulsarAttention(nn.Module):
             q = q * scale
 
         enable_gqa = (self.num_queries_per_kv > 1)
-        if self.is_local and T > self.cfg.sliding_window:
+        if self.is_local and T > max(self.cfg.sliding_window, 2048):
             # Sliding window. The old implementation materialised T x T int64 index
             # tensors (8.6 GB at T=32768) and a boolean mask (1.07 GB) just to express
             # "causal, within `window`" - impossible on the target 8 GB card, and it
@@ -774,9 +795,12 @@ class PulsarAttention(nn.Module):
         else:
             g = torch.sigmoid(gate_logits)  # [B, T, n_heads]
             out = (out.transpose(1, 2) * g.unsqueeze(-1)).reshape(B, T, -1)
-        out_proj = self.wo(out)
-        if self.wo_adapter is not None:
-            out_proj = out_proj + self.wo_adapter(out, pulse_idx, num_pulses=self.cfg.default_pulses)
+        wo_w = (
+            self.wo_adapter.get_merged_weight(self.wo.weight, pulse_idx, K=self.cfg.default_pulses)
+            if self.wo_adapter is not None
+            else self.wo.weight
+        )
+        out_proj = F.linear(out, wo_w, self.wo.bias)
         return out_proj, v_first
 
 
@@ -1259,6 +1283,19 @@ class PulsarMoEMLP(nn.Module):
                 self.pulse_assigned_accum[pulse_idx].add_(assigned)
                 self.capacity_last.fill_(float(capacity))
 
+        # DeepSeek-V3 lightweight differentiable sequence/batch load-balancing auxiliary loss
+        if self.cfg.router_balance_loss_weight > 0.0:
+            if valid is not None:
+                valid_f = valid.unsqueeze(-1).to(logits.dtype)
+                probs = torch.sigmoid(logits - logits.mean(dim=-1, keepdim=True)) * valid_f
+                P_e = probs.sum(dim=0) / valid.sum().clamp_min(1.0)
+            else:
+                probs = torch.sigmoid(logits - logits.mean(dim=-1, keepdim=True))
+                P_e = probs.mean(dim=0)
+            f_e = (bincounts / bincounts.sum().clamp_min(1.0)).detach()
+            bal_loss = self.cfg.router_balance_loss_weight * self.cfg.n_routed_experts * (f_e * P_e).sum()
+            z_loss = z_loss + bal_loss
+
         if (HAS_PULSAR_CUDA and x_flat.is_cuda and x_flat.dtype == torch.bfloat16
                 and not torch.compiler.is_compiling()
                 and hasattr(pulsar_cuda, "moe_dispatch_forward")):
@@ -1389,7 +1426,9 @@ class PulsarMoEMLP(nn.Module):
             k = num_pulses or self.cfg.default_pulses
             counts = self.expert_pulse_counts[:k]
             avg = counts.mean(dim=1, keepdim=True)
-            self.expert_bias[:k].add_(bias_lr * torch.sign(avg - counts))
+            diff = avg - counts
+            step = torch.where(diff.abs() > 0.01 * avg, torch.sign(diff), diff / (0.01 * avg.clamp_min(1.0)))
+            self.expert_bias[:k].add_(bias_lr * step)
             # Zero-center across expert dimension to prevent DC drift saturation
             self.expert_bias[:k].sub_(self.expert_bias[:k].mean(dim=1, keepdim=True))
             self.expert_bias[:k].clamp_(-1.0, 1.0)
@@ -1399,7 +1438,9 @@ class PulsarMoEMLP(nn.Module):
             self.expert_counts_accum.zero_()
         else:
             avg_count = self.expert_counts_accum.mean()
-            self.expert_bias.add_(bias_lr * torch.sign(avg_count - self.expert_counts_accum))
+            diff = avg_count - self.expert_counts_accum
+            step = torch.where(diff.abs() > 0.01 * avg_count, torch.sign(diff), diff / (0.01 * avg_count.clamp_min(1.0)))
+            self.expert_bias.add_(bias_lr * step)
             self.expert_bias.sub_(self.expert_bias.mean())
             self.expert_bias.clamp_(-1.0, 1.0)
             self.expert_counts_accum.zero_()

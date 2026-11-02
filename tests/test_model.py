@@ -446,7 +446,7 @@ def test_moe_padding_excluded_from_capacity():
 
 def test_zloss_gradient_and_scaling():
     """MoE router z-loss computes exact analytic gradients and scales with gradient accumulation."""
-    cfg = make_cfg(d_model=64, d_expert=64, n_routed_experts=8, top_k=2, max_pulses=2)
+    cfg = make_cfg(d_model=64, d_expert=64, n_routed_experts=8, top_k=2, max_pulses=2, router_balance_loss_weight=0.0)
     torch.manual_seed(0)
     mlp = PulsarMoEMLP(cfg).float()
 
@@ -587,3 +587,46 @@ def test_loop_matrix_adapter_flattened_gemm_parity_and_gradients():
     assert adapter.lora_A.grad is not None and adapter.lora_A.grad.abs().sum() > 0
     assert adapter.lora_B.grad is not None and adapter.lora_B.grad.abs().sum() > 0
     assert adapter.loop_M.grad is not None and adapter.loop_M.grad.abs().sum() > 0
+
+
+def test_loop_matrix_adapter_get_merged_weight_parity_and_gradients():
+    """F.linear(x, adapter.get_merged_weight(W)) matches F.linear(x, W) + adapter(x) exactly."""
+    d_in, d_out, q, alpha, max_pulses = 128, 192, 8, 16.0, 3
+    adapter = LoopMatrixAdapter(d_in=d_in, d_out=d_out, q=q, alpha=alpha, max_pulses=max_pulses)
+
+    with torch.no_grad():
+        adapter.lora_B.normal_(0, 0.02)
+        adapter.loop_M.normal_(0, 0.5)
+
+    base_weight = torch.randn(d_out, d_in, requires_grad=True)
+    x = torch.randn(2, 8, d_in, requires_grad=True)
+
+    for p in range(max_pulses):
+        merged_w = adapter.get_merged_weight(base_weight, pulse_idx=p, K=max_pulses)
+        out_merged = F.linear(x, merged_w)
+        out_separate = F.linear(x, base_weight) + adapter(x, pulse_idx=p, num_pulses=max_pulses)
+        diff = (out_merged - out_separate).abs().max().item()
+        assert diff < 5e-5, f"Pulse {p} merged weight output diff {diff} exceeded 5e-5"
+
+    out_merged.sum().backward()
+    assert base_weight.grad is not None and base_weight.grad.abs().sum() > 0
+    assert adapter.lora_A.grad is not None and adapter.lora_A.grad.abs().sum() > 0
+    assert adapter.lora_B.grad is not None and adapter.lora_B.grad.abs().sum() > 0
+    assert adapter.loop_M.grad is not None and adapter.loop_M.grad.abs().sum() > 0
+
+
+def test_router_balance_loss_gradient():
+    """DeepSeek-V3 sequence balance loss exerts restoring gradients on router_weight."""
+    cfg = make_cfg(d_model=64, d_expert=64, n_routed_experts=8, top_k=2, max_pulses=2, router_z_loss_weight=0.0, router_balance_loss_weight=0.01)
+    torch.manual_seed(42)
+    mlp = PulsarMoEMLP(cfg).float()
+
+    N = 32
+    x = torch.randn(1, N, cfg.d_model)
+    _, total_loss, _, bincounts = mlp(x, pulse_idx=0)
+    total_loss.backward()
+
+    assert mlp.router_weight.grad is not None
+    grad = mlp.router_weight.grad[0]
+    assert grad.abs().sum() > 0
+    assert torch.isfinite(grad).all()

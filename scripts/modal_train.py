@@ -47,6 +47,7 @@ image = (
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
         "TORCHINDUCTOR_CACHE_DIR": "/checkpoints/.inductor_cache",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+        "TRITON_DEFAULT_FP_FUSION": "1",
         "PYTHONUNBUFFERED": "1",
     })
     .add_local_dir("src", remote_path="/root/src")
@@ -415,7 +416,7 @@ def main(
     }
 
     selected_gpu = gpu.upper()
-    print(f"\n[Modal Orchestrator] Target GPU: {selected_gpu} | Target Step: {target_step} | MBS: {mbs}")
+    print(f"\n[Modal Orchestrator] Target GPU: {selected_gpu} | Target Step: {effective_target_step} | MBS: {mbs}")
 
     fn_map = {
         "B300": train_remote_b300,

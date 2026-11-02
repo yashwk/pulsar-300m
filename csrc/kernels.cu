@@ -3218,7 +3218,7 @@ __global__ void causal_depthwise_conv1d_k4_forward_vec8_kernel(
         float w2 = weight[d * 4 + 2];
         float w3 = weight[d * 4 + 3];
 
-        float res = w0 * x0 + w1 * x1 + w2 * x2 + w3 * x3;
+        float res = x0 + (w0 * x0 + w1 * x1 + w2 * x2 + w3 * x3);
         out_bf[k] = __float2bfloat16(res);
     }
 
@@ -3247,7 +3247,7 @@ __global__ void causal_depthwise_conv1d_k4_forward_scalar_kernel(
         float w2 = weight[d * 4 + 2];
         float w3 = weight[d * 4 + 3];
 
-        float res = w0 * x0 + w1 * x1 + w2 * x2 + w3 * x3;
+        float res = x0 + (w0 * x0 + w1 * x1 + w2 * x2 + w3 * x3);
         y[tok * D + d] = __float2bfloat16(res);
     }
 }
@@ -3303,7 +3303,7 @@ __global__ void causal_depthwise_conv1d_k4_backward_dx_vec8_kernel(
         float w2 = weight[d * 4 + 2];
         float w3 = weight[d * 4 + 3];
 
-        float val = dy0 * w0 + dy1 * w1 + dy2 * w2 + dy3 * w3;
+        float val = dy0 + (dy0 * w0 + dy1 * w1 + dy2 * w2 + dy3 * w3);
         dx_bf[k] = __float2bfloat16(val);
     }
 
@@ -3332,7 +3332,7 @@ __global__ void causal_depthwise_conv1d_k4_backward_dx_scalar_kernel(
         float w2 = weight[d * 4 + 2];
         float w3 = weight[d * 4 + 3];
 
-        float val = dy0 * w0 + dy1 * w1 + dy2 * w2 + dy3 * w3;
+        float val = dy0 + (dy0 * w0 + dy1 * w1 + dy2 * w2 + dy3 * w3);
         dx[tok * D + d] = __float2bfloat16(val);
     }
 }

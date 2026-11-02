@@ -13,6 +13,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Optimize PyTorch CUDA caching allocator to use virtual memory expandable segments (prevents fragmentation OOMs)
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# Explicitly enable Triton floating point fusion (FMA instructions) for optimal kernel performance and to eliminate warning
+os.environ["TRITON_DEFAULT_FP_FUSION"] = "1"
 
 import numpy as np
 import torch

@@ -248,10 +248,13 @@ class PulsarInferenceEngine:
 
         # 1. Projections
         if attn.canon_weight is not None:
-            x = x + causal_depthwise_conv1d_k4(x, attn.canon_weight)
-        qkv = attn.wqkv(x)
-        if attn.wqkv_adapter is not None:
-            qkv = qkv + attn.wqkv_adapter(x, pulse_idx, num_pulses=self.model.cfg.default_pulses)
+            x = causal_depthwise_conv1d_k4(x, attn.canon_weight)
+        wqkv_w = (
+            attn.wqkv_adapter.get_merged_weight(attn.wqkv.weight, pulse_idx, K=self.model.cfg.default_pulses)
+            if attn.wqkv_adapter is not None
+            else attn.wqkv.weight
+        )
+        qkv = F.linear(x, wqkv_w, attn.wqkv.bias)
         q, k, v = qkv.split([attn.q_dim, attn.kv_dim, attn.kv_dim], dim=-1)
 
         q = q.view(B, T, attn.n_heads, attn.head_dim).transpose(1, 2)
@@ -304,9 +307,12 @@ class PulsarInferenceEngine:
         out = out * g.transpose(1, 2).unsqueeze(-1)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
 
-        out_proj = attn.wo(out)
-        if attn.wo_adapter is not None:
-            out_proj = out_proj + attn.wo_adapter(out, pulse_idx, num_pulses=self.model.cfg.default_pulses)
+        wo_w = (
+            attn.wo_adapter.get_merged_weight(attn.wo.weight, pulse_idx, K=self.model.cfg.default_pulses)
+            if attn.wo_adapter is not None
+            else attn.wo.weight
+        )
+        out_proj = F.linear(out, wo_w, attn.wo.bias)
         return out_proj, v_first
 
     @torch.inference_mode()
@@ -385,10 +391,13 @@ class PulsarInferenceEngine:
                 # Custom prefill attention that populates kv_cache
                 attn = block.attn
                 if attn.canon_weight is not None:
-                    attn_in = attn_in + causal_depthwise_conv1d_k4(attn_in, attn.canon_weight)
-                qkv = attn.wqkv(attn_in)
-                if attn.wqkv_adapter is not None:
-                    qkv = qkv + attn.wqkv_adapter(attn_in, k, num_pulses=self.model.cfg.default_pulses)
+                    attn_in = causal_depthwise_conv1d_k4(attn_in, attn.canon_weight)
+                wqkv_w = (
+                    attn.wqkv_adapter.get_merged_weight(attn.wqkv.weight, k, K=self.model.cfg.default_pulses)
+                    if attn.wqkv_adapter is not None
+                    else attn.wqkv.weight
+                )
+                qkv = F.linear(attn_in, wqkv_w, attn.wqkv.bias)
                 q, k_vec, v_vec = qkv.split([attn.q_dim, attn.kv_dim, attn.kv_dim], dim=-1)
 
                 q = q.view(B, T, attn.n_heads, attn.head_dim).transpose(1, 2)
@@ -429,10 +438,12 @@ class PulsarInferenceEngine:
                 g = torch.sigmoid(F.linear(attn_in, gate_w, gate_b))
                 attn_out = attn_out * g.transpose(1, 2).unsqueeze(-1)
                 attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, -1)
-                attn_proj = attn.wo(attn_out)
-                if attn.wo_adapter is not None:
-                    attn_proj = attn_proj + attn.wo_adapter(attn_out, k, num_pulses=self.model.cfg.default_pulses)
-                attn_out = attn_proj
+                wo_w = (
+                    attn.wo_adapter.get_merged_weight(attn.wo.weight, k, K=self.model.cfg.default_pulses)
+                    if attn.wo_adapter is not None
+                    else attn.wo.weight
+                )
+                attn_out = F.linear(attn_out, wo_w, attn.wo.bias)
 
                 h_curr = h_curr + attn_out
 

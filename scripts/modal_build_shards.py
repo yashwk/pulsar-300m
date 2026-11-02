@@ -25,7 +25,7 @@ image = (
         "requests",
     )
     .env({
-        "HF_XET_HIGH_PERFORMANCE": "0",
+        "HF_HUB_ENABLE_HF_TRANSFER": "1",
         "PYTHONUNBUFFERED": "1",
     })
     .add_local_dir("data/pulsar_tokenizer", remote_path="/root/pulsar_tokenizer")
@@ -65,13 +65,13 @@ def generate_single_shard(
     print(f"[Modal Worker {shard_idx}] Verified tokenizer vocabulary size: {len(tok):,} tokens")
 
     env = os.environ.copy()
+    env["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
     if hf_token:
         env["HF_TOKEN"] = hf_token
         env["HUGGING_FACE_HUB_TOKEN"] = hf_token
     if typesafe_api_key:
         env["TYPESAFE_API_KEY"] = typesafe_api_key
         env["JEV_API_KEY"] = typesafe_api_key
-    env["HF_XET_HIGH_PERFORMANCE"] = "0"
     env["PYTHONUNBUFFERED"] = "1"
 
     train_path = f"/root/data/train_shard{shard_idx}.bin"
@@ -98,6 +98,8 @@ def generate_single_shard(
         "--min-doc-tokens", str(min_doc_tokens),
         "--max-doc-tokens", str(max_doc_tokens),
     ]
+    if hf_token:
+        cmd.extend(["--hf-token", hf_token])
     if use_jev:
         cmd.extend(["--use-jev", "--jev-max-usd", f"{jev_max_usd:.4f}"])
         if typesafe_api_key:

@@ -1063,12 +1063,14 @@ def make_substream_stream(
     batch_size: int = 512,
     base_seed: int = 20261023,
     stage: int = 1,
+    hf_token: str | None = None,
 ) -> Generator[str, None, None]:
     """Create a persistent generator streaming documents for a given sub-stream.
 
     All per-(stream, shard) randomness comes from a seeded ``random.Random`` so the
     rebuild is reproducible; the seed is recorded in the manifest.
     """
+    token = hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     stream_rng = random.Random(derive_stream_seed(substream_id, shard_idx, base_seed))
     if substream_id == "1A":
         # codeparrot/github-code-clean
@@ -1115,7 +1117,7 @@ def make_substream_stream(
 
     try:
         all_files = [
-            f for f in list_repo_files(repo_id, repo_type="dataset")
+            f for f in list_repo_files(repo_id, repo_type="dataset", token=token)
             if f.startswith(prefix) and f.endswith(".parquet")
         ]
     except Exception:
@@ -1126,7 +1128,7 @@ def make_substream_stream(
         repo_id = "nvidia/OpenMathReasoning"
         prefix = "data/cot-"
         all_files = [
-            f for f in list_repo_files(repo_id, repo_type="dataset")
+            f for f in list_repo_files(repo_id, repo_type="dataset", token=token)
             if f.startswith(prefix) and f.endswith(".parquet")
         ]
 
@@ -1191,7 +1193,7 @@ def make_substream_stream(
             fpath = None
             for attempt in range(5):
                 try:
-                    fpath = hf_hub_download(repo_id=repo_id, filename=fname, repo_type="dataset")
+                    fpath = hf_hub_download(repo_id=repo_id, filename=fname, repo_type="dataset", token=token)
                     break
                 except Exception as e:
                     if attempt == 4:
@@ -1446,6 +1448,7 @@ def build_shard(
     jev_api_url: str = "https://api.typesafe.ai/v1/systemone",
     jev_model: str = "jev-1.14.0",
     jev_concurrency: int = 32,
+    hf_token: str | None = None,
 ):
     """Generate a single curriculum shard with exact sub-stream token budgeting."""
     os.makedirs(os.path.dirname(train_path) or ".", exist_ok=True)
@@ -1509,6 +1512,7 @@ def build_shard(
             batch_size=batch_size,
             base_seed=base_seed,
             stage=stage,
+            hf_token=hf_token,
         )
         for s in substream_keys
     }
@@ -1712,6 +1716,7 @@ def main():
     parser.add_argument("--jev-api-url", type=str, default="https://api.typesafe.ai/v1/systemone", help="TypeSafe Jev API URL")
     parser.add_argument("--jev-model", type=str, default="jev-1.14.0", help="TypeSafe Jev model name")
     parser.add_argument("--jev-concurrency", type=int, default=32, help="TypeSafe Jev concurrent workers")
+    parser.add_argument("--hf-token", type=str, default=None, help="Hugging Face API Token")
     args = parser.parse_args()
 
     train_path = args.train_path or f"data/train_shard{args.shard_idx}.bin"
@@ -1735,6 +1740,7 @@ def main():
         jev_api_url=args.jev_api_url,
         jev_model=args.jev_model,
         jev_concurrency=args.jev_concurrency,
+        hf_token=args.hf_token,
     )
 
 

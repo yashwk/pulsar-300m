@@ -25,11 +25,6 @@ Universal Schema Formatter:
 """
 
 import os
-import warnings
-
-# Suppress noisy library deprecation and PyTorch missing warnings in CPU tokenizer worker
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=UserWarning)
 
 # Enable modern high-performance Xet transfer in huggingface_hub
 os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
@@ -63,7 +58,15 @@ from typing import Generator
 import numpy as np
 import pyarrow.parquet as pq
 from huggingface_hub import hf_hub_download, list_repo_files
-from transformers import AutoTokenizer
+
+try:
+    from tokenizers import Tokenizer
+except ImportError:
+    Tokenizer = None
+try:
+    from transformers import AutoTokenizer
+except ImportError:
+    AutoTokenizer = None
 
 RAW_DIR = "data/raw"
 MANIFEST_PATH = "data/shards_manifest.json"
@@ -94,11 +97,14 @@ def is_strict_english_technical(text: str, min_ascii_ratio: float = 0.985) -> bo
         return False
     if FOREIGN_SCRIPT_RE.search(text):
         return False
-    allowed = sum(
-        1 for c in text
-        if (0x20 <= ord(c) <= 0x7E) or c in "\n\r\t" or c in ALLOWED_MATH_BOX_UNICODE
-    )
-    return (allowed / max(1, len(text))) >= min_ascii_ratio
+    if text.isascii():
+        return True
+    ascii_len = len(text.encode("ascii", errors="ignore"))
+    total_len = len(text)
+    if (ascii_len / total_len) >= min_ascii_ratio:
+        return True
+    extra = sum(1 for c in text if c in ALLOWED_MATH_BOX_UNICODE)
+    return ((ascii_len + extra) / total_len) >= min_ascii_ratio
 
 
 def strip_chatbot_fluff(text: str) -> str:
@@ -1265,6 +1271,8 @@ def make_substream_stream(
                         out = str(row.get("output") or row.get("generated_solution") or "").strip()
                         if inp and out:
                             distilled = distill_code_cot(inp, out)
+                            if not distilled:
+                                distilled = format_cot_block(inp, out)
                             if distilled and is_strict_english_technical(distilled):
                                 formatted = distilled
 
@@ -1285,6 +1293,8 @@ def make_substream_stream(
                         ans = str(row.get("expected_answer") or "").strip()
                         if p and s:
                             distilled = distill_math_cot(p, s, expected_answer=ans)
+                            if not distilled:
+                                distilled = format_cot_block(p, s)
                             if distilled and is_strict_english_technical(distilled):
                                 formatted = distilled
 
@@ -1335,9 +1345,6 @@ def make_substream_stream(
 
                     if formatted and len(formatted.strip()) > 15:
                         yield formatted.strip()
-
-                del pydict
-                gc.collect()
 
             # Clean up consumed parquet file from container cache to prevent disk exhaustion
             del pf
@@ -1447,8 +1454,8 @@ def build_shard(
     tokenizer_path: str = "data/pulsar_tokenizer",
     batch_size: int = 256,
     base_seed: int = 20261023,
-    min_doc_tokens: int = 64,
-    max_doc_tokens: int = 2048,
+    min_doc_tokens: int = 16,
+    max_doc_tokens: int = 0,
     use_jev: bool = False,
     jev_max_usd: float = 4.80,
     jev_api_key: str | None = None,
@@ -1456,25 +1463,29 @@ def build_shard(
     jev_model: str = "jev-1.14.0",
     jev_concurrency: int = 32,
     hf_token: str | None = None,
+    status_file: str | None = None,
+    quiet: bool = False,
 ):
     """Generate a single curriculum shard with exact sub-stream token budgeting."""
     os.makedirs(os.path.dirname(train_path) or ".", exist_ok=True)
     os.makedirs(os.path.dirname(val_path) or ".", exist_ok=True)
 
-    print("==================================================================")
-    print(f"   PULSAR SHARD BUILDER: SHARD {shard_idx}/{num_shards - 1}   ")
-    stage_desc = (
-        'Stage 3 Long-Context 32k Cooldown' if stage >= 3
-        else ('Stage 2 High-Density Reasoning (65% CoT/Agentic, T=2048)' if stage == 2
-        else 'Stage 1 Foundation Refined (34% CoT / 51% Reasoning & Agentic, T=1024)')
-    )
-    print(f"   Stage {stage} | Target: {total_tokens:,} tokens | Mix: {stage_desc}")
-    print(f"   Traces: un-elided (cap {MAX_TRACE_CHARS:,} chars) | Seed: {base_seed} + per-stream sha256")
-    if use_jev:
-        print(f"   Quality Gate: TypeSafe Jev ({jev_model}) | Hard Cap: ${jev_max_usd:.2f} USD")
-    print("==================================================================")
+    if not quiet:
+        print("==================================================================")
+        print(f"   PULSAR SHARD BUILDER: SHARD {shard_idx}/{num_shards - 1}   ")
+        stage_desc = (
+            'Stage 3 Long-Context 32k Cooldown' if stage >= 3
+            else ('Stage 2 High-Density Reasoning (65% CoT/Agentic, T=2048)' if stage == 2
+            else 'Stage 1 Foundation Refined (34% CoT / 51% Reasoning & Agentic, T=1024)')
+        )
+        print(f"   Stage {stage} | Target: {total_tokens:,} tokens | Mix: {stage_desc}")
+        print(f"   Traces: un-elided (cap {MAX_TRACE_CHARS:,} chars) | Seed: {base_seed} + per-stream sha256")
+        if use_jev:
+            print(f"   Quality Gate: TypeSafe Jev ({jev_model}) | Hard Cap: ${jev_max_usd:.2f} USD")
+        print("==================================================================")
     free_gb, avail_ram = check_system_resources(min_disk_gb=3.0, min_ram_mb=400.0)
-    print(f"[Resource Guard] Available Disk: {free_gb:.2f} GB | Available RAM: {avail_ram:.1f} MB (PASS)")
+    if not quiet:
+        print(f"[Resource Guard] Available Disk: {free_gb:.2f} GB | Available RAM: {avail_ram:.1f} MB (PASS)")
 
     jev_gate = JevQualityGate(
         api_key=jev_api_key,
@@ -1485,10 +1496,24 @@ def build_shard(
         enabled=use_jev,
     )
 
-    tok = AutoTokenizer.from_pretrained(tokenizer_path)
-    assert len(tok) == 32768, f"Tokenizer vocab must be strictly 32768, got {len(tok)}"
-    eos_id = tok.eos_token_id if tok.eos_token_id is not None else 0
-    print(f"[Tokenizer] Vocab size: {len(tok):,}, EOS id: {eos_id}")
+    tok_json = os.path.join(tokenizer_path, "tokenizer.json")
+    if os.path.exists(tok_json) and Tokenizer is not None:
+        tok = Tokenizer.from_file(tok_json)
+        vocab_size = tok.get_vocab_size()
+        eos_id = tok.token_to_id("<|endoftext|>")
+        if eos_id is None:
+            eos_id = 0
+    elif AutoTokenizer is not None:
+        auto_tok = AutoTokenizer.from_pretrained(tokenizer_path)
+        tok = auto_tok._tokenizer
+        vocab_size = len(auto_tok)
+        eos_id = auto_tok.eos_token_id if auto_tok.eos_token_id is not None else 0
+    else:
+        raise RuntimeError("Neither tokenizers nor transformers is available")
+
+    assert vocab_size == 32768, f"Tokenizer vocab must be strictly 32768, got {vocab_size}"
+    if not quiet:
+        print(f"[Tokenizer] Vocab size: {vocab_size:,}, EOS id: {eos_id}")
 
     target_val = int(total_tokens * 0.05) if total_tokens >= 50_000_000 else 0
     target_train = total_tokens - target_val
@@ -1537,6 +1562,7 @@ def build_shard(
 
     t_start = time.time()
     last_print = t_start
+    last_status_write = t_start
     last_health_check = 0
 
     train_buf = []
@@ -1552,8 +1578,8 @@ def build_shard(
             for s in substream_keys:
                 if substream_tokens[s] >= target_quota[s]:
                     continue
-                # Fetch up to 2 documents per active substream for exact quota budgeting
-                for _ in range(2):
+                # Fetch up to 16 documents per active substream to saturate Rayon BPE threads
+                for _ in range(16):
                     if substream_tokens[s] >= target_quota[s]:
                         break
                     try:
@@ -1577,15 +1603,18 @@ def build_shard(
 
             # Parallel Rust BPE tokenization across all CPU cores via Rayon
             texts = [c[1] for c in batch_candidates]
-            enc_batch = [e.ids for e in tok._tokenizer.encode_batch(texts, add_special_tokens=False)]
+            enc_batch = [e.ids for e in tok.encode_batch(texts, add_special_tokens=False)]
 
             for (s, txt), enc in zip(batch_candidates, enc_batch):
                 if not enc:
                     continue
 
                 seq_len = len(enc) + 1  # includes eos_id
-                if not (min_doc_tokens <= seq_len <= max_doc_tokens):
+                if min_doc_tokens > 0 and seq_len < min_doc_tokens:
                     continue
+                if max_doc_tokens > 0 and seq_len > max_doc_tokens:
+                    enc = enc[:max_doc_tokens - 1]
+                    seq_len = len(enc) + 1
 
                 doc_idx += 1
 
@@ -1613,23 +1642,56 @@ def build_shard(
 
                 total_now = train_tokens + val_tokens
                 now = time.time()
-                if now - last_print >= 10.0 or total_now >= total_tokens:
+                if now - last_status_write >= 2.0 or total_now >= total_tokens:
                     dt = now - t_start
                     speed = total_now / max(dt, 0.01)
                     pct = 100.0 * total_now / total_tokens
                     eta_sec = (total_tokens - total_now) / max(1.0, speed)
 
-                    if total_now - last_health_check >= 10_000_000 or total_now >= total_tokens:
+                    if status_file:
+                        try:
+                            st_data = {
+                                "shard_idx": shard_idx,
+                                "stage": stage,
+                                "train_tokens": train_tokens,
+                                "val_tokens": val_tokens,
+                                "total_tokens": total_now,
+                                "target_tokens": total_tokens,
+                                "pct": pct,
+                                "speed": speed,
+                                "eta_sec": eta_sec,
+                                "docs": doc_idx,
+                                "status": "BUILDING",
+                                "updated_at": now,
+                            }
+                            tmp_sf = status_file + ".tmp"
+                            with open(tmp_sf, "w") as sf:
+                                json.dump(st_data, sf)
+                            os.replace(tmp_sf, status_file)
+                        except Exception:
+                            pass
+                    last_status_write = now
+
+                    if total_now - last_health_check >= 10_000_000:
                         curr_free_gb, curr_avail_ram = check_system_resources()
                         gc.collect()
                         last_health_check = total_now
 
-                    print(
-                        f"[Shard {shard_idx}] [{pct:5.1f}%] {total_now / 1e6:6.2f}M / {total_tokens / 1e6:.1f}M tokens "
-                        f"| Rate: {speed / 1e6:4.2f}M tok/s | ETA: {eta_sec / 60:4.1f}m | Docs: {doc_idx:,}",
-                        flush=True
-                    )
-                    last_print = now
+                    if not quiet and (now - last_print >= 5.0 or total_now >= total_tokens):
+                        if sys.stdout.isatty():
+                            print(
+                                f"\r[Shard {shard_idx}] [{pct:5.1f}%] {total_now / 1e6:6.2f}M / {total_tokens / 1e6:.1f}M tokens "
+                                f"| Rate: {speed / 1e6:4.2f}M tok/s | ETA: {eta_sec / 60:4.1f}m | Docs: {doc_idx:,}",
+                                end="",
+                                flush=True
+                            )
+                        else:
+                            print(
+                                f"[Shard {shard_idx}] [{pct:5.1f}%] {total_now / 1e6:6.2f}M / {total_tokens / 1e6:.1f}M tokens "
+                                f"| Rate: {speed / 1e6:4.2f}M tok/s | ETA: {eta_sec / 60:4.1f}m | Docs: {doc_idx:,}",
+                                flush=True
+                            )
+                        last_print = now
 
             if not progress_in_cycle:
                 break
@@ -1697,6 +1759,29 @@ def build_shard(
             base_seed=base_seed,
         )
 
+    if status_file:
+        try:
+            st_data = {
+                "shard_idx": shard_idx,
+                "stage": stage,
+                "train_tokens": train_tokens,
+                "val_tokens": val_tokens,
+                "total_tokens": total_done,
+                "target_tokens": total_tokens,
+                "pct": 100.0,
+                "speed": total_done / max(elapsed_total, 0.01),
+                "eta_sec": 0,
+                "docs": doc_idx,
+                "status": "COMPLETED",
+                "updated_at": time.time(),
+            }
+            tmp_sf = status_file + ".tmp"
+            with open(tmp_sf, "w") as sf:
+                json.dump(st_data, sf)
+            os.replace(tmp_sf, status_file)
+        except Exception:
+            pass
+
 
 # ==============================================================================
 # CLI Entrypoint
@@ -1716,8 +1801,8 @@ def main():
         "--seed", type=int, default=20261023,
         help="Base seed; per-(stream, shard) seeds are derived via sha256 and recorded in the manifest",
     )
-    parser.add_argument("--min-doc-tokens", type=int, default=64, help="Minimum tokens per document")
-    parser.add_argument("--max-doc-tokens", type=int, default=2048, help="Maximum tokens per document")
+    parser.add_argument("--min-doc-tokens", type=int, default=16, help="Minimum tokens per document")
+    parser.add_argument("--max-doc-tokens", type=int, default=0, help="Maximum tokens per document (0 for unlimited)")
     parser.add_argument("--use-jev", action="store_true", help="Enable TypeSafe Jev semantic quality gate")
     parser.add_argument("--jev-max-usd", type=float, default=4.80, help="Hard USD budget cap for Jev API calls")
     parser.add_argument("--jev-api-key", type=str, default=None, help="TypeSafe API Key")
@@ -1725,6 +1810,8 @@ def main():
     parser.add_argument("--jev-model", type=str, default="jev-1.14.0", help="TypeSafe Jev model name")
     parser.add_argument("--jev-concurrency", type=int, default=32, help="TypeSafe Jev concurrent workers")
     parser.add_argument("--hf-token", type=str, default=None, help="Hugging Face API Token")
+    parser.add_argument("--status-file", type=str, default=None, help="Path to write atomic JSON status telemetry")
+    parser.add_argument("--quiet", action="store_true", help="Suppress continuous stdout progress lines for static monitor")
     args = parser.parse_args()
 
     train_path = args.train_path or f"data/train_shard{args.shard_idx}.bin"
@@ -1749,6 +1836,8 @@ def main():
         jev_model=args.jev_model,
         jev_concurrency=args.jev_concurrency,
         hf_token=args.hf_token,
+        status_file=args.status_file,
+        quiet=args.quiet,
     )
 
 

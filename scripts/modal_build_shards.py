@@ -22,6 +22,7 @@ image = (
         "tiktoken",
         "numpy",
         "tqdm",
+        "requests",
     )
     .env({
         "HF_XET_HIGH_PERFORMANCE": "0",

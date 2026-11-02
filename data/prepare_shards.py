@@ -44,6 +44,12 @@ import tarfile
 import time
 import urllib.request
 import urllib.error
+try:
+    import requests
+    from requests.adapters import HTTPAdapter
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
 from concurrent.futures import ThreadPoolExecutor
 from typing import Generator
 
@@ -473,8 +479,69 @@ def distill_math_cot(problem: str, raw_solution: str, expected_answer: str = "")
 JEV_EVAL_SUBSTREAMS = {"1B", "2B", "4A", "4B", "5A", "5B"}
 
 
+def clean_doc_text(doc_text: str) -> str:
+    """Strip temporary internal metadata headers before tokenizer or Jev digest."""
+    m = re.match(r"^<!-- fineweb_score: [0-9.]+ -->\n?", doc_text)
+    if m:
+        return doc_text[m.end():]
+    return doc_text
+
+
+def is_auto_accepted(substream_id: str, doc_text: str) -> bool:
+    """Two-tier pre-filter: auto-accept obvious high-confidence winners for $0.00.
+
+    - "1B": Python code block that passes ast.parse() and has anti-rambling think trace.
+    - "2B": OpenMathInstruct-2 with concise think block (<= 1400 chars) and explicit \boxed{}.
+    - "4B": FineWeb-Edu with score >= 4.2 and >= 4 STEM/CS keywords.
+    """
+    if substream_id == "1B":
+        if "```python" in doc_text:
+            m = re.search(r"```python\s*\n(.*?)\n```", doc_text, re.DOTALL)
+            if m:
+                code = m.group(1).strip()
+                try:
+                    ast.parse(code)
+                    if "<|think|>" in doc_text and "<|/think|>" in doc_text:
+                        think_part = doc_text.split("<|think|>", 1)[1].split("<|/think|>", 1)[0]
+                        if len(BANNED_RAMBLE_RE.findall(think_part)) < 2:
+                            return True
+                    else:
+                        return True
+                except Exception:
+                    pass
+        return False
+
+    if substream_id == "2B":
+        if "<|think|>" in doc_text and "<|/think|>" in doc_text:
+            think_part = doc_text.split("<|think|>", 1)[1].split("<|/think|>", 1)[0]
+            if len(think_part.strip()) <= 1400 and "\\boxed{" in doc_text:
+                return True
+        return False
+
+    if substream_id == "4B":
+        score = 0.0
+        m = re.match(r"^<!-- fineweb_score: ([0-9.]+) -->\n?", doc_text)
+        if m:
+            score = float(m.group(1))
+            doc_text = doc_text[m.end():]
+        stem_count = len(STEM_RE.findall(doc_text))
+        if score >= 4.2 and stem_count >= 4:
+            return True
+        return False
+
+    return False
+
+
 class JevQualityGate:
-    """TypeSafe Jev (typesafe/jev-1.14 / jev-1.14.0) Semantic Quality Gate with Hard USD Budget Cap."""
+    """TypeSafe Jev (typesafe/jev-1.14 / jev-1.14.0) Semantic Quality Gate with Hard USD Budget Cap.
+
+    Features:
+    - Multi-document non-causal batching: up to 32 candidate document digests per single /v1/systemone API call.
+    - Persistent HTTP keep-alive session via requests.Session with connection pooling (HTTPAdapter).
+    - Resilient retry logic for HTTP 429 and 5xx (up to 3 retries with backoff / Retry-After).
+    - Circuit breaker tripped only on hard budget exhaustion ($0.60/shard), auth failure (401/402/403), or 5 consecutive failures.
+    - Two-tier pre-filter routing: $0.00 auto-accept for high-confidence winners (1B, 2B, 4B) to maximize budget coverage.
+    """
 
     def __init__(
         self,
@@ -482,7 +549,8 @@ class JevQualityGate:
         api_url: str = "https://api.typesafe.ai/v1/systemone",
         model: str = "jev-1.14.0",
         max_usd: float = 4.80,
-        concurrency: int = 32,
+        concurrency: int = 16,
+        batch_size: int = 32,
         enabled: bool = False,
     ):
         self.api_key = (
@@ -495,66 +563,43 @@ class JevQualityGate:
         self.model = os.environ.get("JEV_MODEL") or model
         self.max_usd = max_usd
         self.concurrency = concurrency
+        self.batch_size = batch_size
         self.enabled = enabled and bool(self.api_key)
         self.total_cost = 0.0
         self.circuit_broken = False
+        self.consecutive_failures = 0
         self.total_evaluated = 0
         self.total_passed = 0
-        self._executor = ThreadPoolExecutor(max_workers=concurrency) if self.enabled else None
+
+        if HAS_REQUESTS:
+            self._session = requests.Session()
+            adapter = HTTPAdapter(pool_connections=16, pool_maxsize=32)
+            self._session.mount("https://", adapter)
+            self._session.mount("http://", adapter)
+        else:
+            self._session = None
+
+        self._executor = ThreadPoolExecutor(max_workers=concurrency) if (self.enabled and concurrency > 1) else None
 
         if self.enabled:
-            print(f"[Jev Quality Gate] Initialized: URL={self.api_url} | Model={self.model} | Budget Cap=${self.max_usd:.2f} | Concurrency={self.concurrency}")
+            print(f"[Jev Quality Gate] Initialized: URL={self.api_url} | Model={self.model} | Budget Cap=${self.max_usd:.2f} | Batch Size={self.batch_size}")
 
-    def _compact_state(self, doc_text: str, max_chars: int = 1400) -> str:
-        """Create a compact state string (~350 tokens) to minimize Jev token cost."""
-        if len(doc_text) <= max_chars:
-            return doc_text
-        if "<|im_start|>assistant" in doc_text:
-            parts = doc_text.split("<|im_start|>assistant", 1)
+    def _compact_digest(self, doc_text: str, max_chars: int = 700) -> str:
+        """Create a compact document digest (<= 700 chars, ~175 tokens) for Jev batching."""
+        cleaned = clean_doc_text(doc_text)
+        if len(cleaned) <= max_chars:
+            return cleaned
+        if "<|im_start|>assistant" in cleaned:
+            parts = cleaned.split("<|im_start|>assistant", 1)
             prompt = parts[0]
             rest = parts[1]
-            avail = max_chars - len(prompt)
-            if avail > 200:
+            avail = max_chars - len(prompt) - 25
+            if avail > 150:
                 return prompt + "<|im_start|>assistant" + rest[:avail]
-        return doc_text[:max_chars]
+        return cleaned[:max_chars]
 
-    def evaluate_one(self, doc_text: str) -> bool:
-        """Evaluate a single document against TypeSafe Jev semantic criteria."""
-        if not self.enabled or self.circuit_broken:
-            return True
-
-        if self.total_cost >= self.max_usd:
-            if not self.circuit_broken:
-                self.circuit_broken = True
-                print(f"[Jev Quality Gate] Budget cap reached (${self.total_cost:.4f} >= ${self.max_usd:.2f}). Circuit breaker tripped - falling back to Python gates.")
-            return True
-
-        state = self._compact_state(doc_text)
-        payload = {
-            "model": self.model,
-            "state": state,
-            "questions": {
-                "is_on_domain": {
-                    "type": "noul",
-                    "instructions": "The text is strictly technical English covering programming (Python/Bash/TS/SQL/Rust/C++), applied/CS math, logical deduction, STEM concepts, or structured tool/schema execution—NOT pop-culture trivia, sports, biographies, creative fiction, or non-English text."
-                },
-                "is_coherent_and_direct": {
-                    "type": "noul",
-                    "instructions": "The reasoning or explanation is self-contained, logically sound, and progresses directly to the solution without circular rambling, self-contradiction, or broken context."
-                },
-                "quality_tier": {
-                    "type": "score",
-                    "instructions": "Rate the pedagogical and technical density for training a coding and reasoning model.",
-                    "criteria": [
-                        "noisy, boilerplate, or trivial",
-                        "acceptable basic example",
-                        "clear, well-structured technical or deductive example",
-                        "exceptional textbook-grade reasoning or implementation"
-                    ]
-                }
-            }
-        }
-
+    def _post_with_retry(self, payload: dict) -> dict | None:
+        """Execute POST to /v1/systemone with keep-alive, 429/5xx retry, and circuit breaker trip."""
         data_bytes = json.dumps(payload).encode("utf-8")
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -562,58 +607,205 @@ class JevQualityGate:
             "User-Agent": "Pulsar-Data-Specialization/2.0",
         }
 
-        req = urllib.request.Request(self.api_url, data=data_bytes, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=10.0) as resp:
-                resp_json = json.loads(resp.read().decode("utf-8"))
-        except Exception:
-            # Network or timeout error: gracefully fall back without crashing
-            return True
+        backoffs = [0.5, 1.0, 2.0]
+        for attempt in range(3):
+            try:
+                if self._session is not None:
+                    resp = self._session.post(
+                        self.api_url,
+                        data=data_bytes,
+                        headers=headers,
+                        timeout=15.0,
+                    )
+                    status = resp.status_code
+                    if status == 200:
+                        self.consecutive_failures = 0
+                        return resp.json()
 
-        # Track usage cost: $0.042 / 1M input tokens
+                    if status in (401, 402, 403):
+                        self.circuit_broken = True
+                        print(f"[Jev Quality Gate] Auth / credit limit error (HTTP {status}). Tripping circuit breaker.")
+                        return None
+
+                    if status == 429 or status >= 500:
+                        retry_after = resp.headers.get("Retry-After")
+                        delay = backoffs[attempt]
+                        if retry_after:
+                            try:
+                                delay = min(float(retry_after), 10.0)
+                            except ValueError:
+                                pass
+                        time.sleep(delay)
+                        continue
+                    else:
+                        self.consecutive_failures += 1
+                        if self.consecutive_failures >= 5:
+                            self.circuit_broken = True
+                            print("[Jev Quality Gate] 5 consecutive failures. Tripping circuit breaker.")
+                        return None
+                else:
+                    req = urllib.request.Request(self.api_url, data=data_bytes, headers=headers, method="POST")
+                    with urllib.request.urlopen(req, timeout=15.0) as resp:
+                        resp_data = json.loads(resp.read().decode("utf-8"))
+                        self.consecutive_failures = 0
+                        return resp_data
+            except urllib.error.HTTPError as e:
+                status = e.code
+                if status in (401, 402, 403):
+                    self.circuit_broken = True
+                    print(f"[Jev Quality Gate] Auth / credit error (HTTP {status}). Tripping circuit breaker.")
+                    return None
+                if status == 429 or status >= 500:
+                    retry_after = e.headers.get("Retry-After") if hasattr(e, "headers") else None
+                    delay = backoffs[attempt]
+                    if retry_after:
+                        try:
+                            delay = min(float(retry_after), 10.0)
+                        except ValueError:
+                            pass
+                    time.sleep(delay)
+                    continue
+                self.consecutive_failures += 1
+                if self.consecutive_failures >= 5:
+                    self.circuit_broken = True
+                return None
+            except Exception:
+                time.sleep(backoffs[attempt])
+                continue
+
+        self.consecutive_failures += 1
+        if self.consecutive_failures >= 5:
+            self.circuit_broken = True
+            print("[Jev Quality Gate] 5 consecutive failures. Tripping circuit breaker.")
+        return None
+
+    def evaluate_batch(self, batch_texts: list[str]) -> list[bool]:
+        """Evaluate up to 32 documents in a single /v1/systemone API call using question isolation."""
+        if not self.enabled or self.circuit_broken or not batch_texts:
+            return [True] * len(batch_texts)
+
+        if len(batch_texts) > self.batch_size:
+            results = []
+            for i in range(0, len(batch_texts), self.batch_size):
+                sub_batch = batch_texts[i : i + self.batch_size]
+                results.extend(self.evaluate_batch(sub_batch))
+            return results
+
+        if self.total_cost >= self.max_usd:
+            if not self.circuit_broken:
+                self.circuit_broken = True
+                print(f"[Jev Quality Gate] Budget cap reached (${self.total_cost:.4f} >= ${self.max_usd:.2f}). Circuit breaker tripped - falling back to Python gates.")
+            return [True] * len(batch_texts)
+
+        criteria = [
+            "reject: off-topic trivia, biography, sports, fiction, non-English, rambling, or broken context",
+            "borderline: shallow, repetitive, or low-density text",
+            "accept: clear technical English, Big-5 code, applied math, or coherent step-by-step deduction",
+            "excellent: high-density textbook-grade reasoning, algorithm, or STEM explanation",
+        ]
+        questions = {
+            f"doc_{i}": {
+                "type": "score",
+                "instructions": self._compact_digest(doc_text, max_chars=700),
+                "criteria": criteria,
+            }
+            for i, doc_text in enumerate(batch_texts)
+        }
+
+        payload = {
+            "model": self.model,
+            "state": "You are a strict pretraining data quality filter for a technical English coding (Python/Bash/TS/SQL/Rust/C++), applied/CS math, STEM, and MCP tool-calling language model. Evaluate each candidate document snippet independently.",
+            "questions": questions,
+        }
+
+        resp_json = self._post_with_retry(payload)
+        if resp_json is None:
+            # Network failure or circuit broken: fail-open gracefully without dropping data
+            return [True] * len(batch_texts)
+
         usage = resp_json.get("usage", {})
         cost = usage.get("cost")
         if cost is None:
             inp_toks = usage.get("input_tokens", 0)
             cost = (inp_toks / 1_000_000.0) * 0.042
         self.total_cost += float(cost)
-        self.total_evaluated += 1
+        self.total_evaluated += len(batch_texts)
 
         answers = resp_json.get("answers", {})
-        on_domain = float(answers.get("is_on_domain", {}).get("noul", 0.0))
-        coherent = float(answers.get("is_coherent_and_direct", {}).get("noul", 0.0))
-        quality = float(answers.get("quality_tier", {}).get("score", 0.0))
+        results = []
+        for i in range(len(batch_texts)):
+            key = f"doc_{i}"
+            ans = answers.get(key)
+            if isinstance(ans, dict):
+                score = float(ans.get("score", ans.get("value", 0.0)))
+            elif ans is not None:
+                try:
+                    score = float(ans)
+                except (TypeError, ValueError):
+                    score = 0.0
+            else:
+                score = 0.0
 
-        passed = (on_domain >= 0.75) and (coherent >= 0.75) and (quality >= 1.5)
-        if passed:
-            self.total_passed += 1
-        return passed
+            passed = (score >= 1.65)
+            if passed:
+                self.total_passed += 1
+            results.append(passed)
+
+        if self.total_cost >= self.max_usd:
+            if not self.circuit_broken:
+                self.circuit_broken = True
+                print(f"[Jev Quality Gate] Budget cap reached (${self.total_cost:.4f} >= ${self.max_usd:.2f}). Circuit breaker tripped - falling back to Python gates.")
+
+        return results
+
+    def evaluate_one(self, doc_text: str) -> bool:
+        """Evaluate a single document using evaluate_batch for consistency."""
+        return self.evaluate_batch([doc_text])[0]
 
     def filter_batch(self, batch_candidates: list[tuple[str, str]]) -> list[tuple[str, str]]:
-        """Filter a batch of (substream_id, text) candidates concurrently.
+        """Filter a batch of (substream_id, text) candidates using the two-tier pre-filter.
 
-        Only evaluates prose/Q&A/CoT streams ('1B', '2B', '4A', '4B', '5A', '5B').
-        Skips Jev on '1A', '3A', '3B' where ast.parse(), json.loads(), and tomllib.loads()
-        already provide 100% deterministic verification.
+        Tier 1 ($0.00): Auto-accepts deterministic streams (1A, 3A, 3B) and high-confidence
+        winners (1B Python AST pass, 2B concise boxed, 4B edu score >= 4.2 + >= 4 STEM keywords).
+        Tier 2 (Jev API): Evaluates remaining ambiguous candidates in batches of up to 32.
         """
-        if not self.enabled or self.circuit_broken or not batch_candidates:
+        if not batch_candidates:
             return batch_candidates
 
-        eval_candidates = []
-        bypass_candidates = []
-        for c in batch_candidates:
-            if c[0] in JEV_EVAL_SUBSTREAMS:
-                eval_candidates.append(c)
+        if not self.enabled or self.circuit_broken:
+            return [(s, clean_doc_text(txt)) for s, txt in batch_candidates]
+
+        out_candidates = []
+        jev_indices = []
+        jev_texts = []
+
+        for idx, (s, txt) in enumerate(batch_candidates):
+            if s not in JEV_EVAL_SUBSTREAMS or is_auto_accepted(s, txt):
+                out_candidates.append((s, clean_doc_text(txt)))
             else:
-                bypass_candidates.append(c)
+                jev_indices.append((idx, s, clean_doc_text(txt)))
+                jev_texts.append(txt)
 
-        if not eval_candidates:
-            return batch_candidates
+        if not jev_texts:
+            return out_candidates
 
-        texts = [c[1] for c in eval_candidates]
-        results = list(self._executor.map(self.evaluate_one, texts))
-        passed_eval = [c for c, ok in zip(eval_candidates, results) if ok]
-        return passed_eval + bypass_candidates
+        batch_size = self.batch_size
+        chunks = [jev_texts[i : i + batch_size] for i in range(0, len(jev_texts), batch_size)]
+
+        if self._executor and len(chunks) > 1:
+            chunk_results = list(self._executor.map(self.evaluate_batch, chunks))
+        else:
+            chunk_results = [self.evaluate_batch(chunk) for chunk in chunks]
+
+        jev_passes = [p for sublist in chunk_results for p in sublist]
+
+        passed_jev_candidates = [
+            (s, txt)
+            for (idx, s, txt), ok in zip(jev_indices, jev_passes)
+            if ok
+        ]
+
+        return out_candidates + passed_jev_candidates
 
 
 def legacy_format_cot_block(problem: str, solution: str, max_think_chars: int = LEGACY_ELISION_CHARS) -> str:
@@ -1099,7 +1291,7 @@ def make_substream_stream(
                             if len(txt) > 50:
                                 if STEM_RE.search(txt) and not NON_STEM_RE.search(txt):
                                     if is_strict_english_technical(txt):
-                                        formatted = txt
+                                        formatted = f"<!-- fineweb_score: {float(score):.2f} -->\n{txt}"
 
                     elif substream_id == "5A":
                         msgs = row.get("messages") or row.get("conversations")
@@ -1353,6 +1545,8 @@ def build_shard(
                 batch_candidates = jev_gate.filter_batch(batch_candidates)
                 if not batch_candidates:
                     continue
+            else:
+                batch_candidates = [(s, clean_doc_text(txt)) for s, txt in batch_candidates]
 
             progress_in_cycle = True
 

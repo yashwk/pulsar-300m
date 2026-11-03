@@ -37,12 +37,26 @@ app = modal.App("pulsar-monitor")
     volumes={"/checkpoints": ckpt_vol},
     cpu=0.25,
     memory=512,
-    concurrency_limit=1,
-    timeout=60 * 60,
+    max_containers=1,
+    timeout=60 * 60 * 4,
     scaledown_window=60,
 )
 @modal.web_server(port=7860, startup_timeout=60)
 def serve():
+    import threading
+    import time
+
+    def volume_reloader():
+        while True:
+            time.sleep(2.0)
+            try:
+                ckpt_vol.reload()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=volume_reloader, daemon=True)
+    t.start()
+
     cmd = [
         "python", "-u", "/root/monitor/web_server.py",
         "--host", "0.0.0.0",

@@ -279,7 +279,7 @@ def test_router_topk_and_weight_normalization(E, K):
     logits = _bf16(N, E, seed=13)
     bias = torch.randn(E, device="cuda", dtype=torch.float32) * 0.1
 
-    idx, weights, z = pulsar_cuda.moe_router_topk_forward(logits, bias, K, 1e-4)
+    idx, weights, z, probs_mean = pulsar_cuda.moe_router_topk_forward(logits, bias, K, 1e-4)
     centered = logits.float() - logits.float().mean(dim=-1, keepdim=True)
     scores = torch.sigmoid(centered)
     biased = scores + bias.float()
@@ -289,6 +289,7 @@ def test_router_topk_and_weight_normalization(E, K):
 
     assert_close(weights, weights_ref, atol=2e-3)
     assert torch.allclose(weights.float().sum(-1), torch.ones(N, device="cuda"), atol=max(2e-3, K * 1e-3))
+    assert_close(probs_mean, scores.mean(dim=0), atol=2e-3)
 
 
 @needs_gpu
@@ -317,12 +318,13 @@ def test_fused_moe_router_parity_e16_topk4(dtype):
 
     # CUDA path: _FusedMoERouterFunction
     logits_cuda = logits_ref.detach().clone().requires_grad_(True)
-    idx_cuda, weights_cuda = _FusedMoERouterFunction.apply(logits_cuda, bias, K)
+    idx_cuda, weights_cuda, _, probs_mean_cuda = _FusedMoERouterFunction.apply(logits_cuda, bias, K)
     weights_cuda.backward(d_weights)
     grad_cuda = logits_cuda.grad.clone()
 
     assert torch.equal(idx_ref, idx_cuda)
     assert_close(weights_cuda, weights_ref, atol=2e-3)
+    assert_close(probs_mean_cuda, scores_ref.mean(dim=0), atol=2e-3)
     assert_close(grad_cuda, grad_ref, atol=5e-3)
 
 
@@ -743,8 +745,8 @@ def test_moe_router_topk_z_loss_forward_backward_parity():
     z_w = 1e-3
 
     # Fused CUDA path
-    topk_idx, topk_weights, z_loss = _FusedMoERouterFunction.apply(logits, bias, K, z_w)
-    loss = (topk_weights.float() * 0.5).sum() + z_loss
+    topk_idx, topk_weights, z_loss, probs_mean = _FusedMoERouterFunction.apply(logits, bias, K, z_w)
+    loss = (topk_weights.float() * 0.5).sum() + z_loss + (probs_mean * 0.2).sum()
     loss.backward()
     grad_fused = logits.grad.clone()
 
@@ -757,13 +759,15 @@ def test_moe_router_topk_z_loss_forward_backward_parity():
     ref_topk_raw = torch.gather(scores, -1, ref_topk_idx)
     ref_topk_weights = ref_topk_raw / (ref_topk_raw.sum(dim=-1, keepdim=True) + 1e-6)
     ref_z = z_w * torch.logsumexp(logits_c, dim=-1).pow(2).mean()
-    ref_loss = (ref_topk_weights * 0.5).sum() + ref_z
+    ref_pm = scores.mean(dim=0)
+    ref_loss = (ref_topk_weights * 0.5).sum() + ref_z + (ref_pm * 0.2).sum()
     ref_loss.backward()
     grad_ref = logits.grad.clone()
 
     assert torch.equal(topk_idx, ref_topk_idx)
     assert_close(topk_weights.float(), ref_topk_weights, atol=1e-3, msg="topk weights match")
     assert_close(z_loss, ref_z, atol=1e-5, msg="z_loss forward match")
+    assert_close(probs_mean, ref_pm, atol=1e-4, msg="probs_mean forward match")
     assert_close(grad_fused, grad_ref, atol=1e-3, msg="router backward grad match")
 
 

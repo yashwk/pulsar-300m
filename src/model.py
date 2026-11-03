@@ -56,7 +56,7 @@ class PulsarConfig:
     # drops were common and invisible. 1.12 with 32-alignment gives 864 slots at
     # N=3072 (vs 832 at 1.08/64). Capacity is a runtime setting: it changes no
     # checkpoint format, so it can be raised mid-run if the logged drop rate is high.
-    moe_capacity_factor: float = 1.35
+    moe_capacity_factor: float = 1.25
     moe_capacity_align: int = 32
     # Per-pulse balancing bias. Drops are a per-pulse phenomenon (early pulses route
     # differently from late ones), so a single across-pulse bias can leave one pulse
@@ -608,17 +608,15 @@ class _MergedLoopLinearFunction(torch.autograd.Function):
             d_in = base_weight.size(1)
             d_out = base_weight.size(0)
             A_all = lora_A.to(base_weight.dtype).reshape(K * q, d_in)
-            B_scaled = (
-                (loop_M_row.view(K, 1, 1).to(base_weight.dtype) * lora_B.to(base_weight.dtype))
-                .permute(1, 0, 2)
-                .reshape(d_out, K * q)
-            )
+            B_perm = lora_B.to(base_weight.dtype).permute(1, 0, 2)
+            B_scaled = (B_perm * loop_M_row.view(1, K, 1).to(base_weight.dtype)).reshape(d_out, K * q)
             W_eff = torch.addmm(base_weight, B_scaled, A_all, beta=1.0, alpha=alpha_over_q)
             out = F.linear(x, W_eff)
 
-        ctx.save_for_backward(x, W_eff, A_all, B_scaled, lora_B, loop_M_row)
+        ctx.save_for_backward(x, W_eff, A_all, B_scaled, B_perm, loop_M_row)
         ctx.alpha_over_q = alpha_over_q
         ctx.lora_A_dtype = lora_A.dtype
+        ctx.lora_B_dtype = lora_B.dtype
         ctx.K = K
         ctx.q = q
         ctx.d_in = d_in
@@ -627,7 +625,7 @@ class _MergedLoopLinearFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        x, W_eff, A_all, B_scaled, lora_B, loop_M_row = ctx.saved_tensors
+        x, W_eff, A_all, B_scaled, B_perm, loop_M_row = ctx.saved_tensors
         alpha_over_q = ctx.alpha_over_q
         K = ctx.K
         q = ctx.q
@@ -643,9 +641,9 @@ class _MergedLoopLinearFunction(torch.autograd.Function):
         dA_all = torch.matmul(B_scaled.t(), dW) * alpha_over_q
         dB_scaled = torch.matmul(dW, A_all.t()) * alpha_over_q
 
-        dB_k = dB_scaled.view(d_out, K, q).permute(1, 0, 2)
-        d_lora_B = (dB_k.float() * loop_M_row.float().view(K, 1, 1)).to(lora_B.dtype)
-        d_loop_M_row = (dB_k.float() * lora_B.float()).sum(dim=(1, 2)).to(loop_M_row.dtype)
+        dB_perm = dB_scaled.view(d_out, K, q)
+        d_loop_M_row = (dB_perm.float() * B_perm.float()).sum(dim=(0, 2)).to(loop_M_row.dtype)
+        d_lora_B = (dB_perm.float() * loop_M_row.float().view(1, K, 1)).permute(1, 0, 2).to(ctx.lora_B_dtype)
         d_lora_A = dA_all.view(K, q, d_in).to(ctx.lora_A_dtype)
 
         return dx, dW, d_lora_A, d_lora_B, d_loop_M_row, None
@@ -687,10 +685,8 @@ class LoopMatrixAdapter(nn.Module):
         q = self.rank
         scale = self.alpha / q
         A_all = self.lora_A[:k_use].to(base_weight.dtype).reshape(k_use * q, self.d_in)
-        B_scaled = (
-            (self.loop_M[pulse_idx, :k_use] * scale).view(k_use, 1, 1).to(base_weight.dtype)
-            * self.lora_B[:k_use].to(base_weight.dtype)
-        ).permute(1, 0, 2).reshape(self.d_out, k_use * q)
+        B_perm = self.lora_B[:k_use].to(base_weight.dtype).permute(1, 0, 2)
+        B_scaled = (B_perm * (self.loop_M[pulse_idx, :k_use] * scale).view(1, k_use, 1).to(base_weight.dtype)).reshape(self.d_out, k_use * q)
         return torch.addmm(base_weight, B_scaled, A_all)
 
     def linear_with_adapter(
@@ -1101,31 +1097,30 @@ class _FusedMoECombineFunction(torch.autograd.Function):
 
 
 class _FusedMoERouterFunction(torch.autograd.Function):
-    """Fused router top-k selection, sigmoid, weight normalisation, and optional z-loss."""
+    """Fused router top-k selection, sigmoid, weight normalisation, DeepSeek probs_mean, and optional z-loss."""
 
     @staticmethod
     def forward(ctx, logits: torch.Tensor, expert_bias: torch.Tensor, top_k: int = 2, z_loss_weight: float = 0.0):
-        topk_idx, topk_weights, z_loss = pulsar_cuda.moe_router_topk_forward(
+        topk_idx, topk_weights, z_loss, probs_mean = pulsar_cuda.moe_router_topk_forward(
             logits.contiguous(), expert_bias.float().contiguous(), top_k, z_loss_weight
         )
         ctx.save_for_backward(logits, topk_idx)
         ctx.z_loss_weight = z_loss_weight
-        if z_loss_weight > 0.0:
-            return topk_idx, topk_weights, z_loss
-        return topk_idx, topk_weights
+        return topk_idx, topk_weights, z_loss, probs_mean
 
     @staticmethod
     def backward(ctx, *grads):
         logits, topk_idx = ctx.saved_tensors
-        if ctx.z_loss_weight > 0.0:
-            _d_topk_idx, d_topk_weights, d_z_loss = grads
-        else:
-            _d_topk_idx, d_topk_weights = grads
-            d_z_loss = None
+        _d_topk_idx = grads[0]
+        d_topk_weights = grads[1]
+        d_z_loss = grads[2] if len(grads) > 2 else None
+        d_probs_mean = grads[3] if len(grads) > 3 else None
+
         d_topk_weights_bf16 = d_topk_weights.to(torch.bfloat16).contiguous()
         d_z = d_z_loss.float().contiguous() if (d_z_loss is not None and ctx.z_loss_weight > 0.0) else None
+        d_pm = d_probs_mean.float().contiguous() if (d_probs_mean is not None) else None
         d_logits = pulsar_cuda.moe_router_topk_backward(
-            d_topk_weights_bf16, logits.contiguous(), topk_idx, ctx.z_loss_weight, d_z
+            d_topk_weights_bf16, logits.contiguous(), topk_idx, ctx.z_loss_weight, d_z, d_pm
         )
         return d_logits.to(logits.dtype), None, None, None
 
@@ -1256,7 +1251,7 @@ class PulsarMoEMLP(nn.Module):
         router_w = self.router_weight[pulse_idx]
         logits = F.linear(
             x_flat, router_w.to(x_flat.dtype)
-        ).float()  # [N, E] fp32
+        )  # [N, E] in x_flat.dtype (bfloat16)
 
         # Padded positions must not influence routing statistics or z-loss: a run of
         # identical pad tokens would all choose the same experts, inflating drop counts
@@ -1266,6 +1261,7 @@ class PulsarMoEMLP(nn.Module):
             valid = routing_mask.reshape(-1).bool()
 
         bias = self.expert_bias[pulse_idx] if self.cfg.per_pulse_bias else self.expert_bias
+        P_e = None
         if (
             HAS_PULSAR_CUDA
             and logits.is_cuda
@@ -1276,15 +1272,9 @@ class PulsarMoEMLP(nn.Module):
                  or (self.cfg.n_routed_experts == 16 and self.cfg.top_k == 4)
                  or (self.cfg.n_routed_experts <= 32 and self.cfg.top_k <= 8))
         ):
-            if self.cfg.router_z_loss_weight > 0.0:
-                topk_idx, topk_weights, z_loss = _FusedMoERouterFunction.apply(
-                    logits, bias, self.cfg.top_k, self.cfg.router_z_loss_weight
-                )
-            else:
-                topk_idx, topk_weights = _FusedMoERouterFunction.apply(
-                    logits, bias, self.cfg.top_k, 0.0
-                )
-                z_loss = logits.new_zeros(())
+            topk_idx, topk_weights, z_loss, P_e = _FusedMoERouterFunction.apply(
+                logits, bias, self.cfg.top_k, self.cfg.router_z_loss_weight
+            )
             topk_weights = topk_weights.to(x.dtype)
         else:
             # Centre the logits across experts. Top-k selection and the bias addition are
@@ -1292,19 +1282,21 @@ class PulsarMoEMLP(nn.Module):
             # but keeps the absolute scale from drifting with the shared batch-mean component
             # of the hidden state (strong by pulse 3), which saturated sigmoid and left the
             # [-0.5, 0.5] bias without leverage.
-            logits_c = logits - logits.mean(dim=-1, keepdim=True)
-            scores = torch.sigmoid(logits_c.float())
+            logits_c = logits.float() - logits.float().mean(dim=-1, keepdim=True)
+            scores = torch.sigmoid(logits_c)
             biased_scores = scores + bias
             _, topk_idx = torch.topk(biased_scores, k=self.cfg.top_k, dim=-1)  # [N, K]
             topk_raw = torch.gather(scores, -1, topk_idx)
             topk_weights = (topk_raw / (topk_raw.sum(dim=-1, keepdim=True) + 1e-6)).to(x.dtype)
-            lse_sq = torch.logsumexp(logits_c.float(), dim=-1).pow(2)
+            lse_sq = torch.logsumexp(logits_c, dim=-1).pow(2)
             if valid is not None:
                 valid_f = valid.to(torch.float32)
                 z_loss = self.cfg.router_z_loss_weight * ((lse_sq * valid_f).sum() / valid_f.sum().clamp_min(1.0))
                 topk_weights = topk_weights * valid.unsqueeze(-1).to(topk_weights.dtype)
+                P_e = (scores * valid_f.unsqueeze(-1)).sum(dim=0) / valid_f.sum().clamp_min(1.0)
             else:
                 z_loss = self.cfg.router_z_loss_weight * lse_sq.mean()
+                P_e = scores.mean(dim=0)
 
         # Invalidate padded positions so they do not compete for expert capacity slots
         if valid is not None:
@@ -1403,7 +1395,8 @@ class PulsarMoEMLP(nn.Module):
 
         # DeepSeek-V3 lightweight differentiable sequence/batch load-balancing auxiliary loss
         if self.cfg.router_balance_loss_weight > 0.0:
-            P_e = _CenteredSigmoidMeanFunction.apply(logits, valid)
+            if P_e is None:
+                P_e = _CenteredSigmoidMeanFunction.apply(logits.float(), valid)
             f_e = (bincounts / bincounts.sum().clamp_min(1.0)).detach()
             # Scale by n_core * default_pulses so bal_loss is not diluted by the 1/(n_core*K) division in model loss
             bal_scale = self.cfg.router_balance_loss_weight * (self.cfg.n_core * self.cfg.default_pulses)
@@ -1541,7 +1534,7 @@ class PulsarMoEMLP(nn.Module):
             counts = self.expert_pulse_counts[:k]
             avg = counts.mean(dim=1, keepdim=True)
             diff = avg - counts
-            step = torch.where(diff.abs() > 0.01 * avg, torch.sign(diff), diff / (0.01 * avg.clamp_min(1.0)))
+            step = (diff / (0.15 * avg.clamp_min(1.0))).clamp(-1.0, 1.0)
             self.expert_bias[:k].add_(bias_lr * step)
             # Zero-center across expert dimension to prevent DC drift saturation
             self.expert_bias[:k].sub_(self.expert_bias[:k].mean(dim=1, keepdim=True))
@@ -1553,7 +1546,7 @@ class PulsarMoEMLP(nn.Module):
         else:
             avg_count = self.expert_counts_accum.mean()
             diff = avg_count - self.expert_counts_accum
-            step = torch.where(diff.abs() > 0.01 * avg_count, torch.sign(diff), diff / (0.01 * avg_count.clamp_min(1.0)))
+            step = (diff / (0.15 * avg_count.clamp_min(1.0))).clamp(-1.0, 1.0)
             self.expert_bias.add_(bias_lr * step)
             self.expert_bias.sub_(self.expert_bias.mean())
             self.expert_bias.clamp_(-1.0, 1.0)

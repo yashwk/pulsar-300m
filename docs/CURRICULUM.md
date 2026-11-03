@@ -69,15 +69,17 @@ flowchart TD
 ### Stage 1: Foundation Core Mix (3.8 Billion Tokens | Shards 0–7)
 - **Token Budget:** $3,800,000,000$ tokens ($8 \text{ shards} \times 475\text{M}$ tokens each).
 - **Optimizer Steps:** **`28,991 steps`** (at 131,072 tokens per step).
-- **Sequence Length ($T$):** Fixed context window $T = 1,024$ tokens.
+- **Sequence Length ($T$):** Context window $T = 2,048$ tokens (doubled from 1,024 to increase whole-document intactness and eliminate boundary fragmentation).
 - **Batch Dynamics:**
-  - Micro-Batch Size (MBS): 128
+  - Micro-Batch Size (MBS): 64
   - Gradient Accumulation Steps: 1
-  - Effective Global Batch Tokens: $128 \times 1024 = 131,072$ tokens / step.
-- **Sampler:** **Best-fit document packing** (`--sampler bestfit`) is the production default across all stages, packing variable-length documents into context windows with 0.000% padding waste while preserving strict document boundaries. Flat permuted windows (`--sampler flat`) are supported as an ablation baseline.
+  - Effective Global Batch Tokens: $64 \times 2048 = 131,072$ tokens / step.
+- **Sampler & Quality Gating:**
+  - **Best-fit document packing** (`--sampler bestfit`) is the production default across all stages, packing variable-length documents into context windows with 0.000% padding waste while preserving strict document boundaries.
+  - **Jev Quality Gate**: Two-tier pre-filtering with keep-alive batching filters low-information text and enforces high syntactic density before tokenization.
 - **Learning Rate Schedule:**
-  - Steps 1 $\to$ 300: Linear warmup from 0 to full peak LR (`Muon: 0.02`, `Adam: 6e-4`).
-  - Steps 301 $\to$ 28,991: Flat stable plateau at 100% peak LR (`cooldown_steps = 0`).
+  - Steps 1 $\to$ 290: Linear warmup from 0 to full peak LR (`Muon: 0.02`, `Adam: 6e-4`).
+  - Steps 291 $\to$ 28,991: Flat stable plateau at 100% peak LR (`cooldown_steps = 0`).
 - **Domain Composition (80% Direct / 20% CoT):**
   1. **Pillar 1 — Code, SWE, CLI & Algorithms (30.0% / 1.14B tokens):**
      - Sub-stream 1A (22.0% / 836M tokens): Direct clean source code in Python, C++, Rust, CUDA, Bash without CoT overhead.

@@ -19,11 +19,11 @@ Engineered for extreme parameter efficiency and throughput, Pulsar achieves the 
 | **Attention Output Gating** | **16-Head Sigmoid Gate** | Fused pulse-indexed per-head output gate with zero FlashAttention latency penalty |
 | **Recurrent MoE MLP** | **1 Shared + 16 Routed** | Top-4 routed active ($d_{\text{expert}} = 512$, $d_{\text{shared}} = 1024$, active MLP width = 3072) |
 | **Residual State Dynamics** | **Harmonic Refinement** | Learnable per-pulse channel scale $\mathbf{s}_k \sim 1/(k+1)$ (monotonic delta contraction) |
-| **Context Length** | **32,768 Tokens** | 6 Local (window 1024, $\theta=10\text{k}$) + 2 Global (full causal 32k, $\theta=1\text{M}$) |
+| **Context Length** | **32,768 Tokens** | Stage 1 pretraining: $T = 2048$ ($64 \times 2048 = 131,072$ tokens/step). 6 Local (window 1024, $\theta=10\text{k}$) + 2 Global (full causal 32k, $\theta=1\text{M}$) |
 | **Vocabulary Size** | **32,768 Tokens** | Unified vocabulary matching standard open weights |
 | **Optimizer** | **Muon + AdamW** | 2D weight matrices in Muon; embeddings, norms, gates & scales in AdamW |
 | **Training Budget** | **3.80 Billion Tokens (Stage 1)** | 8 disjoint binary shards, 28,991 optimizer steps @ 131,072 tokens/step |
-| **Cloud Throughput** | **260,000+ tok/s (24% MFU)** | NVIDIA B300 SXM6 Blackwell Ultra on Modal |
+| **Cloud Throughput** | **263,000+ tok/s (25.1% MFU)** | NVIDIA B300 SXM6 Blackwell Ultra on Modal (480.6 ms/step, 564.5 TFLOPS) |
 
 ---
 
@@ -55,12 +55,20 @@ $$\mathcal{L}_{\text{total}} = 0.15 \cdot \mathcal{L}_1 + 0.25 \cdot \mathcal{L}
 
 ### 6. High-Performance Fused CUDA Kernels (`pulsar_cuda`)
 Hand-optimized C++/CUDA kernels in `csrc/kernels.cu` eliminate Python runtime overhead and HBM bandwidth roundtrips:
+- **`moe_router_topk`**: Fused Top-K router with register-level sigmoid, warp-reduced inline `probs_mean` accumulation, direct BF16 logit ingestion, and backward adjoint, cutting 120 eager kernel launches per step.
+- **`causal_depthwise_conv1d_k4`**: 4-gram local causal depthwise convolution with vectorized 128-bit loads and fused residual addition, deployed at the embedding stem (`h_0_norm`) to eliminate 37 GB/step of intermediate HBM traffic.
 - **`qk_rmsnorm_rope`**: Fuses QK-RMSNorm and Rotary Positional Embeddings in registers, eliminating 32 GB/step of memory roundtrips.
 - **`fused_attn_gate`**: Fuses 16-head sigmoid gating and memory transpose into a single vectorized pass.
 - **`moe_dispatch` & `moe_combine`**: 128-bit vectorized `uint4` token dispatch and combine with register-level scaling and early-exit on dropped tokens.
 - **`moe_slots_from_order`**: C++ post-argsort slot assignment and expert histogram reduction.
 - **`fused_sr_update`**: Fuses Muon momentum weight updates with on-chip deterministic PRNG (SplitMix32) stochastic rounding in registers.
 - **`fused_softcap_ce`**: Computes online logsumexp and fused backward in registers, cutting peak memory from 800 MB down to 8 KB per micro-batch.
+
+### 7. Custom Autograd Function for Loop LoRA (`_MergedLoopLinearFunction`)
+Merges the rank-24 LoRA adapter matrix into the base projection weights ($W_{qkv}$, $W_o$) under `torch.no_grad()` prior to linear projection, saving 93.9 GB/step of HBM activation movement and removing 576 PyTorch autograd graph nodes per step.
+
+### 8. Smooth Proportional Bias Routing with Bounded Dropping
+In `PulsarMoEMLP.update_biases()`, replaces abrupt deadband steps with a smooth 15% proportional ramp (`step = (diff / (0.15 * avg.clamp_min(1.0))).clamp(-1.0, 1.0)`). Eliminates step-to-step expert ping-pong oscillation, holding drops strictly `< 1-2%` at `moe_capacity_factor = 1.25 / 1.50` while saving ~15 ms/step in dummy zero padding.
 
 ---
 
@@ -147,26 +155,30 @@ python -m src.train --max-steps 2 --warmup-steps 1 --no-save \
 Pulsar is optimized for remote training on high-end cloud accelerators via Modal.
 
 ### 1. Launch Production Pretraining (Detached Mode)
-Run unattended pretraining on an NVIDIA B300 SXM6 (Blackwell Ultra). The `--detach` flag launches the job in the cloud and exits immediately, ensuring that local Wi-Fi dropouts or laptop sleep will not interrupt training:
+Run unattended pretraining on an NVIDIA B300 SXM6 (Blackwell Ultra). The `--detach` flag launches the job in Modal's cloud orchestrator and disconnects your local client immediately, ensuring that local Wi-Fi dropouts, sleeping laptops, or powering down the machine will not interrupt cloud execution:
 ```bash
-modal run scripts/modal_train.py \
+uv run modal run --detach scripts/modal_train.py \
     --gpu B300 \
-    --detach \
     --target-step 28991 \
-    --mbs 128 \
+    --max-steps 28991 \
+    --mbs 64 \
+    --seq-len 2048 \
     --global-batch-tokens 131072 \
-    --seq-len 1024 \
-    --resume latest
+    --moe-capacity-factor 1.50 \
+    --warmup-steps 290 \
+    --eval-every 250 \
+    --save-every 500 \
+    --no-compile
 ```
 
-### 2. Launch Local Real-Time Dashboard
+### 2. Launch Real-Time Dashboard
 Monitor training live at `http://localhost:7860`:
 ```bash
-# Terminal 1: Background cloud telemetry sync
-python scripts/sync_cloud_monitor.py --checkpoint-dir checkpoints
+# Option A: Single-command local server with in-process cloud volume sync
+make monitor-cloud          # (python monitor/web_server.py --port 7860 --cloud)
 
-# Terminal 2: Web monitor server
-python monitor/web_server.py --port 7860 --checkpoint-dir checkpoints
+# Option B: Serverless cloud-hosted dashboard on Modal
+make serve-cloud-monitor    # (modal serve scripts/modal_monitor.py)
 ```
 
 ### 3. Automated Telemetry Rollback

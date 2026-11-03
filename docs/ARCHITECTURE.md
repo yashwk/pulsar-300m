@@ -25,7 +25,10 @@ Pulsar couples recurrent compute efficiency with sparse Mixture-of-Experts (MoE)
 5. **Linear Associativity Fusion for MoE Combine:** The routed output scale $\mathbf{r}_k$ is absorbed into the expert down-projection weights prior to `torch.bmm`, unlocking direct accumulation of `shared_out` inside the fused CUDA combine kernel and eliminating 6.4 GB/step of intermediate HBM allocations.
 6. **Auxiliary-Loss-Free Global Balancing:** The router uses an adaptive expert bias vector $b \in \mathbb{R}^{16}$ (or $[K, 16]$ per-pulse bias) to guide token distribution without adding artificial loss terms to the objective. Expert allocation counts are accumulated across micro-batches, allowing experts to specialize temporally without hardware imbalance.
 7. **32k Hybrid Local/Global Attention Pattern:** 6 layers use high-precision local attention ($\theta = 10,000$, sliding window 1024), while 2 layers (Layers 3 & 7) provide global anchor attention ($\theta = 1,000,000$, full causal 32k span with YaRN temperature scaling). Across 3 recurrent pulses, the global layers execute 6 full 32k sweeps across sequence history.
-8. **Fused Custom CUDA Kernels:** Critical bottlenecks (fused QK-RMSNorm + RoPE, fused Attention Gate + Transpose, fused MoE Dispatch & Combine with early-exit on dropped tokens, C++ slot assignment from argsort, fused Muon momentum stochastic rounding, and online softcap CE) are executed through hand-optimized CUDA kernels in `csrc/kernels.cu`, delivering sustained Tensor Core saturation.
+8. **Fused Custom CUDA Kernels:** Critical bottlenecks (fused QK-RMSNorm + RoPE, fused Attention Gate + Transpose, fused MoE Dispatch & Combine with early-exit on dropped tokens, C++ slot assignment from argsort, fused Muon momentum stochastic rounding, online softcap CE, fused MoE Top-K router with inline `probs_mean`, and vectorized causal depthwise conv) are executed through hand-optimized CUDA kernels in `csrc/kernels.cu`, delivering sustained Tensor Core saturation.
+9. **Stem Canon 4-Gram Depthwise Convolution:** Local causal 4-gram convolution (`causal_depthwise_conv1d_k4`) applied directly to the normalized embedding stem `h_0_norm` prior to recurrent looping. Infuses local n-gram lexical context across all recursive passes while eliminating 37 GB/step of intermediate HBM traffic and 6.2 GB VRAM compared to per-layer execution.
+10. **LoopMatrixAdapter Custom Autograd Function:** Merges rank-24 LoRA adapters directly into base weights ($W_{qkv}$, $W_o$) under `torch.no_grad()` via `_MergedLoopLinearFunction`, eliminating 93.9 GB/step HBM traffic and removing 576 PyTorch autograd graph nodes per step.
+11. **Smooth Proportional MoE Balancing:** Replaces discontinuous deadband updates with a smooth 15% proportional ramp in `PulsarMoEMLP.update_biases()`, eliminating step-to-step expert ping-pong oscillation and bounding drops `< 1-2%` at `moe_capacity_factor = 1.25 / 1.50`.
 
 ---
 
@@ -39,9 +42,11 @@ flowchart TD
     subgraph InputStage ["1. Input & Hybrid RoPE Embedding"]
         TOK["Input Token IDs: x_t"]
         EMB["Tied Token Embedding [32,768 x 1024]"]
+        ANCHOR_NORM["Anchor RMSNorm"]
+        STEM_CONV["Stem Canon 4-Gram Depthwise Conv (causal_depthwise_conv1d_k4)"]
         ROPE_LOC["Local RoPE Cache (theta = 10k, 32k max)"]
         ROPE_GLOB["Global RoPE Cache (theta = 1M, 32k max)"]
-        TOK --> EMB --> H0["Initial State: h_0"]
+        TOK --> EMB --> ANCHOR_NORM --> STEM_CONV --> H0["Initial State: h_0_norm"]
         TOK --> ROPE_LOC
         TOK --> ROPE_GLOB
     end

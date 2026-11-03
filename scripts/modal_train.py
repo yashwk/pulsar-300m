@@ -269,7 +269,7 @@ def execute_training(
 @app.function(
     image=image,
     gpu="B300",
-    timeout=60 * 60 * 8,
+    timeout=int(60 * 60 * 4.5),  # 4.5h safety cap (full Stage 1 is ~3.9h)
     volumes={"/root/data": data_vol, "/checkpoints": ckpt_vol},
 )
 def train_remote_b300(**kwargs):

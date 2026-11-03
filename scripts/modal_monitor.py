@@ -35,6 +35,9 @@ app = modal.App("pulsar-monitor")
 @app.function(
     image=image,
     volumes={"/checkpoints": ckpt_vol},
+    cpu=0.25,
+    memory=512,
+    concurrency_limit=1,
     timeout=60 * 60,
     scaledown_window=60,
 )

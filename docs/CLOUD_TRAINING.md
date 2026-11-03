@@ -28,33 +28,38 @@ Two persistent Modal volumes support zero-copy data streaming and durable checkp
 ## 2. Launching Training
 
 ### 2.1 Detached Mode (Recommended for Production)
-The `--detach` flag launches the job in the cloud via Modal `.spawn()` and immediately terminates the local client process with code 0. Once spawned, the cloud container runs completely independently:
-- **Resilience**: Immune to local Wi-Fi disconnects, VPN timeouts, or putting your laptop to sleep.
-- **Monitoring**: Progress is tracked via the local dashboard (`http://localhost:7860`) or the Modal web console.
+The `--detach` flag instructs Modal's cloud orchestrator to decouple the job from your local terminal. Once initialized, the remote B300 container runs autonomously in the cloud:
+- **Resilience**: Immune to local Wi-Fi disconnects, closing the laptop, VPN dropouts, or powering off your machine.
+- **Credit Safety**: Hard container timeout (`timeout=60 * 60 * 4.5`) guarantees the container cannot exceed its target runtime (~3.9 hours on B300) or run indefinitely.
+- **Monitoring**: Progress is tracked via the local dashboard (`make monitor-cloud`), serverless cloud dashboard (`make serve-cloud-monitor`), or direct Modal CLI / web console.
 
 Launch command:
 ```bash
-modal run scripts/modal_train.py \
+uv run modal run --detach scripts/modal_train.py \
     --gpu B300 \
-    --detach \
     --target-step 28991 \
-    --mbs 128 \
+    --max-steps 28991 \
+    --mbs 64 \
+    --seq-len 2048 \
     --global-batch-tokens 131072 \
-    --seq-len 1024 \
-    --resume latest
+    --moe-capacity-factor 1.50 \
+    --warmup-steps 290 \
+    --eval-every 250 \
+    --save-every 500 \
+    --no-compile
 ```
 
 ### 2.2 Synchronous Mode (Interactive Debugging)
 Omitting `--detach` runs the job synchronously, streaming container stdout directly to your local terminal:
 ```bash
-modal run scripts/modal_train.py \
+uv run modal run scripts/modal_train.py \
     --gpu B300 \
     --target-step 100 \
-    --mbs 128 \
+    --mbs 64 \
     --global-batch-tokens 131072 \
-    --seq-len 1024
+    --seq-len 2048
 ```
-*Note: In synchronous mode, closing your terminal or losing network connection for more than 15 minutes will terminate the remote container.*
+*Note: In synchronous mode, closing your terminal or losing network connection will cause Modal's client to disconnect and cancel the container.*
 
 ---
 

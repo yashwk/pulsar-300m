@@ -1056,7 +1056,13 @@ def train():
         # Forward + backward FLOPs per token: ~6 * 96.47M * K pulses = 1.736 GFLOPs (at K=3).
         # Plus attention matmuls (12 * n_layers * K * T * d_model): ~0.302 GFLOPs at T=1024, K=3.
         # Total compute per token at K=3 is ~2.04 GFLOPs/tok (2.04e-3 TFLOPs/tok).
-        flops_per_tok = 2.04e-3 * (args.num_pulses / 3.0)   # TFLOPs per token
+        # Account for quadratic global/local attention FLOPs when seq_len > 1024
+        attn_extra_gflops = (
+            24 * 4 * 1024 * (args.seq_len - 1024) / 1e9 * (args.num_pulses / 3.0)
+            if args.seq_len > 1024
+            else 0.0
+        )
+        flops_per_tok = (2.04e-3 * (args.num_pulses / 3.0)) + (attn_extra_gflops / 1e3)   # TFLOPs per token
         achieved_tflops = tok_per_sec * flops_per_tok
 
         # Dynamic GPU detection for peak dense BF16 TFLOPS and physical VRAM

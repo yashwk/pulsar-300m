@@ -56,7 +56,7 @@ class PulsarConfig:
     # drops were common and invisible. 1.12 with 32-alignment gives 864 slots at
     # N=3072 (vs 832 at 1.08/64). Capacity is a runtime setting: it changes no
     # checkpoint format, so it can be raised mid-run if the logged drop rate is high.
-    moe_capacity_factor: float = 1.25
+    moe_capacity_factor: float = 1.35
     moe_capacity_align: int = 32
     # Per-pulse balancing bias. Drops are a per-pulse phenomenon (early pulses route
     # differently from late ones), so a single across-pulse bias can leave one pulse
@@ -585,6 +585,72 @@ def causal_depthwise_conv1d_k4(x: torch.Tensor, weight: torch.Tensor) -> torch.T
     return causal_depthwise_conv1d_k4_ref(x, weight)
 
 
+class _MergedLoopLinearFunction(torch.autograd.Function):
+    """Custom autograd function for fused Loop Matrix linear transformation.
+
+    Eliminates the 12-op intermediate autograd graph per call (576 nodes/step) and enables
+    fast leaf accumulation on base weight while executing exact analytic backward.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        base_weight: torch.Tensor,
+        lora_A: torch.Tensor,
+        lora_B: torch.Tensor,
+        loop_M_row: torch.Tensor,
+        alpha_over_q: float,
+    ):
+        with torch.no_grad():
+            K = lora_A.size(0)
+            q = lora_A.size(1)
+            d_in = base_weight.size(1)
+            d_out = base_weight.size(0)
+            A_all = lora_A.to(base_weight.dtype).reshape(K * q, d_in)
+            B_scaled = (
+                (loop_M_row.view(K, 1, 1).to(base_weight.dtype) * lora_B.to(base_weight.dtype))
+                .permute(1, 0, 2)
+                .reshape(d_out, K * q)
+            )
+            W_eff = torch.addmm(base_weight, B_scaled, A_all, beta=1.0, alpha=alpha_over_q)
+            out = F.linear(x, W_eff)
+
+        ctx.save_for_backward(x, W_eff, A_all, B_scaled, lora_B, loop_M_row)
+        ctx.alpha_over_q = alpha_over_q
+        ctx.lora_A_dtype = lora_A.dtype
+        ctx.K = K
+        ctx.q = q
+        ctx.d_in = d_in
+        ctx.d_out = d_out
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        x, W_eff, A_all, B_scaled, lora_B, loop_M_row = ctx.saved_tensors
+        alpha_over_q = ctx.alpha_over_q
+        K = ctx.K
+        q = ctx.q
+        d_in = ctx.d_in
+        d_out = ctx.d_out
+
+        go = grad_out.reshape(-1, d_out)
+        xf = x.reshape(-1, d_in)
+
+        dx = torch.matmul(go, W_eff).view_as(x)
+        dW = torch.matmul(go.t(), xf)
+
+        dA_all = torch.matmul(B_scaled.t(), dW) * alpha_over_q
+        dB_scaled = torch.matmul(dW, A_all.t()) * alpha_over_q
+
+        dB_k = dB_scaled.view(d_out, K, q).permute(1, 0, 2)
+        d_lora_B = (dB_k.float() * loop_M_row.float().view(K, 1, 1)).to(lora_B.dtype)
+        d_loop_M_row = (dB_k.float() * lora_B.float()).sum(dim=(1, 2)).to(loop_M_row.dtype)
+        d_lora_A = dA_all.view(K, q, d_in).to(ctx.lora_A_dtype)
+
+        return dx, dW, d_lora_A, d_lora_B, d_loop_M_row, None
+
+
 class LoopMatrixAdapter(nn.Module):
     """Meta arXiv:2610.40325 Loop Matrix Adapter (Section 3.3, Appendix F, Definition 12).
 
@@ -627,6 +693,29 @@ class LoopMatrixAdapter(nn.Module):
         ).permute(1, 0, 2).reshape(self.d_out, k_use * q)
         return torch.addmm(base_weight, B_scaled, A_all)
 
+    def linear_with_adapter(
+        self,
+        x: torch.Tensor,
+        base_linear: nn.Linear,
+        pulse_idx: int = 0,
+        num_pulses: int | None = None,
+    ) -> torch.Tensor:
+        """Evaluate F.linear with merged Loop Matrix adapter in a single custom autograd node."""
+        k_use = num_pulses if num_pulses is not None else self.default_pulses
+        q = self.rank
+        scale = self.alpha / q
+        out = _MergedLoopLinearFunction.apply(
+            x,
+            base_linear.weight,
+            self.lora_A[:k_use],
+            self.lora_B[:k_use],
+            self.loop_M[pulse_idx, :k_use],
+            scale,
+        )
+        if base_linear.bias is not None:
+            out = out + base_linear.bias
+        return out
+
     def forward(self, x: torch.Tensor, pulse_idx: int, num_pulses: int = 3) -> torch.Tensor:
         K = num_pulses
         q = self.q
@@ -657,11 +746,8 @@ class PulsarAttention(nn.Module):
         self.wo = nn.Linear(q_dim, cfg.d_model, bias=False)
         self.wo.is_residual_out = True
 
-        # Lightweight causal depthwise conv (k=4) vision before wqkv
-        if cfg.use_canon_conv:
-            self.canon_weight = nn.Parameter(torch.zeros(cfg.d_model, cfg.canon_kernel_size, dtype=torch.float32))
-        else:
-            self.canon_weight = None
+        # Lightweight causal depthwise conv (k=4) vision is evaluated once at stem h_0_norm
+        self.canon_weight = None
 
         # Meta arXiv:2610.40325 Loop Matrix Adapter on wqkv and wo
         if cfg.loop_lora_rank > 0:
@@ -703,15 +789,12 @@ class PulsarAttention(nn.Module):
         v_first: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         B, T, _ = x.shape
-        if self.canon_weight is not None:
-            x = causal_depthwise_conv1d_k4(x, self.canon_weight)
-
-        wqkv_w = (
-            self.wqkv_adapter.get_merged_weight(self.wqkv.weight, pulse_idx, K=self.cfg.default_pulses)
-            if self.wqkv_adapter is not None
-            else self.wqkv.weight
-        )
-        qkv = F.linear(x, wqkv_w, self.wqkv.bias)
+        if self.wqkv_adapter is not None:
+            qkv = self.wqkv_adapter.linear_with_adapter(
+                x, self.wqkv, pulse_idx=pulse_idx, num_pulses=self.cfg.default_pulses
+            )
+        else:
+            qkv = self.wqkv(x)
         q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
 
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
@@ -795,12 +878,12 @@ class PulsarAttention(nn.Module):
         else:
             g = torch.sigmoid(gate_logits)  # [B, T, n_heads]
             out = (out.transpose(1, 2) * g.unsqueeze(-1)).reshape(B, T, -1)
-        wo_w = (
-            self.wo_adapter.get_merged_weight(self.wo.weight, pulse_idx, K=self.cfg.default_pulses)
-            if self.wo_adapter is not None
-            else self.wo.weight
-        )
-        out_proj = F.linear(out, wo_w, self.wo.bias)
+        if self.wo_adapter is not None:
+            out_proj = self.wo_adapter.linear_with_adapter(
+                out, self.wo, pulse_idx=pulse_idx, num_pulses=self.cfg.default_pulses
+            )
+        else:
+            out_proj = self.wo(out)
         return out_proj, v_first
 
 
@@ -1061,6 +1144,41 @@ class SwiGLUMLP(nn.Module):
         return self.w_down(act)
 
 
+class _CenteredSigmoidMeanFunction(torch.autograd.Function):
+    """Custom autograd function for mean router probability across batch.
+
+    Computes P_e = mean_t sigmoid(logit_{t, e} - mean_k logit_{t, k}) with exact analytic
+    adjoint in a single static backward step, avoiding 192 eager kernel launches per step.
+    """
+
+    @staticmethod
+    def forward(ctx, logits: torch.Tensor, mask: torch.Tensor | None = None):
+        c = logits - logits.mean(dim=-1, keepdim=True)
+        s = torch.sigmoid(c)
+        if mask is not None:
+            m = mask.unsqueeze(-1).to(s.dtype)
+            denom = mask.sum().clamp_min(1.0).to(s.dtype)
+            p = (s * m).sum(dim=0) / denom
+            ctx.save_for_backward(s, mask)
+        else:
+            p = s.mean(dim=0)
+            ctx.save_for_backward(s, None)
+        return p
+
+    @staticmethod
+    def backward(ctx, grad_p: torch.Tensor):
+        s, mask = ctx.saved_tensors
+        if mask is not None:
+            denom = mask.sum().clamp_min(1.0).to(s.dtype)
+            m = mask.unsqueeze(-1).to(s.dtype)
+            ds = (grad_p.unsqueeze(0) / denom) * (s * (1.0 - s)) * m
+        else:
+            N = s.shape[0]
+            ds = (grad_p.unsqueeze(0) / N) * (s * (1.0 - s))
+        d_logits = ds - ds.mean(dim=-1, keepdim=True)
+        return d_logits, None
+
+
 class PulsarMoEMLP(nn.Module):
     def __init__(self, cfg: PulsarConfig):
         super().__init__()
@@ -1285,15 +1403,11 @@ class PulsarMoEMLP(nn.Module):
 
         # DeepSeek-V3 lightweight differentiable sequence/batch load-balancing auxiliary loss
         if self.cfg.router_balance_loss_weight > 0.0:
-            if valid is not None:
-                valid_f = valid.unsqueeze(-1).to(logits.dtype)
-                probs = torch.sigmoid(logits - logits.mean(dim=-1, keepdim=True)) * valid_f
-                P_e = probs.sum(dim=0) / valid.sum().clamp_min(1.0)
-            else:
-                probs = torch.sigmoid(logits - logits.mean(dim=-1, keepdim=True))
-                P_e = probs.mean(dim=0)
+            P_e = _CenteredSigmoidMeanFunction.apply(logits, valid)
             f_e = (bincounts / bincounts.sum().clamp_min(1.0)).detach()
-            bal_loss = self.cfg.router_balance_loss_weight * self.cfg.n_routed_experts * (f_e * P_e).sum()
+            # Scale by n_core * default_pulses so bal_loss is not diluted by the 1/(n_core*K) division in model loss
+            bal_scale = self.cfg.router_balance_loss_weight * (self.cfg.n_core * self.cfg.default_pulses)
+            bal_loss = bal_scale * self.cfg.n_routed_experts * (f_e * P_e).sum()
             z_loss = z_loss + bal_loss
 
         if (HAS_PULSAR_CUDA and x_flat.is_cuda and x_flat.dtype == torch.bfloat16
@@ -1608,6 +1722,13 @@ class PulsarForCausalLM(nn.Module):
         # Unit-Normalized Per-Pulse Prompt Anchor
         self.pulse_state_norm = RMSNorm(cfg.d_model, cfg.rms_eps)
         self.anchor_norm = RMSNorm(cfg.d_model, cfg.rms_eps)
+        # Stem Canon Depthwise Conv (k=4) vision: evaluated once on h_0_norm before the pulse loop
+        if cfg.use_canon_conv:
+            self.stem_canon_weight = nn.Parameter(
+                torch.zeros(cfg.d_model, cfg.canon_kernel_size, dtype=torch.float32)
+            )
+        else:
+            self.stem_canon_weight = None
         # Gradient checkpointing for long context: recompute each core block in
         # backward instead of retaining activations. Off by default.
         self.grad_checkpoint = False
@@ -1841,6 +1962,8 @@ class PulsarForCausalLM(nn.Module):
                 block.mlp._diag_capture = []
 
         h_0_norm = self.anchor_norm(h_0)
+        if self.stem_canon_weight is not None:
+            h_0_norm = causal_depthwise_conv1d_k4(h_0_norm, self.stem_canon_weight)
         h_pulse = h_0
         v_first = None
         total_loss = torch.zeros((), device=input_ids.device, dtype=torch.float32) if labels is not None else None
@@ -1878,13 +2001,16 @@ class PulsarForCausalLM(nn.Module):
             else:
                 r_norm = self.pulse_state_norm(h_pulse)
                 e_norm = h_0_norm
-                er_cat = torch.cat([e_norm, r_norm], dim=-1)
-                g_hidden = F.linear(er_cat, self.reinject_gate_down[k].to(er_cat.dtype))
+                w_down = self.reinject_gate_down[k].to(e_norm.dtype)
+                g_hidden = (
+                    F.linear(e_norm, w_down[:, :self.cfg.d_model])
+                    + F.linear(r_norm, w_down[:, self.cfg.d_model:])
+                )
                 mix_k = torch.sigmoid(
                     F.linear(
                         g_hidden,
-                        self.reinject_gate_up[k].to(er_cat.dtype),
-                        self.reinject_gate_bias[k].to(er_cat.dtype),
+                        self.reinject_gate_up[k].to(e_norm.dtype),
+                        self.reinject_gate_bias[k].to(e_norm.dtype),
                     )
                 )
                 h_in = torch.lerp(r_norm, e_norm, mix_k) + step_emb

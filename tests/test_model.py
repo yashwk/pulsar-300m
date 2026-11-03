@@ -630,3 +630,40 @@ def test_router_balance_loss_gradient():
     grad = mlp.router_weight.grad[0]
     assert grad.abs().sum() > 0
     assert torch.isfinite(grad).all()
+
+
+def test_loop_matrix_linear_with_adapter_parity_and_gradients():
+    """linear_with_adapter matches get_merged_weight and separate forward exactly in forward and backward."""
+    d_in, d_out, q, alpha, max_pulses = 128, 192, 8, 16.0, 3
+    adapter1 = LoopMatrixAdapter(d_in=d_in, d_out=d_out, q=q, alpha=alpha, max_pulses=max_pulses)
+    adapter2 = LoopMatrixAdapter(d_in=d_in, d_out=d_out, q=q, alpha=alpha, max_pulses=max_pulses)
+
+    with torch.no_grad():
+        adapter1.lora_B.normal_(0, 0.02)
+        adapter1.loop_M.normal_(0, 0.5)
+        adapter2.load_state_dict(adapter1.state_dict())
+
+    base_linear1 = torch.nn.Linear(d_in, d_out, bias=False)
+    base_linear2 = torch.nn.Linear(d_in, d_out, bias=False)
+    with torch.no_grad():
+        base_linear2.weight.copy_(base_linear1.weight)
+
+    x1 = torch.randn(2, 8, d_in, requires_grad=True)
+    x2 = x1.clone().detach().requires_grad_(True)
+
+    for p in range(max_pulses):
+        out1 = adapter1.linear_with_adapter(x1, base_linear1, pulse_idx=p, num_pulses=max_pulses)
+        w_merged = adapter2.get_merged_weight(base_linear2.weight, pulse_idx=p, K=max_pulses)
+        out2 = F.linear(x2, w_merged)
+
+        diff = (out1 - out2).abs().max().item()
+        assert diff < 1e-6, f"Pulse {p} linear_with_adapter diff {diff} exceeded 1e-6"
+
+    out1.sum().backward()
+    out2.sum().backward()
+
+    assert (x1.grad - x2.grad).abs().max().item() < 1e-6
+    assert (base_linear1.weight.grad - base_linear2.weight.grad).abs().max().item() < 1e-6
+    assert (adapter1.lora_A.grad - adapter2.lora_A.grad).abs().max().item() < 1e-6
+    assert (adapter1.lora_B.grad - adapter2.lora_B.grad).abs().max().item() < 1e-6
+    assert (adapter1.loop_M.grad - adapter2.loop_M.grad).abs().max().item() < 1e-6

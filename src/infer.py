@@ -247,8 +247,6 @@ class PulsarInferenceEngine:
         B, T, _ = x.shape  # B=1, T=1
 
         # 1. Projections
-        if attn.canon_weight is not None:
-            x = causal_depthwise_conv1d_k4(x, attn.canon_weight)
         wqkv_w = (
             attn.wqkv_adapter.get_merged_weight(attn.wqkv.weight, pulse_idx, K=self.model.cfg.default_pulses)
             if attn.wqkv_adapter is not None
@@ -363,6 +361,8 @@ class PulsarInferenceEngine:
         cos_global, sin_global = self.model.rope_global(h_0, T)
 
         h_0_norm = self.model.anchor_norm(h_0)
+        if getattr(self.model, "stem_canon_weight", None) is not None:
+            h_0_norm = causal_depthwise_conv1d_k4(h_0_norm, self.model.stem_canon_weight)
         h_pulse = h_0
 
         for k in range(K):
@@ -372,13 +372,16 @@ class PulsarInferenceEngine:
             else:
                 r_norm = self.model.pulse_state_norm(h_pulse)
                 e_norm = h_0_norm
-                er_cat = torch.cat([e_norm, r_norm], dim=-1)
-                g_hidden = F.linear(er_cat, self.model.reinject_gate_down[k].to(er_cat.dtype))
+                w_down = self.model.reinject_gate_down[k].to(e_norm.dtype)
+                g_hidden = (
+                    F.linear(e_norm, w_down[:, :self.model.cfg.d_model])
+                    + F.linear(r_norm, w_down[:, self.model.cfg.d_model:])
+                )
                 mix_k = torch.sigmoid(
                     F.linear(
                         g_hidden,
-                        self.model.reinject_gate_up[k].to(er_cat.dtype),
-                        self.model.reinject_gate_bias[k].to(er_cat.dtype),
+                        self.model.reinject_gate_up[k].to(e_norm.dtype),
+                        self.model.reinject_gate_bias[k].to(e_norm.dtype),
                     )
                 )
                 h_in = torch.lerp(r_norm, e_norm, mix_k) + step_emb
@@ -390,8 +393,6 @@ class PulsarInferenceEngine:
 
                 # Custom prefill attention that populates kv_cache
                 attn = block.attn
-                if attn.canon_weight is not None:
-                    attn_in = causal_depthwise_conv1d_k4(attn_in, attn.canon_weight)
                 wqkv_w = (
                     attn.wqkv_adapter.get_merged_weight(attn.wqkv.weight, k, K=self.model.cfg.default_pulses)
                     if attn.wqkv_adapter is not None
@@ -474,6 +475,8 @@ class PulsarInferenceEngine:
             input_ids = torch.tensor([[token_id]], device=self.device, dtype=torch.long)
             h_0 = self.model.tok_emb(input_ids)
             h_0_norm = self.model.anchor_norm(h_0)
+            if getattr(self.model, "stem_canon_weight", None) is not None:
+                h_0_norm = causal_depthwise_conv1d_k4(h_0_norm, self.model.stem_canon_weight)
             step_emb = self.model.pulse_step_emb.weight[0].to(h_0_norm.dtype).view(1, 1, -1)
             h_in = h_0_norm + step_emb
             h_prev = h_0
@@ -483,13 +486,16 @@ class PulsarInferenceEngine:
             step_emb = self.model.pulse_step_emb.weight[pulse_idx].to(h_0_norm.dtype).view(1, 1, -1)
             r_norm = self.model.pulse_state_norm(h_prev)
             e_norm = h_0_norm
-            er_cat = torch.cat([e_norm, r_norm], dim=-1)
-            g_hidden = F.linear(er_cat, self.model.reinject_gate_down[pulse_idx].to(er_cat.dtype))
+            w_down = self.model.reinject_gate_down[pulse_idx].to(e_norm.dtype)
+            g_hidden = (
+                F.linear(e_norm, w_down[:, :self.model.cfg.d_model])
+                + F.linear(r_norm, w_down[:, self.model.cfg.d_model:])
+            )
             mix_k = torch.sigmoid(
                 F.linear(
                     g_hidden,
-                    self.model.reinject_gate_up[pulse_idx].to(er_cat.dtype),
-                    self.model.reinject_gate_bias[pulse_idx].to(er_cat.dtype),
+                    self.model.reinject_gate_up[pulse_idx].to(e_norm.dtype),
+                    self.model.reinject_gate_bias[pulse_idx].to(e_norm.dtype),
                 )
             )
             h_in = torch.lerp(r_norm, e_norm, mix_k) + step_emb

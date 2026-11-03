@@ -56,7 +56,7 @@ class PulsarConfig:
     # drops were common and invisible. 1.12 with 32-alignment gives 864 slots at
     # N=3072 (vs 832 at 1.08/64). Capacity is a runtime setting: it changes no
     # checkpoint format, so it can be raised mid-run if the logged drop rate is high.
-    moe_capacity_factor: float = 1.25
+    moe_capacity_factor: float = 1.50
     moe_capacity_align: int = 32
     # Per-pulse balancing bias. Drops are a per-pulse phenomenon (early pulses route
     # differently from late ones), so a single across-pulse bias can leave one pulse
@@ -1397,10 +1397,9 @@ class PulsarMoEMLP(nn.Module):
         if self.cfg.router_balance_loss_weight > 0.0:
             if P_e is None:
                 P_e = _CenteredSigmoidMeanFunction.apply(logits.float(), valid)
+            P_norm = P_e / (P_e.sum().clamp_min(1e-6))
             f_e = (bincounts / bincounts.sum().clamp_min(1.0)).detach()
-            # Scale by n_core * default_pulses so bal_loss is not diluted by the 1/(n_core*K) division in model loss
-            bal_scale = self.cfg.router_balance_loss_weight * (self.cfg.n_core * self.cfg.default_pulses)
-            bal_loss = bal_scale * self.cfg.n_routed_experts * (f_e * P_e).sum()
+            bal_loss = self.cfg.router_balance_loss_weight * self.cfg.n_routed_experts * (f_e * P_norm).sum()
             z_loss = z_loss + bal_loss
 
         if (HAS_PULSAR_CUDA and x_flat.is_cuda and x_flat.dtype == torch.bfloat16

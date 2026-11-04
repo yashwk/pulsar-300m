@@ -56,8 +56,12 @@ image = (
 
 app = modal.App("pulsar-training")
 
-ALL_TRAIN_SHARDS = ",".join([f"/root/data/train_shard{i}.bin" for i in range(8)])
-ALL_VAL_SHARDS = ",".join([f"/root/data/val_shard{i}.bin" for i in range(8)])
+STAGE1_TRAIN_SHARDS = ",".join([f"/root/data/train_shard{i}.bin" for i in range(8)])
+STAGE1_VAL_SHARDS = ",".join([f"/root/data/val_shard{i}.bin" for i in range(8)])
+STAGE2_TRAIN_SHARDS = ",".join([f"/root/data/train_shard{i}.bin" for i in [8, 9, 10]])
+STAGE2_VAL_SHARDS = ",".join([f"/root/data/val_shard{i}.bin" for i in [8, 9, 10]])
+ALL_TRAIN_SHARDS = STAGE1_TRAIN_SHARDS
+ALL_VAL_SHARDS = STAGE1_VAL_SHARDS
 
 
 def parse_tokens(val: str | int | float | None) -> int | None:
@@ -315,16 +319,17 @@ def train_remote_h100(**kwargs):
 
 @app.local_entrypoint()
 def main(
+    stage: int = 2,
     gpu: str = "B300",
-    train_shards: str = ALL_TRAIN_SHARDS,
-    val_shards: str = ALL_VAL_SHARDS,
+    train_shards: str = None,
+    val_shards: str = None,
     target_step: int = None,
     target_tokens: str = None,
     max_steps: int = None,
     max_tokens: str = None,
-    mbs: int = 64,
+    mbs: int = None,
     global_batch_tokens: int = 131072,
-    seq_len: int = 2048,
+    seq_len: int = None,
     warmup_steps: int = None,
     warmup_tokens: str = None,
     cooldown_steps: int = None,
@@ -343,29 +348,69 @@ def main(
     compile: bool = False,
     output_ckpt: str = None,
     no_milestones: bool = False,
-    mask_prompt_loss: bool = False,
-    reset_dataset: bool = False,
+    mask_prompt_loss: bool = None,
+    reset_dataset: bool = None,
 ):
+    if stage == 2:
+        if train_shards is None:
+            train_shards = STAGE2_TRAIN_SHARDS
+        if val_shards is None:
+            val_shards = STAGE2_VAL_SHARDS
+        if seq_len is None:
+            seq_len = 4096
+        if mbs is None:
+            mbs = 32
+        if mask_prompt_loss is None:
+            mask_prompt_loss = True
+        if reset_dataset is None:
+            reset_dataset = True
+        if resume is None:
+            resume = "/checkpoints/stage1_base.pt"
+
+        # Stage 2 contains 1,425,432,776 training tokens across shards 8, 9, 10
+        stage2_train_tokens = 1_425_432_776
+        tokens_per_step = (mbs * seq_len) if (mbs and seq_len) else global_batch_tokens
+        stage2_steps = stage2_train_tokens // tokens_per_step  # exactly 10,875 steps
+        stage1_base_step = 28991
+        stage2_final_step = stage1_base_step + stage2_steps    # exactly 39,866 steps
+        if max_steps is None:
+            max_steps = stage2_final_step
+        if target_step is None:
+            target_step = stage2_final_step
+    else:
+        if train_shards is None:
+            train_shards = STAGE1_TRAIN_SHARDS
+        if val_shards is None:
+            val_shards = STAGE1_VAL_SHARDS
+        if seq_len is None:
+            seq_len = 2048
+        if mbs is None:
+            mbs = 64
+        if mask_prompt_loss is None:
+            mask_prompt_loss = False
+        if reset_dataset is None:
+            reset_dataset = False
+
     # Calculate invariant hardware-agnostic batch dynamics
     tokens_per_micro = mbs * seq_len
     grad_accum = max(1, (global_batch_tokens + tokens_per_micro - 1) // tokens_per_micro)
     effective_gbt = grad_accum * tokens_per_micro
 
-    # 1. Resolve total curriculum steps from max_tokens or default 3.8B curriculum
+    # 1. Resolve total curriculum steps from max_tokens or default
     if max_steps is None:
         total_tok = parse_tokens(max_tokens) if max_tokens else 3_800_000_000
         effective_max_steps = max(1, total_tok // effective_gbt)
     else:
         effective_max_steps = max_steps
 
-    # 2. Resolve target_step from target_tokens if provided, else default to step 30
+    # 2. Resolve target_step from target_tokens if provided
     if target_tokens is not None:
         target_tok_val = parse_tokens(target_tokens)
         effective_target_step = max(1, (target_tok_val + effective_gbt - 1) // effective_gbt)
     elif target_step is not None:
         effective_target_step = target_step
     else:
-        effective_target_step = 30
+        effective_target_step = effective_max_steps
 
     # 3. Resolve warmup_steps from warmup_tokens or 1% curriculum default
     if warmup_tokens is not None:

@@ -797,7 +797,9 @@ def train():
 
             start_step = ckpt.get("global_step", 0)
             tokens_seen = ckpt.get("tokens_seen", 0)
-            best_val_loss = ckpt.get("best_val_loss", float("inf"))
+            best_val_loss = float("inf") if args.reset_dataset else ckpt.get("best_val_loss", float("inf"))
+            if args.reset_dataset:
+                print("[Pulsar] best_val_loss reset to inf for new curriculum stage.")
 
             # Free checkpoint CPU memory and flush any lingering GPU caches
             del ckpt

@@ -387,46 +387,51 @@ def format_cot_block(problem: str, solution: str, max_think_chars: int = MAX_TRA
 
 
 def distill_code_cot(problem: str, raw_solution: str) -> str | None:
-    """Distill concise, zero-rambling code CoT.
+    """Distill genuine, complete native code CoT without slicing post_think or mutilating sentences."""
+    p = problem.strip()
+    if not p:
+        return None
 
-    Case 1 (Concise First-Try): If raw <think> is 80-2200 chars and has zero backtracking,
-    keep it directly.
-    Case 2 (Distill Post-<think> Explanation): If raw <think> is rambling, discard it and
-    split post-<think> at the first Big-5 fenced code block into (explanation, code). If the
-    explanation is 80-2200 chars and clean, wrap it in <|think|> ... <|/think|>.
-    """
     sol = normalize_special_tags(raw_solution.strip())
     part_a = ""
-    post_think = sol
+    post_think = ""
     if "<|think|>" in sol and "<|/think|>" in sol:
         _, rest = sol.split("<|think|>", 1)
         part_a, post_think = rest.split("<|/think|>", 1)
         part_a = part_a.strip()
         post_think = post_think.strip()
-
-    candidate = None
-    # Case 1: Concise first-try think
-    if 80 <= len(part_a) <= 2200 and not BANNED_RAMBLE_RE.search(part_a):
-        candidate = f"<|think|>\n{part_a}\n<|/think|>\n{post_think}"
+    elif "<think>" in sol and "</think>" in sol:
+        _, rest = sol.split("<think>", 1)
+        part_a, post_think = rest.split("</think>", 1)
+        part_a = part_a.strip()
+        post_think = post_think.strip()
+    elif "<|begin_of_thought|>" in sol and "<|end_of_thought|>" in sol:
+        _, rest = sol.split("<|begin_of_thought|>", 1)
+        part_a, post_think = rest.split("<|end_of_thought|>", 1)
+        part_a = part_a.strip()
+        post_think = post_think.replace("<|begin_of_solution|>", "").replace("<|end_of_solution|>", "").strip()
     else:
-        # Case 2: Split at first Big-5 code block
-        code_block_match = re.search(
-            r"```(?:python|bash|sh|ts|typescript|js|javascript|sql|rust|rs|cpp|c|c\+\+)?\s*\n",
-            post_think,
-            re.IGNORECASE,
-        )
-        if code_block_match:
-            split_pos = code_block_match.start()
-            explanation = post_think[:split_pos].strip()
-            code_and_rest = post_think[split_pos:].strip()
-            if 80 <= len(explanation) <= 2200 and not BANNED_RAMBLE_RE.search(explanation):
-                candidate = f"<|think|>\n{explanation}\n<|/think|>\n{code_and_rest}"
+        # No native think block: return None cleanly
+        return None
 
-    if not candidate:
+    if not (80 <= len(part_a) <= 10000):
+        return None
+    if len(BANNED_RAMBLE_RE.findall(part_a)) > 2:
+        return None
+    if len(post_think) < 5:
+        return None
+
+    # post_think must contain a valid Big-5 code block
+    code_block_match = re.search(
+        r"```(?:python|bash|sh|ts|typescript|js|javascript|sql|rust|rs|cpp|c|c\+\+)?\s*\n",
+        post_think,
+        re.IGNORECASE,
+    )
+    if not code_block_match:
         return None
 
     # Validate Python code syntax if Python blocks are present
-    py_blocks = re.findall(r"```(?:python)?\s*\n(.*?)```", candidate, re.DOTALL | re.IGNORECASE)
+    py_blocks = re.findall(r"```(?:python)?\s*\n(.*?)```", post_think, re.DOTALL | re.IGNORECASE)
     for code_str in py_blocks:
         code_body = code_str.strip()
         if len(code_body) > 20:
@@ -435,8 +440,7 @@ def distill_code_cot(problem: str, raw_solution: str) -> str | None:
             except SyntaxError:
                 return None
 
-    p = problem.strip()
-    return f"<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n{candidate}<|im_end|>"
+    return f"<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n<|think|>\n{part_a}\n<|/think|>\n{post_think}<|im_end|>"
 
 
 MATH_THEORETICAL_RE = re.compile(
@@ -450,43 +454,70 @@ MATH_CALCULATION_RE = re.compile(
 
 
 def distill_math_cot(problem: str, raw_solution: str, expected_answer: str = "") -> str | None:
-    """Distill concise, step-by-step mathematical reasoning with zero R1 rambling."""
+    """Distill concise, step-by-step mathematical reasoning without mutilating sentences."""
     p = problem.strip()
+    if not p:
+        return None
     if MATH_THEORETICAL_RE.search(p) and not ("\\boxed" in raw_solution or expected_answer):
         return None
 
     sol = normalize_special_tags(raw_solution.strip())
-    steps = ""
-    ans_part = ""
 
+    # 1. Check for native think block
+    has_native_think = False
+    part_a = ""
+    post_think = ""
     if "<|think|>" in sol and "<|/think|>" in sol:
         _, rest = sol.split("<|think|>", 1)
-        steps, ans_part = rest.split("<|/think|>", 1)
-        steps = steps.strip()
-        ans_part = ans_part.strip()
-    else:
-        # Solution is a linear derivation (e.g. OpenMathInstruct-2)
-        steps = sol
-        ans_part = ""
+        part_a, post_think = rest.split("<|/think|>", 1)
+        part_a = part_a.strip()
+        post_think = post_think.strip()
+        has_native_think = True
+    elif "<think>" in sol and "</think>" in sol:
+        _, rest = sol.split("<think>", 1)
+        part_a, post_think = rest.split("</think>", 1)
+        part_a = part_a.strip()
+        post_think = post_think.strip()
+        has_native_think = True
 
-    if not (80 <= len(steps) <= 2200):
+    if has_native_think:
+        if 80 <= len(part_a) <= 10000 and len(post_think) >= 5:
+            if len(BANNED_RAMBLE_RE.findall(part_a)) <= 2:
+                return f"<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n<|think|>\n{part_a}\n<|/think|>\n{post_think}<|im_end|>"
         return None
-    if BANNED_RAMBLE_RE.search(steps):
+
+    # 2. Linear derivation without think tag (e.g. nvidia/OpenMathInstruct-2)
+    # Keep the entire derivation 100% intact inside <|think|> without mid-sentence slicing
+    raw_sol_clean = clean_think_trace(sol.strip())
+    if not (80 <= len(raw_sol_clean) <= 10000):
+        return None
+    if len(BANNED_RAMBLE_RE.findall(raw_sol_clean)) > 2:
         return None
 
-    if not ans_part:
-        if "\\boxed" in steps:
-            # Boxed answer already in steps, extract or wrap
-            box_idx = steps.rfind("\\boxed")
-            closing = steps.find("}", box_idx)
-            if closing != -1:
-                ans_part = f"The final answer is {steps[box_idx:closing+1]}."
-        elif expected_answer:
-            ans_part = f"The final answer is \\boxed{{{expected_answer}}}."
-        else:
-            ans_part = "Solution complete."
+    ans_val = ""
+    if "\\boxed{" in raw_sol_clean:
+        box_idx = raw_sol_clean.rfind("\\boxed{")
+        depth = 0
+        start_c = box_idx + len("\\boxed{")
+        end_c = -1
+        for idx in range(start_c, len(raw_sol_clean)):
+            if raw_sol_clean[idx] == "{":
+                depth += 1
+            elif raw_sol_clean[idx] == "}":
+                if depth == 0:
+                    end_c = idx
+                    break
+                depth -= 1
+        if end_c != -1:
+            ans_val = raw_sol_clean[start_c:end_c].strip()
 
-    return f"<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n<|think|>\n{steps}\n<|/think|>\n{ans_part}<|im_end|>"
+    if not ans_val and expected_answer:
+        ans_val = expected_answer.strip()
+
+    if not ans_val:
+        return None
+
+    return f"<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n<|think|>\n{raw_sol_clean}\n<|/think|>\nFinal Answer: \\boxed{{{ans_val}}}<|im_end|>"
 
 
 JEV_EVAL_SUBSTREAMS = {"1B", "2B", "4A", "4B", "5A", "5B"}
@@ -1044,24 +1075,49 @@ def format_openthoughts_row(convs: list, system_prompt: str = "") -> str:
     if not user_msg or not assist_msg:
         return ""
 
+    think_text = ""
+    sol_text = ""
     if "<|begin_of_thought|>" in assist_msg and "<|end_of_thought|>" in assist_msg:
         parts = assist_msg.split("<|begin_of_thought|>", 1)[1]
         think_text, sol_text = parts.split("<|end_of_thought|>", 1)
-        think_text = clean_think_trace(think_text.strip())
+        think_text = think_text.strip()
         sol_text = sol_text.replace("<|begin_of_solution|>", "").replace("<|end_of_solution|>", "").strip()
-        final_assist = f"<|think|>\n{think_text}\n<|/think|>\n{sol_text}"
+    elif "<|think|>" in assist_msg and "<|/think|>" in assist_msg:
+        parts = assist_msg.split("<|think|>", 1)[1]
+        think_text, sol_text = parts.split("<|/think|>", 1)
+        think_text = think_text.strip()
+        sol_text = sol_text.strip()
+    elif "<think>" in assist_msg and "</think>" in assist_msg:
+        parts = assist_msg.split("<think>", 1)[1]
+        think_text, sol_text = parts.split("</think>", 1)
+        think_text = think_text.strip()
+        sol_text = sol_text.strip()
     else:
-        norm = normalize_special_tags(assist_msg)
-        if "<|think|>" in norm and "<|/think|>" in norm:
-            final_assist = norm
-        else:
-            final_assist = f"<|think|>\n{clean_think_trace(norm)}\n<|/think|>"
+        # No native think tags: discard row
+        return ""
+
+    if not (80 <= len(think_text) <= 10000):
+        return ""
+    if len(sol_text) < 5:
+        return ""
+    if len(BANNED_RAMBLE_RE.findall(think_text)) > 2:
+        return ""
+
+    # Validate Python code syntax if Python blocks are present
+    py_blocks = re.findall(r"```(?:python)?\s*\n(.*?)```", sol_text, re.DOTALL | re.IGNORECASE)
+    for code_str in py_blocks:
+        code_body = code_str.strip()
+        if len(code_body) > 20:
+            try:
+                ast.parse(code_body)
+            except SyntaxError:
+                return ""
 
     parts = []
     if system_prompt:
         parts.append(f"<|im_start|>system\n{system_prompt.strip()}<|im_end|>")
     parts.append(f"<|im_start|>user\n{user_msg.strip()}<|im_end|>")
-    parts.append(f"<|im_start|>assistant\n{final_assist.strip()}<|im_end|>")
+    parts.append(f"<|im_start|>assistant\n<|think|>\n{think_text}\n<|/think|>\n{sol_text}<|im_end|>")
     return "\n".join(parts)
 
 
@@ -1271,8 +1327,6 @@ def make_substream_stream(
                         out = str(row.get("output") or row.get("generated_solution") or "").strip()
                         if inp and out:
                             distilled = distill_code_cot(inp, out)
-                            if not distilled:
-                                distilled = format_cot_block(inp, out)
                             if distilled and is_strict_english_technical(distilled):
                                 formatted = distilled
 
@@ -1293,8 +1347,6 @@ def make_substream_stream(
                         ans = str(row.get("expected_answer") or "").strip()
                         if p and s:
                             distilled = distill_math_cot(p, s, expected_answer=ans)
-                            if not distilled:
-                                distilled = format_cot_block(p, s)
                             if distilled and is_strict_english_technical(distilled):
                                 formatted = distilled
 

@@ -841,7 +841,7 @@ class PulsarAttention(nn.Module):
             q = q * scale
 
         enable_gqa = (self.num_queries_per_kv > 1)
-        if self.is_local and T > max(self.cfg.sliding_window, 2048):
+        if self.is_local and T > max(self.cfg.sliding_window, 4096):
             # Sliding window. The old implementation materialised T x T int64 index
             # tensors (8.6 GB at T=32768) and a boolean mask (1.07 GB) just to express
             # "causal, within `window`" - impossible on the target 8 GB card, and it

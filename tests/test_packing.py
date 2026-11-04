@@ -3,6 +3,7 @@ import pytest
 
 from src.packing import (
     BESTFIT,
+    EOS_TOKEN_ID,
     IGNORE_INDEX,
     TOOL_CALL_START_ID,
     THINK_START_ID,
@@ -221,4 +222,63 @@ def test_prompt_loss_mask_role_gating():
     assert y_asst[6] == 2    # at 304, predicts <im_end> (2)
     # After turn:
     assert y_asst[7] == IGNORE_INDEX  # at <im_end>, predicts next turn (masked)
+
+
+def test_prompt_loss_mask_mixed_chatml_and_plain():
+    """Verify that in packed windows with mixed plain replays and ChatML, plain tokens remain unmasked."""
+    # Plain replay document (e.g. 1A code or 4B pretraining text) ending with EOS (0)
+    plain_doc = np.array([500, 501, 502, 503, EOS_TOKEN_ID], dtype=np.int64)
+
+    # ChatML document: user turn + assistant turn ending with EOS (0)
+    # user turn: <im_start>(1) user(2240) \n(210) 800 <im_end>(2) \n(210)
+    # assistant turn: <im_start>(1) assistant(957) \n(210) 900 901 <im_end>(2) EOS(0)
+    chatml_doc = np.array([
+        1, 2240, 210, 800, 2, 210,
+        1, 957, 210, 900, 901, 2, EOS_TOKEN_ID,
+    ], dtype=np.int64)
+
+    # Packed window: plain_doc followed by chatml_doc
+    toks = np.concatenate([plain_doc, chatml_doc])
+    n_real = len(toks)
+
+    # Initialize standard causal next-token targets
+    y = np.full(n_real, IGNORE_INDEX, dtype=np.int64)
+    y[:-1] = toks[1:]
+    # Cross-document boundary (plain EOS) is ignored
+    y[len(plain_doc) - 1] = IGNORE_INDEX
+
+    # Apply prompt loss mask
+    y_masked = _apply_prompt_loss_mask(
+        toks,
+        y,
+        n_real,
+        assistant_role_ids={957, 11911},
+        newline_ids={210},
+        eos_id=EOS_TOKEN_ID,
+    )
+
+    # 1. Plain document tokens (indices 0..3) must remain unmasked causal targets!
+    assert y_masked[0] == 501
+    assert y_masked[1] == 502
+    assert y_masked[2] == 503
+    assert y_masked[3] == EOS_TOKEN_ID
+    assert y_masked[4] == IGNORE_INDEX  # Cross-document transition
+
+    # 2. ChatML document:
+    # ChatML starts at offset 5
+    # user turn: 5..10
+    assert (y_masked[5:11] == IGNORE_INDEX).all()
+
+    # assistant turn header: 11..13 (im_start, assistant, \n)
+    assert y_masked[11] == IGNORE_INDEX
+    assert y_masked[12] == IGNORE_INDEX
+
+    # assistant body: at \n (13) predicts 900; at 900 (14) predicts 901; at 901 (15) predicts <im_end> (2)
+    assert y_masked[13] == 900
+    assert y_masked[14] == 901
+    assert y_masked[15] == 2
+
+    # assistant closing <im_end> target at index 16
+    assert y_masked[16] == IGNORE_INDEX
+
 

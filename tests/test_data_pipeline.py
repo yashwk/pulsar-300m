@@ -100,8 +100,8 @@ def test_distill_code_cot_case1_concise_first_try():
     assert "def fib(n: int) -> int:" in res
 
 
-def test_distill_code_cot_case2_rambling_replacement():
-    """Verify that rambling trial-and-error <think> is discarded in favor of post-think explanation."""
+def test_distill_code_cot_excessive_rambling_rejected():
+    """Verify that excessive trial-and-error (>2 banned rambles) is rejected rather than sliced."""
     problem = "Implement binary search in Python."
     solution = (
         "<think>\n"
@@ -126,15 +126,7 @@ def test_distill_code_cot_case2_rambling_replacement():
         "```"
     )
     res = distill_code_cot(problem, solution)
-    assert res is not None
-    assert "<|think|>" in res
-    assert "<|/think|>" in res
-    # Rambling phrases must not appear
-    assert "Wait, let me reconsider" not in res
-    assert "Oops, wait a second" not in res
-    # Clean explanation must be inside think block
-    assert "Binary search operates by maintaining low and high bounds" in res
-    assert "def binary_search" in res
+    assert res is None
 
 
 def test_distill_code_cot_invalid_python_syntax():

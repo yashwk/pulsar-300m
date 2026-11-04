@@ -101,6 +101,7 @@ def execute_training(
     per_pulse_bias: bool = True,
     no_milestones: bool = False,
     mask_prompt_loss: bool = False,
+    reset_dataset: bool = False,
 ):
     """Core training harness with background volume sync."""
     ckpt_vol.reload()
@@ -158,6 +159,8 @@ def execute_training(
         cmd.append("--no-milestones")
     if mask_prompt_loss:
         cmd.append("--mask-prompt-loss")
+    if reset_dataset:
+        cmd.append("--reset-dataset")
     if compile:
         cmd.append("--compile")
     if output_ckpt:
@@ -341,6 +344,7 @@ def main(
     output_ckpt: str = None,
     no_milestones: bool = False,
     mask_prompt_loss: bool = False,
+    reset_dataset: bool = False,
     detach: bool = True,
 ):
     # Calculate invariant hardware-agnostic batch dynamics
@@ -421,6 +425,7 @@ def main(
         "output_ckpt": output_ckpt,
         "no_milestones": no_milestones,
         "mask_prompt_loss": mask_prompt_loss,
+        "reset_dataset": reset_dataset,
     }
 
     selected_gpu = gpu.upper()

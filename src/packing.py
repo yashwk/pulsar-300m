@@ -458,64 +458,87 @@ def _apply_prompt_loss_mask(
     im_end_id: int = IM_END_TOKEN_ID,
     tool_resp_id: int = TOOL_RESPONSE_START_ID,
     tool_resp_end_id: int = TOOL_RESPONSE_END_ID,
+    eos_id: int = EOS_TOKEN_ID,
 ) -> np.ndarray:
-    """Mask prompt loss on ChatML turns, unmasking only assistant body and closing <|im_end|>."""
+    """Mask prompt loss on ChatML turns, unmasking only assistant body and closing <|im_end|>.
+
+    Operates per document segment (delimited by eos_id) so mixed windows containing both
+    unmasked plain text/code replays and ChatML conversations maintain valid next-token
+    prediction targets on non-ChatML spans.
+    """
     L = min(len(toks), n_real)
-    if L <= 1 or im_start_id not in toks[:L]:
+    if L <= 1:
         return y
 
-    # Mask everything by default in ChatML segments
-    y[:L] = ignore_index
+    # Delimit document segments by eos_id
+    eos_positions = np.flatnonzero(toks[:L] == eos_id)
+    seg_bounds = []
+    prev_start = 0
+    for pos in eos_positions:
+        seg_bounds.append((prev_start, pos + 1))
+        prev_start = pos + 1
+    if prev_start < L:
+        seg_bounds.append((prev_start, L))
 
-    # Find turns
-    starts = np.flatnonzero(toks[:L] == im_start_id)
-    ends = np.flatnonzero(toks[:L] == im_end_id)
+    for seg_start, seg_end in seg_bounds:
+        seg_toks = toks[seg_start:seg_end]
+        if im_start_id not in seg_toks:
+            # Plain document segment (code, math, pretraining text):
+            # Keep causal next-token targets unmasked.
+            continue
 
-    for s_idx in starts:
-        future_ends = ends[ends > s_idx]
-        e_idx = int(future_ends[0]) if future_ends.size > 0 else L - 1
-        turn_slice = toks[s_idx : e_idx + 1]
+        # ChatML document segment: mask all tokens by default in this segment
+        y[seg_start:seg_end] = ignore_index
 
-        is_assistant = False
-        if assistant_role_ids:
-            if s_idx + 1 <= e_idx and toks[s_idx + 1] in assistant_role_ids:
-                is_assistant = True
-        elif not assistant_role_ids:
-            is_assistant = bool(
-                np.any((turn_slice == THINK_START_ID) | (turn_slice == TOOL_CALL_START_ID))
-            )
+        # Find turns within this document segment
+        seg_starts = np.flatnonzero(seg_toks == im_start_id) + seg_start
+        seg_ends = np.flatnonzero(seg_toks == im_end_id) + seg_start
 
-        if is_assistant:
-            header_end = -1
-            n_ids = newline_ids if newline_ids else {210}
-            for k in range(s_idx + 1, min(s_idx + 16, e_idx + 1)):
-                if toks[k] in n_ids:
-                    header_end = k
-                    break
-            if header_end == -1:
-                header_end = s_idx + 2
+        for s_idx in seg_starts:
+            future_ends = seg_ends[seg_ends > s_idx]
+            e_idx = int(future_ends[0]) if future_ends.size > 0 else seg_end - 1
+            turn_slice = toks[s_idx : e_idx + 1]
 
-            content_start = header_end + 1
-            if content_start <= e_idx:
-                for t in range(content_start, e_idx + 1):
-                    if t - 1 >= 0 and t - 1 < L:
-                        y[t - 1] = toks[t]
+            is_assistant = False
+            if assistant_role_ids:
+                if s_idx + 1 <= e_idx and toks[s_idx + 1] in assistant_role_ids:
+                    is_assistant = True
+            elif not assistant_role_ids:
+                is_assistant = bool(
+                    np.any((turn_slice == THINK_START_ID) | (turn_slice == TOOL_CALL_START_ID))
+                )
 
-                k = content_start
-                while k <= e_idx:
-                    if toks[k] == tool_resp_id:
-                        resp_start = k
-                        resp_end = e_idx
-                        for m in range(resp_start, e_idx + 1):
-                            if toks[m] == tool_resp_end_id:
-                                resp_end = m
-                                break
-                        for t in range(resp_start, resp_end + 1):
-                            if t - 1 >= 0 and t - 1 < L:
-                                y[t - 1] = ignore_index
-                        k = resp_end + 1
-                    else:
-                        k += 1
+            if is_assistant:
+                header_end = -1
+                n_ids = newline_ids if newline_ids else {210}
+                for k in range(s_idx + 1, min(s_idx + 16, e_idx + 1)):
+                    if toks[k] in n_ids:
+                        header_end = k
+                        break
+                if header_end == -1:
+                    header_end = s_idx + 2
+
+                content_start = header_end + 1
+                if content_start <= e_idx:
+                    for t in range(content_start, e_idx + 1):
+                        if 0 <= t - 1 < L:
+                            y[t - 1] = toks[t]
+
+                    k = content_start
+                    while k <= e_idx:
+                        if toks[k] == tool_resp_id:
+                            resp_start = k
+                            resp_end = e_idx
+                            for m in range(resp_start, e_idx + 1):
+                                if toks[m] == tool_resp_end_id:
+                                    resp_end = m
+                                    break
+                            for t in range(resp_start, resp_end + 1):
+                                if 0 <= t - 1 < L:
+                                    y[t - 1] = ignore_index
+                            k = resp_end + 1
+                        else:
+                            k += 1
 
     return y
 
@@ -529,6 +552,7 @@ def build_chatml_labels(
     im_end_id: int = IM_END_TOKEN_ID,
     tool_resp_id: int = TOOL_RESPONSE_START_ID,
     tool_resp_end_id: int = TOOL_RESPONSE_END_ID,
+    eos_id: int = EOS_TOKEN_ID,
     **kwargs,
 ) -> np.ndarray:
     """Build target labels for a ChatML segment masking prompt loss."""
@@ -550,6 +574,7 @@ def build_chatml_labels(
         im_end_id=im_end_id,
         tool_resp_id=tool_resp_id,
         tool_resp_end_id=tool_resp_end_id,
+        eos_id=eos_id,
     )
 
 
@@ -623,6 +648,7 @@ class PackedBatchLoader:
             im_end_id=self.im_end_id,
             tool_resp_id=self.tool_resp_id,
             tool_resp_end_id=self.tool_resp_end_id,
+            eos_id=self.eos_id,
         )
 
     def _build_window(self, w: Window) -> tuple[np.ndarray, np.ndarray, int]:

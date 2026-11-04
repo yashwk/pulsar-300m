@@ -692,127 +692,134 @@ std::vector<torch::Tensor> swiglu_backward_cuda(torch::Tensor dout, torch::Tenso
 __global__ void fused_swiglu_forward_vec8_kernel(
     const __nv_bfloat16* __restrict__ gu,
     __nv_bfloat16* __restrict__ out,
-    int64_t num_rows,
-    int d_ff
+    int64_t total_vec,
+    int D_vec,
+    int d_ff,
+    int d_vec_shift,
+    int d_vec_mask
 ) {
-    int D_vec = d_ff >> 3; // 8 bf16 per uint4
-    for (int64_t row = blockIdx.x; row < num_rows; row += gridDim.x) {
-        const uint4* __restrict__ gate_row = reinterpret_cast<const uint4*>(gu + row * (2 * d_ff));
-        const uint4* __restrict__ up_row   = reinterpret_cast<const uint4*>(gu + row * (2 * d_ff) + d_ff);
-        uint4* __restrict__ out_row        = reinterpret_cast<uint4*>(out + row * d_ff);
+    int64_t vec_idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (vec_idx >= total_vec) return;
 
-        for (int col = threadIdx.x; col < D_vec; col += blockDim.x) {
-            uint4 g_u4 = gate_row[col];
-            uint4 u_u4 = up_row[col];
-            uint4 o_u4;
+    int64_t row = (d_vec_shift >= 0) ? (vec_idx >> d_vec_shift) : (vec_idx / D_vec);
+    int col     = (d_vec_mask >= 0)  ? (int)(vec_idx & d_vec_mask) : (int)(vec_idx % D_vec);
 
-            const __nv_bfloat162* g_bf2 = reinterpret_cast<const __nv_bfloat162*>(&g_u4);
-            const __nv_bfloat162* u_bf2 = reinterpret_cast<const __nv_bfloat162*>(&u_u4);
-            __nv_bfloat162* o_bf2       = reinterpret_cast<__nv_bfloat162*>(&o_u4);
+    const uint4* __restrict__ gate_row = reinterpret_cast<const uint4*>(gu + row * (2 * d_ff));
+    const uint4* __restrict__ up_row   = reinterpret_cast<const uint4*>(gu + row * (2 * d_ff) + d_ff);
+    uint4* __restrict__ out_row        = reinterpret_cast<uint4*>(out + row * d_ff);
 
-            #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                float2 gf = __bfloat1622float2(g_bf2[i]);
-                float2 uf = __bfloat1622float2(u_bf2[i]);
-                float2 of_val;
-                of_val.x = silu_fast(gf.x) * uf.x;
-                of_val.y = silu_fast(gf.y) * uf.y;
-                o_bf2[i] = __float22bfloat162_rn(of_val);
-            }
-            out_row[col] = o_u4;
-        }
+    uint4 g_u4 = gate_row[col];
+    uint4 u_u4 = up_row[col];
+    uint4 o_u4;
+
+    const __nv_bfloat162* g_bf2 = reinterpret_cast<const __nv_bfloat162*>(&g_u4);
+    const __nv_bfloat162* u_bf2 = reinterpret_cast<const __nv_bfloat162*>(&u_u4);
+    __nv_bfloat162* o_bf2       = reinterpret_cast<__nv_bfloat162*>(&o_u4);
+
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        float2 gf = __bfloat1622float2(g_bf2[i]);
+        float2 uf = __bfloat1622float2(u_bf2[i]);
+        float2 of_val;
+        of_val.x = silu_fast(gf.x) * uf.x;
+        of_val.y = silu_fast(gf.y) * uf.y;
+        o_bf2[i] = __float22bfloat162_rn(of_val);
     }
+    out_row[col] = o_u4;
 }
 
 __global__ void fused_swiglu_forward_kernel(
     const __nv_bfloat16* __restrict__ gu,
     __nv_bfloat16* __restrict__ out,
-    int64_t num_rows,
+    int64_t total_out_elements,
     int d_ff
 ) {
-    for (int64_t row = blockIdx.x; row < num_rows; row += gridDim.x) {
-        int64_t row_offset = row * (2 * d_ff);
-        for (int c = threadIdx.x; c < d_ff; c += blockDim.x) {
-            float g_val = __bfloat162float(gu[row_offset + c]);
-            float u_val = __bfloat162float(gu[row_offset + d_ff + c]);
-            out[row * d_ff + c] = __float2bfloat16(silu_fast(g_val) * u_val);
-        }
-    }
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_out_elements) return;
+    int64_t row = idx / d_ff;
+    int col = (int)(idx % d_ff);
+    int64_t row_offset = row * (2 * d_ff);
+    float g_val = __bfloat162float(gu[row_offset + col]);
+    float u_val = __bfloat162float(gu[row_offset + d_ff + col]);
+    out[idx] = __float2bfloat16(silu_fast(g_val) * u_val);
 }
 
 __global__ void fused_swiglu_backward_vec8_kernel(
     const __nv_bfloat16* __restrict__ dout,
     const __nv_bfloat16* __restrict__ gu,
     __nv_bfloat16* __restrict__ dgu,
-    int64_t num_rows,
-    int d_ff
+    int64_t total_vec,
+    int D_vec,
+    int d_ff,
+    int d_vec_shift,
+    int d_vec_mask
 ) {
-    int D_vec = d_ff >> 3;
-    for (int64_t row = blockIdx.x; row < num_rows; row += gridDim.x) {
-        const uint4* __restrict__ do_row = reinterpret_cast<const uint4*>(dout + row * d_ff);
-        const uint4* __restrict__ g_row  = reinterpret_cast<const uint4*>(gu + row * (2 * d_ff));
-        const uint4* __restrict__ u_row  = reinterpret_cast<const uint4*>(gu + row * (2 * d_ff) + d_ff);
-        uint4* __restrict__ dg_row       = reinterpret_cast<uint4*>(dgu + row * (2 * d_ff));
-        uint4* __restrict__ du_row       = reinterpret_cast<uint4*>(dgu + row * (2 * d_ff) + d_ff);
+    int64_t vec_idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (vec_idx >= total_vec) return;
 
-        for (int col = threadIdx.x; col < D_vec; col += blockDim.x) {
-            uint4 do_u4 = do_row[col];
-            uint4 g_u4  = g_row[col];
-            uint4 u_u4  = u_row[col];
-            uint4 dg_u4, du_u4;
+    int64_t row = (d_vec_shift >= 0) ? (vec_idx >> d_vec_shift) : (vec_idx / D_vec);
+    int col     = (d_vec_mask >= 0)  ? (int)(vec_idx & d_vec_mask) : (int)(vec_idx % D_vec);
 
-            const __nv_bfloat162* do_bf2 = reinterpret_cast<const __nv_bfloat162*>(&do_u4);
-            const __nv_bfloat162* g_bf2  = reinterpret_cast<const __nv_bfloat162*>(&g_u4);
-            const __nv_bfloat162* u_bf2  = reinterpret_cast<const __nv_bfloat162*>(&u_u4);
-            __nv_bfloat162* dg_bf2       = reinterpret_cast<__nv_bfloat162*>(&dg_u4);
-            __nv_bfloat162* du_bf2       = reinterpret_cast<__nv_bfloat162*>(&du_u4);
+    const uint4* __restrict__ do_row = reinterpret_cast<const uint4*>(dout + row * d_ff);
+    const uint4* __restrict__ g_row  = reinterpret_cast<const uint4*>(gu + row * (2 * d_ff));
+    const uint4* __restrict__ u_row  = reinterpret_cast<const uint4*>(gu + row * (2 * d_ff) + d_ff);
+    uint4* __restrict__ dg_row       = reinterpret_cast<uint4*>(dgu + row * (2 * d_ff));
+    uint4* __restrict__ du_row       = reinterpret_cast<uint4*>(dgu + row * (2 * d_ff) + d_ff);
 
-            #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                float2 dy = __bfloat1622float2(do_bf2[i]);
-                float2 g  = __bfloat1622float2(g_bf2[i]);
-                float2 u  = __bfloat1622float2(u_bf2[i]);
+    uint4 do_u4 = do_row[col];
+    uint4 g_u4  = g_row[col];
+    uint4 u_u4  = u_row[col];
+    uint4 dg_u4, du_u4;
 
-                float sig_x = 1.0f / (1.0f + __expf(-g.x));
-                float sig_y = 1.0f / (1.0f + __expf(-g.y));
-                float silu_x = g.x * sig_x;
-                float silu_y = g.y * sig_y;
+    const __nv_bfloat162* do_bf2 = reinterpret_cast<const __nv_bfloat162*>(&do_u4);
+    const __nv_bfloat162* g_bf2  = reinterpret_cast<const __nv_bfloat162*>(&g_u4);
+    const __nv_bfloat162* u_bf2  = reinterpret_cast<const __nv_bfloat162*>(&u_u4);
+    __nv_bfloat162* dg_bf2       = reinterpret_cast<__nv_bfloat162*>(&dg_u4);
+    __nv_bfloat162* du_bf2       = reinterpret_cast<__nv_bfloat162*>(&du_u4);
 
-                float2 dg, du;
-                du.x = dy.x * silu_x;
-                du.y = dy.y * silu_y;
-                dg.x = dy.x * u.x * sig_x * (1.0f + g.x * (1.0f - sig_x));
-                dg.y = dy.y * u.y * sig_y * (1.0f + g.y * (1.0f - sig_y));
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        float2 dy = __bfloat1622float2(do_bf2[i]);
+        float2 g  = __bfloat1622float2(g_bf2[i]);
+        float2 u  = __bfloat1622float2(u_bf2[i]);
 
-                dg_bf2[i] = __float22bfloat162_rn(dg);
-                du_bf2[i] = __float22bfloat162_rn(du);
-            }
-            dg_row[col] = dg_u4;
-            du_row[col] = du_u4;
-        }
+        float sig_x = 1.0f / (1.0f + __expf(-g.x));
+        float sig_y = 1.0f / (1.0f + __expf(-g.y));
+        float silu_x = g.x * sig_x;
+        float silu_y = g.y * sig_y;
+
+        float2 dg, du;
+        du.x = dy.x * silu_x;
+        du.y = dy.y * silu_y;
+        dg.x = dy.x * u.x * sig_x * (1.0f + g.x * (1.0f - sig_x));
+        dg.y = dy.y * u.y * sig_y * (1.0f + g.y * (1.0f - sig_y));
+
+        dg_bf2[i] = __float22bfloat162_rn(dg);
+        du_bf2[i] = __float22bfloat162_rn(du);
     }
+    dg_row[col] = dg_u4;
+    du_row[col] = du_u4;
 }
 
 __global__ void fused_swiglu_backward_kernel(
     const __nv_bfloat16* __restrict__ dout,
     const __nv_bfloat16* __restrict__ gu,
     __nv_bfloat16* __restrict__ dgu,
-    int64_t num_rows,
+    int64_t total_out_elements,
     int d_ff
 ) {
-    for (int64_t row = blockIdx.x; row < num_rows; row += gridDim.x) {
-        int64_t row_offset = row * (2 * d_ff);
-        int64_t out_offset = row * d_ff;
-        for (int c = threadIdx.x; c < d_ff; c += blockDim.x) {
-            float do_val = __bfloat162float(dout[out_offset + c]);
-            float g_val = __bfloat162float(gu[row_offset + c]);
-            float u_val = __bfloat162float(gu[row_offset + d_ff + c]);
-            float du = do_val * silu_fast(g_val);
-            float dg = do_val * u_val * dsilu_fast(g_val);
-            dgu[row_offset + c] = __float2bfloat16(dg);
-            dgu[row_offset + d_ff + c] = __float2bfloat16(du);
-        }
-    }
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_out_elements) return;
+    int64_t row = idx / d_ff;
+    int col = (int)(idx % d_ff);
+    int64_t row_offset = row * (2 * d_ff);
+    float do_val = __bfloat162float(dout[idx]);
+    float g_val = __bfloat162float(gu[row_offset + col]);
+    float u_val = __bfloat162float(gu[row_offset + d_ff + col]);
+    float du = do_val * silu_fast(g_val);
+    float dg = do_val * u_val * dsilu_fast(g_val);
+    dgu[row_offset + col] = __float2bfloat16(dg);
+    dgu[row_offset + d_ff + col] = __float2bfloat16(du);
 }
 
 torch::Tensor fused_swiglu_forward_cuda(torch::Tensor gu, int64_t d_ff) {
@@ -828,20 +835,28 @@ torch::Tensor fused_swiglu_forward_cuda(torch::Tensor gu, int64_t d_ff) {
     auto sizes = gu.sizes().vec();
     sizes.back() = d_ff;
     auto out = torch::empty(sizes, gu.options());
-    int blocks = (int)std::min<int64_t>(N, 65535);
+
     if (d_ff % 8 == 0) {
-        int threads = (int)std::min<int64_t>(std::max<int64_t>(d_ff / 8, 32), 256);
+        int D_vec = (int)(d_ff >> 3);
+        int64_t total_vec = N * D_vec;
+        bool is_pow2 = (D_vec & (D_vec - 1)) == 0;
+        int d_vec_shift = is_pow2 ? __builtin_ctz(D_vec) : -1;
+        int d_vec_mask = is_pow2 ? (D_vec - 1) : -1;
+        int threads = 256;
+        int blocks = (int)((total_vec + threads - 1) / threads);
         fused_swiglu_forward_vec8_kernel<<<blocks, threads>>>(
             reinterpret_cast<const __nv_bfloat16*>(gu.data_ptr<c10::BFloat16>()),
             reinterpret_cast<__nv_bfloat16*>(out.data_ptr<c10::BFloat16>()),
-            N, (int)d_ff
+            total_vec, D_vec, (int)d_ff, d_vec_shift, d_vec_mask
         );
     } else {
-        int threads = (int)std::min<int64_t>(std::max<int64_t>(d_ff, 32), 256);
+        int64_t total_out_elements = N * d_ff;
+        int threads = 256;
+        int blocks = (int)((total_out_elements + threads - 1) / threads);
         fused_swiglu_forward_kernel<<<blocks, threads>>>(
             reinterpret_cast<const __nv_bfloat16*>(gu.data_ptr<c10::BFloat16>()),
             reinterpret_cast<__nv_bfloat16*>(out.data_ptr<c10::BFloat16>()),
-            N, (int)d_ff
+            total_out_elements, (int)d_ff
         );
     }
     return out;
@@ -858,22 +873,30 @@ torch::Tensor fused_swiglu_backward_cuda(torch::Tensor dout, torch::Tensor gu, i
         return dgu;
     }
     int64_t N = total_elements / (2 * d_ff);
-    int blocks = (int)std::min<int64_t>(N, 65535);
+
     if (d_ff % 8 == 0) {
-        int threads = (int)std::min<int64_t>(std::max<int64_t>(d_ff / 8, 32), 256);
+        int D_vec = (int)(d_ff >> 3);
+        int64_t total_vec = N * D_vec;
+        bool is_pow2 = (D_vec & (D_vec - 1)) == 0;
+        int d_vec_shift = is_pow2 ? __builtin_ctz(D_vec) : -1;
+        int d_vec_mask = is_pow2 ? (D_vec - 1) : -1;
+        int threads = 256;
+        int blocks = (int)((total_vec + threads - 1) / threads);
         fused_swiglu_backward_vec8_kernel<<<blocks, threads>>>(
             reinterpret_cast<const __nv_bfloat16*>(dout.data_ptr<c10::BFloat16>()),
             reinterpret_cast<const __nv_bfloat16*>(gu.data_ptr<c10::BFloat16>()),
             reinterpret_cast<__nv_bfloat16*>(dgu.data_ptr<c10::BFloat16>()),
-            N, (int)d_ff
+            total_vec, D_vec, (int)d_ff, d_vec_shift, d_vec_mask
         );
     } else {
-        int threads = (int)std::min<int64_t>(std::max<int64_t>(d_ff, 32), 256);
+        int64_t total_out_elements = N * d_ff;
+        int threads = 256;
+        int blocks = (int)((total_out_elements + threads - 1) / threads);
         fused_swiglu_backward_kernel<<<blocks, threads>>>(
             reinterpret_cast<const __nv_bfloat16*>(dout.data_ptr<c10::BFloat16>()),
             reinterpret_cast<const __nv_bfloat16*>(gu.data_ptr<c10::BFloat16>()),
             reinterpret_cast<__nv_bfloat16*>(dgu.data_ptr<c10::BFloat16>()),
-            N, (int)d_ff
+            total_out_elements, (int)d_ff
         );
     }
     return dgu;
@@ -3723,40 +3746,44 @@ __global__ void fused_harmonic_residual_fwd_vec8_kernel(
     const __nv_bfloat16* __restrict__ h_curr,
     const float* __restrict__ scale,
     __nv_bfloat16* __restrict__ out,
-    int64_t num_rows,
-    int D
+    int64_t total_vec,
+    int D_vec,
+    int D,
+    int d_vec_shift,
+    int d_vec_mask
 ) {
-    int D_vec = D >> 3; // 8 bf16 per uint4
-    for (int64_t row = blockIdx.x; row < num_rows; row += gridDim.x) {
-        const uint4* __restrict__ in_row   = reinterpret_cast<const uint4*>(h_in + row * D);
-        const uint4* __restrict__ curr_row = reinterpret_cast<const uint4*>(h_curr + row * D);
-        uint4* __restrict__ out_row        = reinterpret_cast<uint4*>(out + row * D);
+    int64_t vec_idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (vec_idx >= total_vec) return;
 
-        for (int col = threadIdx.x; col < D_vec; col += blockDim.x) {
-            uint4 in_u4   = in_row[col];
-            uint4 curr_u4 = curr_row[col];
-            uint4 out_u4;
+    int64_t row = (d_vec_shift >= 0) ? (vec_idx >> d_vec_shift) : (vec_idx / D_vec);
+    int col     = (d_vec_mask >= 0)  ? (int)(vec_idx & d_vec_mask) : (int)(vec_idx % D_vec);
 
-            const __nv_bfloat162* in_bf2   = reinterpret_cast<const __nv_bfloat162*>(&in_u4);
-            const __nv_bfloat162* curr_bf2 = reinterpret_cast<const __nv_bfloat162*>(&curr_u4);
-            __nv_bfloat162* out_bf2        = reinterpret_cast<__nv_bfloat162*>(&out_u4);
+    const uint4* __restrict__ in_row   = reinterpret_cast<const uint4*>(h_in + row * D);
+    const uint4* __restrict__ curr_row = reinterpret_cast<const uint4*>(h_curr + row * D);
+    uint4* __restrict__ out_row        = reinterpret_cast<uint4*>(out + row * D);
 
-            int base_d = col * 8;
-            #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                float2 in_f   = __bfloat1622float2(in_bf2[i]);
-                float2 curr_f = __bfloat1622float2(curr_bf2[i]);
-                float s0 = scale[base_d + i * 2];
-                float s1 = scale[base_d + i * 2 + 1];
+    uint4 in_u4   = in_row[col];
+    uint4 curr_u4 = curr_row[col];
+    uint4 out_u4;
 
-                float2 res;
-                res.x = in_f.x + (curr_f.x - in_f.x) * s0;
-                res.y = in_f.y + (curr_f.y - in_f.y) * s1;
-                out_bf2[i] = __float22bfloat162_rn(res);
-            }
-            out_row[col] = out_u4;
-        }
+    const __nv_bfloat162* in_bf2   = reinterpret_cast<const __nv_bfloat162*>(&in_u4);
+    const __nv_bfloat162* curr_bf2 = reinterpret_cast<const __nv_bfloat162*>(&curr_u4);
+    __nv_bfloat162* out_bf2        = reinterpret_cast<__nv_bfloat162*>(&out_u4);
+
+    int base_d = col * 8;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        float2 in_f   = __bfloat1622float2(in_bf2[i]);
+        float2 curr_f = __bfloat1622float2(curr_bf2[i]);
+        float s0 = scale[base_d + i * 2];
+        float s1 = scale[base_d + i * 2 + 1];
+
+        float2 res;
+        res.x = in_f.x + (curr_f.x - in_f.x) * s0;
+        res.y = in_f.y + (curr_f.y - in_f.y) * s1;
+        out_bf2[i] = __float22bfloat162_rn(res);
     }
+    out_row[col] = out_u4;
 }
 
 __global__ void fused_harmonic_residual_fwd_scalar_kernel(
@@ -3785,58 +3812,62 @@ __global__ void fused_harmonic_residual_bwd_vec8_kernel(
     __nv_bfloat16* __restrict__ grad_h_in,
     __nv_bfloat16* __restrict__ grad_h_curr,
     float* __restrict__ grad_scale,
-    int64_t num_rows,
-    int D
+    int64_t total_vec,
+    int D_vec,
+    int D,
+    int d_vec_shift,
+    int d_vec_mask
 ) {
-    int D_vec = D >> 3;
-    for (int64_t row = blockIdx.x; row < num_rows; row += gridDim.x) {
-        const uint4* __restrict__ go_row   = reinterpret_cast<const uint4*>(grad_out + row * D);
-        const uint4* __restrict__ in_row   = reinterpret_cast<const uint4*>(h_in + row * D);
-        const uint4* __restrict__ curr_row = reinterpret_cast<const uint4*>(h_curr + row * D);
-        uint4* __restrict__ gin_row        = reinterpret_cast<uint4*>(grad_h_in + row * D);
-        uint4* __restrict__ gcurr_row      = reinterpret_cast<uint4*>(grad_h_curr + row * D);
+    int64_t vec_idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (vec_idx >= total_vec) return;
 
-        for (int col = threadIdx.x; col < D_vec; col += blockDim.x) {
-            uint4 go_u4   = go_row[col];
-            uint4 in_u4   = in_row[col];
-            uint4 curr_u4 = curr_row[col];
-            uint4 gin_u4, gcurr_u4;
+    int64_t row = (d_vec_shift >= 0) ? (vec_idx >> d_vec_shift) : (vec_idx / D_vec);
+    int col     = (d_vec_mask >= 0)  ? (int)(vec_idx & d_vec_mask) : (int)(vec_idx % D_vec);
 
-            const __nv_bfloat162* go_bf2   = reinterpret_cast<const __nv_bfloat162*>(&go_u4);
-            const __nv_bfloat162* in_bf2   = reinterpret_cast<const __nv_bfloat162*>(&in_u4);
-            const __nv_bfloat162* curr_bf2 = reinterpret_cast<const __nv_bfloat162*>(&curr_u4);
-            __nv_bfloat162* gin_bf2        = reinterpret_cast<__nv_bfloat162*>(&gin_u4);
-            __nv_bfloat162* gcurr_bf2      = reinterpret_cast<__nv_bfloat162*>(&gcurr_u4);
+    const uint4* __restrict__ go_row   = reinterpret_cast<const uint4*>(grad_out + row * D);
+    const uint4* __restrict__ in_row   = reinterpret_cast<const uint4*>(h_in + row * D);
+    const uint4* __restrict__ curr_row = reinterpret_cast<const uint4*>(h_curr + row * D);
+    uint4* __restrict__ gin_row        = reinterpret_cast<uint4*>(grad_h_in + row * D);
+    uint4* __restrict__ gcurr_row      = reinterpret_cast<uint4*>(grad_h_curr + row * D);
 
-            int base_d = col * 8;
-            #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                float2 go_f   = __bfloat1622float2(go_bf2[i]);
-                float2 in_f   = __bfloat1622float2(in_bf2[i]);
-                float2 curr_f = __bfloat1622float2(curr_bf2[i]);
-                float s0 = scale[base_d + i * 2];
-                float s1 = scale[base_d + i * 2 + 1];
+    uint4 go_u4   = go_row[col];
+    uint4 in_u4   = in_row[col];
+    uint4 curr_u4 = curr_row[col];
+    uint4 gin_u4, gcurr_u4;
 
-                float2 gin_f, gcurr_f;
-                gin_f.x   = go_f.x * (1.0f - s0);
-                gin_f.y   = go_f.y * (1.0f - s1);
-                gcurr_f.x = go_f.x * s0;
-                gcurr_f.y = go_f.y * s1;
+    const __nv_bfloat162* go_bf2   = reinterpret_cast<const __nv_bfloat162*>(&go_u4);
+    const __nv_bfloat162* in_bf2   = reinterpret_cast<const __nv_bfloat162*>(&in_u4);
+    const __nv_bfloat162* curr_bf2 = reinterpret_cast<const __nv_bfloat162*>(&curr_u4);
+    __nv_bfloat162* gin_bf2        = reinterpret_cast<__nv_bfloat162*>(&gin_u4);
+    __nv_bfloat162* gcurr_bf2      = reinterpret_cast<__nv_bfloat162*>(&gcurr_u4);
 
-                gin_bf2[i]   = __float22bfloat162_rn(gin_f);
-                gcurr_bf2[i] = __float22bfloat162_rn(gcurr_f);
+    int base_d = col * 8;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        float2 go_f   = __bfloat1622float2(go_bf2[i]);
+        float2 in_f   = __bfloat1622float2(in_bf2[i]);
+        float2 curr_f = __bfloat1622float2(curr_bf2[i]);
+        float s0 = scale[base_d + i * 2];
+        float s1 = scale[base_d + i * 2 + 1];
 
-                if (grad_scale != nullptr) {
-                    float ds0 = go_f.x * (curr_f.x - in_f.x);
-                    float ds1 = go_f.y * (curr_f.y - in_f.y);
-                    atomicAdd(&grad_scale[base_d + i * 2], ds0);
-                    atomicAdd(&grad_scale[base_d + i * 2 + 1], ds1);
-                }
-            }
-            gin_row[col]   = gin_u4;
-            gcurr_row[col] = gcurr_u4;
+        float2 gin_f, gcurr_f;
+        gin_f.x   = go_f.x * (1.0f - s0);
+        gin_f.y   = go_f.y * (1.0f - s1);
+        gcurr_f.x = go_f.x * s0;
+        gcurr_f.y = go_f.y * s1;
+
+        gin_bf2[i]   = __float22bfloat162_rn(gin_f);
+        gcurr_bf2[i] = __float22bfloat162_rn(gcurr_f);
+
+        if (grad_scale != nullptr) {
+            float ds0 = go_f.x * (curr_f.x - in_f.x);
+            float ds1 = go_f.y * (curr_f.y - in_f.y);
+            atomicAdd(&grad_scale[base_d + i * 2], ds0);
+            atomicAdd(&grad_scale[base_d + i * 2 + 1], ds1);
         }
     }
+    gin_row[col]   = gin_u4;
+    gcurr_row[col] = gcurr_u4;
 }
 
 __global__ void fused_harmonic_residual_bwd_scalar_kernel(
@@ -3882,16 +3913,21 @@ torch::Tensor fused_harmonic_residual_forward_cuda(
 
     int D = (int)scale.numel();
     int64_t N = total_elements / D;
-    int blocks = (int)std::min<int64_t>(N, 65535);
 
     if (D % 8 == 0) {
-        int threads = (int)std::min<int64_t>(std::max<int64_t>(D / 8, 32), 256);
+        int D_vec = (int)(D >> 3);
+        int64_t total_vec = N * D_vec;
+        bool is_pow2 = (D_vec & (D_vec - 1)) == 0;
+        int d_vec_shift = is_pow2 ? __builtin_ctz(D_vec) : -1;
+        int d_vec_mask = is_pow2 ? (D_vec - 1) : -1;
+        int threads = 256;
+        int blocks = (int)((total_vec + threads - 1) / threads);
         fused_harmonic_residual_fwd_vec8_kernel<<<blocks, threads>>>(
             reinterpret_cast<const __nv_bfloat16*>(h_in.data_ptr<c10::BFloat16>()),
             reinterpret_cast<const __nv_bfloat16*>(h_curr.data_ptr<c10::BFloat16>()),
             scale_f.data_ptr<float>(),
             reinterpret_cast<__nv_bfloat16*>(out.data_ptr<c10::BFloat16>()),
-            N, D
+            total_vec, D_vec, D, d_vec_shift, d_vec_mask
         );
     } else {
         int threads = 256;
@@ -3927,10 +3963,15 @@ std::vector<torch::Tensor> fused_harmonic_residual_backward_cuda(
 
     int D = (int)scale.numel();
     int64_t N = total_elements / D;
-    int blocks = (int)std::min<int64_t>(N, 65535);
 
     if (D % 8 == 0) {
-        int threads = (int)std::min<int64_t>(std::max<int64_t>(D / 8, 32), 256);
+        int D_vec = (int)(D >> 3);
+        int64_t total_vec = N * D_vec;
+        bool is_pow2 = (D_vec & (D_vec - 1)) == 0;
+        int d_vec_shift = is_pow2 ? __builtin_ctz(D_vec) : -1;
+        int d_vec_mask = is_pow2 ? (D_vec - 1) : -1;
+        int threads = 256;
+        int blocks = (int)((total_vec + threads - 1) / threads);
         fused_harmonic_residual_bwd_vec8_kernel<<<blocks, threads>>>(
             reinterpret_cast<const __nv_bfloat16*>(grad_out.data_ptr<c10::BFloat16>()),
             reinterpret_cast<const __nv_bfloat16*>(h_in.data_ptr<c10::BFloat16>()),
@@ -3939,7 +3980,7 @@ std::vector<torch::Tensor> fused_harmonic_residual_backward_cuda(
             reinterpret_cast<__nv_bfloat16*>(grad_h_in.data_ptr<c10::BFloat16>()),
             reinterpret_cast<__nv_bfloat16*>(grad_h_curr.data_ptr<c10::BFloat16>()),
             grad_scale.data_ptr<float>(),
-            N, D
+            total_vec, D_vec, D, d_vec_shift, d_vec_mask
         );
     } else {
         int threads = 256;

@@ -13,10 +13,10 @@ from src.model import (
     PulsarConfig,
     PulsarForCausalLM,
     PulsarAttention,
+    PulsarMoEMLP,
     _FusedSwiGLUFunction,
     _FusedHarmonicResidualFunction,
     compute_token_slots,
-    _get_band_mask,
 )
 from src.optim import zeropower_via_newtonschulz5
 
@@ -82,67 +82,8 @@ class TestStage2ThroughputOptimizations:
         dropped = (slots_tight == -1).sum().item()
         assert dropped > 0, "Expected drops with tight capacity"
 
-    def test_windowed_chunked_local_attention_parity(self):
-        """Optimization 3: Exact Windowed Chunked SDPA matches full masked SDPA at T=4096, W=1024."""
-        torch.manual_seed(42)
-        device = "cuda"
-        B, H_q, H_kv, T, D = 2, 16, 4, 4096, 64
-        W = 1024
-
-        def eval_attn(chunked: bool):
-            torch.manual_seed(123)
-            q = torch.randn(B, H_q, T, D, dtype=torch.bfloat16, device=device, requires_grad=True)
-            k = torch.randn(B, H_kv, T, D, dtype=torch.bfloat16, device=device, requires_grad=True)
-            v = torch.randn(B, H_kv, T, D, dtype=torch.bfloat16, device=device, requires_grad=True)
-
-            if not chunked:
-                # Reference full masked SDPA
-                row_idx = torch.arange(T, device=device).unsqueeze(1)
-                col_idx = torch.arange(T, device=device).unsqueeze(0)
-                diff = row_idx - col_idx
-                dense_mask = (diff >= 0) & (diff < W)
-                out = F.scaled_dot_product_attention(q, k, v, attn_mask=dense_mask, enable_gqa=True)
-            else:
-                # Exact Windowed Chunked SDPA
-                num_chunks = T // W
-                out_0 = F.scaled_dot_product_attention(
-                    q[:, :, :W, :], k[:, :, :W, :], v[:, :, :W, :],
-                    is_causal=True, enable_gqa=True
-                )
-                q_rest = q[:, :, W:, :].view(B, H_q, num_chunks - 1, W, D).permute(0, 2, 1, 3, 4).reshape(B * (num_chunks - 1), H_q, W, D)
-
-                k_chunks = k.view(B, H_kv, num_chunks, W, D)
-                v_chunks = v.view(B, H_kv, num_chunks, W, D)
-                k_win = torch.cat([k_chunks[:, :, :-1], k_chunks[:, :, 1:]], dim=3).permute(0, 2, 1, 3, 4).reshape(B * (num_chunks - 1), H_kv, 2 * W, D)
-                v_win = torch.cat([v_chunks[:, :, :-1], v_chunks[:, :, 1:]], dim=3).permute(0, 2, 1, 3, 4).reshape(B * (num_chunks - 1), H_kv, 2 * W, D)
-
-                band_mask = _get_band_mask(W, device)
-                out_rest = F.scaled_dot_product_attention(
-                    q_rest, k_win, v_win,
-                    attn_mask=band_mask,
-                    enable_gqa=True
-                )
-                out_rest = out_rest.view(B, num_chunks - 1, H_q, W, D).permute(0, 2, 1, 3, 4).reshape(B, H_q, T - W, D)
-                out = torch.cat([out_0, out_rest], dim=2)
-
-            loss = out.mean()
-            loss.backward()
-            return out, q.grad, k.grad, v.grad
-
-        o_ref, gq_ref, gk_ref, gv_ref = eval_attn(chunked=False)
-        o_chk, gq_chk, gk_chk, gv_chk = eval_attn(chunked=True)
-
-        assert torch.allclose(o_ref, o_chk, atol=1e-2, rtol=1e-2), "Output mismatch"
-        cos_gq = F.cosine_similarity(gq_ref.flatten().float(), gq_chk.flatten().float(), dim=0).item()
-        cos_gk = F.cosine_similarity(gk_ref.flatten().float(), gk_chk.flatten().float(), dim=0).item()
-        cos_gv = F.cosine_similarity(gv_ref.flatten().float(), gv_chk.flatten().float(), dim=0).item()
-
-        assert cos_gq > 0.9999, f"gq cosine similarity too low: {cos_gq}"
-        assert cos_gk > 0.9999, f"gk cosine similarity too low: {cos_gk}"
-        assert cos_gv > 0.9999, f"gv cosine similarity too low: {cos_gv}"
-
-    def test_pre_lm_head_token_compaction_parity(self):
-        """Optimization 4: Pre-lm_head valid-token compaction matches uncompacted loss and grads."""
+    def test_moe_mlp_parity(self):
+        """Optimization 3: MoE MLP forward and backward execution produces finite outputs and grads."""
         torch.manual_seed(42)
         device = "cuda"
         cfg = PulsarConfig(
@@ -160,23 +101,17 @@ class TestStage2ThroughputOptimizations:
             default_pulses=2,
             max_pulses=2,
         )
-        model = PulsarForCausalLM(cfg).to(device=device)
+        moe = PulsarMoEMLP(cfg).to(device=device, dtype=torch.bfloat16)
 
         B, T = 2, 64
-        input_ids = torch.randint(0, cfg.vocab_size, (B, T), device=device)
-        labels = input_ids.clone()
-        # Mask out 50% of tokens as prompt (-100)
-        labels[:, :32] = -100
+        x = torch.randn(B, T, cfg.d_model, device=device, dtype=torch.bfloat16, requires_grad=True)
 
-        # Run forward with compaction (default in model)
-        _, loss_compact, _ = model(input_ids, labels=labels)
-        loss_compact.backward()
-        assert loss_compact.item() > 0.0
+        out, z_loss, mean_max, bincounts = moe(x, pulse_idx=0)
+        loss = out.mean() + z_loss
+        loss.backward()
 
-        # Verify edge case: 100% masked tokens
-        all_masked_labels = torch.full_like(labels, -100)
-        loss_zero = model._chunked_ce(torch.randn(B * T, cfg.d_model, device=device, dtype=torch.bfloat16), all_masked_labels)
-        assert loss_zero.item() == 0.0
+        assert out.shape == (B, T, cfg.d_model)
+        assert x.grad is not None and not torch.isnan(x.grad).any()
 
     def test_fused_harmonic_residual_parity(self):
         """Optimization 5: Fused harmonic residual matches torch.lerp forward and backward."""

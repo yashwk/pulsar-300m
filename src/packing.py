@@ -437,79 +437,120 @@ def waste_fractions(plan: PackPlan) -> dict:
 # Loader
 # ---------------------------------------------------------------------------
 
-def build_chatml_labels(
-    part: np.ndarray,
+IM_START_TOKEN_ID = 1
+IM_END_TOKEN_ID = 2
+THINK_START_ID = 3
+THINK_END_ID = 4
+TOOL_CALL_START_ID = 5
+TOOL_CALL_END_ID = 6
+TOOL_RESPONSE_START_ID = 7
+TOOL_RESPONSE_END_ID = 8
+
+
+def _apply_prompt_loss_mask(
+    toks: np.ndarray,
+    y: np.ndarray,
+    n_real: int,
+    assistant_role_ids: set[int] | None = None,
+    newline_ids: set[int] | None = None,
     ignore_index: int = IGNORE_INDEX,
-    im_start_id: int = 1,
-    im_end_id: int = 2,
-    assistant_id: int = 957,
-    newline_id: int = 210,
-    tool_resp_id: int = 7,
-    tool_resp_end_id: int = 8,
+    im_start_id: int = IM_START_TOKEN_ID,
+    im_end_id: int = IM_END_TOKEN_ID,
+    tool_resp_id: int = TOOL_RESPONSE_START_ID,
+    tool_resp_end_id: int = TOOL_RESPONSE_END_ID,
 ) -> np.ndarray:
-    """Build target labels for a ChatML segment masking prompt loss.
+    """Mask prompt loss on ChatML turns, unmasking only assistant body and closing <|im_end|>."""
+    L = min(len(toks), n_real)
+    if L <= 1 or im_start_id not in toks[:L]:
+        return y
 
-    Labels are active (predicting next token) ONLY for tokens inside assistant responses
-    (<|im_start|>assistant\n through and including <|im_end|>), excluding tool responses.
-    System, user, and assistant prompt headers have target y = ignore_index (-100).
-    """
-    L = len(part)
-    y_part = np.full(L, ignore_index, dtype=np.int64)
-    if L <= 1:
-        return y_part
+    # Mask everything by default in ChatML segments
+    y[:L] = ignore_index
 
-    i = 0
-    while i < L:
-        if part[i] == im_start_id:
-            is_assistant = False
+    # Find turns
+    starts = np.flatnonzero(toks[:L] == im_start_id)
+    ends = np.flatnonzero(toks[:L] == im_end_id)
+
+    for s_idx in starts:
+        future_ends = ends[ends > s_idx]
+        e_idx = int(future_ends[0]) if future_ends.size > 0 else L - 1
+        turn_slice = toks[s_idx : e_idx + 1]
+
+        is_assistant = False
+        if assistant_role_ids:
+            if s_idx + 1 <= e_idx and toks[s_idx + 1] in assistant_role_ids:
+                is_assistant = True
+        elif not assistant_role_ids:
+            is_assistant = bool(
+                np.any((turn_slice == THINK_START_ID) | (turn_slice == TOOL_CALL_START_ID))
+            )
+
+        if is_assistant:
             header_end = -1
-            for k in range(i + 1, min(i + 8, L)):
-                if part[k] == assistant_id:
-                    is_assistant = True
-                if part[k] == newline_id:
+            n_ids = newline_ids if newline_ids else {210}
+            for k in range(s_idx + 1, min(s_idx + 16, e_idx + 1)):
+                if toks[k] in n_ids:
                     header_end = k
                     break
-                if part[k] == im_end_id or part[k] == im_start_id:
-                    break
+            if header_end == -1:
+                header_end = s_idx + 2
 
-            if is_assistant and header_end != -1 and header_end + 1 < L:
-                content_start = header_end + 1
-                turn_end = L - 1
-                for k in range(content_start, L):
-                    if part[k] == im_end_id:
-                        turn_end = k
-                        break
-                    elif part[k] == im_start_id:
-                        turn_end = k - 1
-                        break
+            content_start = header_end + 1
+            if content_start <= e_idx:
+                for t in range(content_start, e_idx + 1):
+                    if t - 1 >= 0 and t - 1 < L:
+                        y[t - 1] = toks[t]
 
-                for t in range(content_start, turn_end + 1):
-                    y_part[t - 1] = part[t]
-
-                # Mask tool_response segments inside the assistant turn
                 k = content_start
-                while k <= turn_end:
-                    if part[k] == tool_resp_id:
+                while k <= e_idx:
+                    if toks[k] == tool_resp_id:
                         resp_start = k
-                        resp_end = turn_end
-                        for m in range(resp_start, turn_end + 1):
-                            if part[m] == tool_resp_end_id:
+                        resp_end = e_idx
+                        for m in range(resp_start, e_idx + 1):
+                            if toks[m] == tool_resp_end_id:
                                 resp_end = m
                                 break
                         for t in range(resp_start, resp_end + 1):
-                            if t - 1 >= 0:
-                                y_part[t - 1] = ignore_index
+                            if t - 1 >= 0 and t - 1 < L:
+                                y[t - 1] = ignore_index
                         k = resp_end + 1
                     else:
                         k += 1
 
-                i = turn_end + 1
-            else:
-                i += 1
-        else:
-            i += 1
+    return y
 
-    return y_part
+
+def build_chatml_labels(
+    part: np.ndarray,
+    ignore_index: int = IGNORE_INDEX,
+    assistant_role_ids: set[int] | None = None,
+    newline_ids: set[int] | None = None,
+    im_start_id: int = IM_START_TOKEN_ID,
+    im_end_id: int = IM_END_TOKEN_ID,
+    tool_resp_id: int = TOOL_RESPONSE_START_ID,
+    tool_resp_end_id: int = TOOL_RESPONSE_END_ID,
+    **kwargs,
+) -> np.ndarray:
+    """Build target labels for a ChatML segment masking prompt loss."""
+    if assistant_role_ids is None and "assistant_id" in kwargs:
+        assistant_role_ids = {kwargs["assistant_id"]}
+    if newline_ids is None and "newline_id" in kwargs:
+        newline_ids = {kwargs["newline_id"]}
+    y_init = np.full(len(part), ignore_index, dtype=np.int64)
+    if len(part) > 1:
+        y_init[: len(part) - 1] = part[1:]
+    return _apply_prompt_loss_mask(
+        part,
+        y_init,
+        len(part),
+        assistant_role_ids=assistant_role_ids,
+        newline_ids=newline_ids,
+        ignore_index=ignore_index,
+        im_start_id=im_start_id,
+        im_end_id=im_end_id,
+        tool_resp_id=tool_resp_id,
+        tool_resp_end_id=tool_resp_end_id,
+    )
 
 
 class PackedBatchLoader:
@@ -526,12 +567,12 @@ class PackedBatchLoader:
         eos_id: int = EOS_TOKEN_ID,
         ignore_index: int = IGNORE_INDEX,
         mask_prompt_loss: bool = False,
-        im_start_id: int = 1,
-        im_end_id: int = 2,
-        assistant_id: int = 957,
-        newline_id: int = 210,
-        tool_response_id: int = 7,
-        tool_response_end_id: int = 8,
+        assistant_role_ids: set[int] | Sequence[int] | None = None,
+        newline_ids: set[int] | Sequence[int] | None = None,
+        im_start_id: int = IM_START_TOKEN_ID,
+        im_end_id: int = IM_END_TOKEN_ID,
+        tool_response_id: int = TOOL_RESPONSE_START_ID,
+        tool_response_end_id: int = TOOL_RESPONSE_END_ID,
     ):
         self.shards = list(shards)
         self.index = index
@@ -542,12 +583,12 @@ class PackedBatchLoader:
         self.eos_id = eos_id
         self.ignore_index = ignore_index
         self.mask_prompt_loss = mask_prompt_loss
+        self.assistant_role_ids = set(assistant_role_ids) if assistant_role_ids is not None else set()
+        self.newline_ids = set(newline_ids) if newline_ids is not None else {210}
         self.im_start_id = im_start_id
         self.im_end_id = im_end_id
-        self.assistant_id = assistant_id
-        self.newline_id = newline_id
-        self.tool_response_id = tool_response_id
-        self.tool_response_end_id = tool_response_end_id
+        self.tool_resp_id = tool_response_id
+        self.tool_resp_end_id = tool_response_end_id
         self._cursor = 0
         self._last_n_real: list[int] = []
 
@@ -569,6 +610,20 @@ class PackedBatchLoader:
         si = int(self.index.shard[d])
         s = int(self.index.start[d]) + off
         return np.asarray(self.shards[si][s:s + length], dtype=np.int64)
+
+    def _apply_prompt_loss_mask(self, toks: np.ndarray, y: np.ndarray, n_real: int) -> np.ndarray:
+        return _apply_prompt_loss_mask(
+            toks,
+            y,
+            n_real,
+            assistant_role_ids=self.assistant_role_ids,
+            newline_ids=self.newline_ids,
+            ignore_index=self.ignore_index,
+            im_start_id=self.im_start_id,
+            im_end_id=self.im_end_id,
+            tool_resp_id=self.tool_resp_id,
+            tool_resp_end_id=self.tool_resp_end_id,
+        )
 
     def _build_window(self, w: Window) -> tuple[np.ndarray, np.ndarray, int]:
         parts = [self._read(int(d), int(o), int(l)) for d, o, l in zip(w.docs, w.offs, w.lens)]
@@ -594,16 +649,10 @@ class PackedBatchLoader:
                 if L == 0:
                     continue
                 if self.im_start_id in part:
-                    y_p = build_chatml_labels(
-                        part,
-                        ignore_index=self.ignore_index,
-                        im_start_id=self.im_start_id,
-                        im_end_id=self.im_end_id,
-                        assistant_id=self.assistant_id,
-                        newline_id=self.newline_id,
-                        tool_resp_id=self.tool_response_id,
-                        tool_resp_end_id=self.tool_response_end_id,
-                    )
+                    y_p = np.full(L, self.ignore_index, dtype=np.int64)
+                    if L > 1:
+                        y_p[: L - 1] = part[1:L]
+                    y_p = self._apply_prompt_loss_mask(part, y_p, L)
                 else:
                     y_p = np.full(L, self.ignore_index, dtype=np.int64)
                     if L > 1:

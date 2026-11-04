@@ -4,10 +4,13 @@ import pytest
 from src.packing import (
     BESTFIT,
     IGNORE_INDEX,
+    TOOL_CALL_START_ID,
+    THINK_START_ID,
     DocIndex,
     PackedBatchLoader,
     PackPlan,
     Window,
+    _apply_prompt_loss_mask,
     build_chatml_labels,
     build_doc_index,
     plan_epoch,
@@ -184,3 +187,38 @@ def test_packed_batch_loader_mask_prompt_loss():
     assert y_list[asst_nl_pos + 3] == 302, "Assistant answer target must be preserved"
     assert y_list[asst_nl_pos + 4] == 2, "Assistant closing <im_end> target must be preserved"
     assert y_list[asst_nl_pos + 5] == IGNORE_INDEX, "Post-turn token must be -100"
+
+
+def test_prompt_loss_mask_role_gating():
+    """Verify role-gating: system turns with tool hints stay masked, plain assistant turns are unmasked."""
+    # (a) System turn that contains TOOL_CALL_START_ID (5) inside its body:
+    # <im_start> system \n Instructions: use <tool_call> {"name": "test"} </tool_call> <im_end>
+    system_part = np.array([
+        1, 2240, 210, 100, TOOL_CALL_START_ID, 200, 6, 101, 2
+    ], dtype=np.int64)
+
+    y_system = np.full(len(system_part), IGNORE_INDEX, dtype=np.int64)
+    _apply_prompt_loss_mask(system_part, y_system, len(system_part), assistant_role_ids={957, 11911})
+    assert (y_system == IGNORE_INDEX).all(), "System turn with tool_call hint must remain 100% masked"
+
+    # (b) Plain assistant turn without THINK_START_ID or TOOL_CALL_START_ID:
+    # <im_start> assistant \n Hello, this is a plain message without thinking or tool call! <im_end>
+    asst_part = np.array([
+        1, 957, 210, 301, 302, 303, 304, 2
+    ], dtype=np.int64)
+
+    y_asst = np.full(len(asst_part), IGNORE_INDEX, dtype=np.int64)
+    _apply_prompt_loss_mask(asst_part, y_asst, len(asst_part), assistant_role_ids={957, 11911})
+
+    # Header masked
+    assert y_asst[0] == IGNORE_INDEX  # target of im_start (assistant)
+    assert y_asst[1] == IGNORE_INDEX  # target of assistant (\n)
+    # Body unmasked:
+    assert y_asst[2] == 301  # at \n, predicts 301
+    assert y_asst[3] == 302  # at 301, predicts 302
+    assert y_asst[4] == 303  # at 302, predicts 303
+    assert y_asst[5] == 304  # at 303, predicts 304
+    assert y_asst[6] == 2    # at 304, predicts <im_end> (2)
+    # After turn:
+    assert y_asst[7] == IGNORE_INDEX  # at <im_end>, predicts next turn (masked)
+

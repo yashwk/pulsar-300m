@@ -653,6 +653,18 @@ def train():
         except Exception as e:
             val_shards.append(np.fromfile(p, dtype=np.uint16))
 
+    # Initialize Tokenizer for canary prompt decoding and ChatML loss masking
+    print(f"[Pulsar] Loading tokenizer '{args.tokenizer}'...")
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+    assert len(tokenizer) == 32768, f"Expected 32768 vocab, got {len(tokenizer)}"
+    print(f"[Pulsar] Verified tokenizer vocabulary size: {len(tokenizer):,} tokens")
+
+    assistant_role_ids = {
+        tokenizer.encode("assistant", add_special_tokens=False)[0],
+        tokenizer.encode(" assistant", add_special_tokens=False)[0],
+    }
+    newline_ids = {tokenizer.encode("\n", add_special_tokens=False)[0]}
+
     if args.sampler == "bestfit":
         # EOS-aligned packing: whole documents fill each window; leftover space comes
         # only from documents longer than seq_len (which can never be intact anyway).
@@ -667,6 +679,8 @@ def train():
             train_shards, train_index, train_plan,
             micro_batch_size=args.micro_batch_size, device=device,
             mask_prompt_loss=args.mask_prompt_loss,
+            assistant_role_ids=assistant_role_ids,
+            newline_ids=newline_ids,
         )
         pad_frac = train_plan.pad_tokens / max(1, train_plan.capacity_tokens)
         print(f"[Pulsar] Sampler: bestfit | {len(train_plan):,} windows | "
@@ -680,6 +694,8 @@ def train():
             val_shards, val_index, val_plan,
             micro_batch_size=args.micro_batch_size, device=device,
             mask_prompt_loss=args.mask_prompt_loss,
+            assistant_role_ids=assistant_role_ids,
+            newline_ids=newline_ids,
         )
         train_loader.total_tokens = int(train_index.length.sum())
         val_loader.total_tokens = int(val_index.length.sum())
@@ -700,12 +716,6 @@ def train():
     print(f"Grad Accum Steps:    {grad_accum}")
     print(f"Effective Step:      {effective_global_batch_tokens:,} tokens / optimizer step")
     print(f"Recurrent Pulses:    K = {args.num_pulses}")
-
-    # Initialize Tokenizer for canary prompt decoding
-    print(f"[Pulsar] Loading tokenizer '{args.tokenizer}'...")
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
-    assert len(tokenizer) == 32768, f"Expected 32768 vocab, got {len(tokenizer)}"
-    print(f"[Pulsar] Verified tokenizer vocabulary size: {len(tokenizer):,} tokens")
 
     # Initialize Model
     cfg = PulsarConfig(

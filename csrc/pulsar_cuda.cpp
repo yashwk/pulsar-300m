@@ -145,6 +145,25 @@ std::vector<torch::Tensor> moe_slots_from_order_cuda(
     int64_t capacity
 );
 
+std::vector<torch::Tensor> moe_assign_slots_cuda(
+    torch::Tensor topk_idx,
+    int64_t num_experts,
+    int64_t capacity
+);
+
+torch::Tensor fused_harmonic_residual_forward_cuda(
+    torch::Tensor h_in,
+    torch::Tensor h_curr,
+    torch::Tensor scale
+);
+
+std::vector<torch::Tensor> fused_harmonic_residual_backward_cuda(
+    torch::Tensor grad_out,
+    torch::Tensor h_in,
+    torch::Tensor h_curr,
+    torch::Tensor scale
+);
+
 void fused_sr_update_cuda(
     torch::Tensor dst,
     torch::Tensor update,
@@ -215,6 +234,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     m.def("moe_slots_from_order", &moe_slots_from_order_cuda, "Fused MoE Slots from Order (CUDA)",
           py::arg("flat_e"), py::arg("order"), py::arg("num_experts"), py::arg("capacity"));
+    m.def("moe_assign_slots", &moe_assign_slots_cuda, "Direct Fused MoE Slot Assignment (CUDA)",
+          py::arg("topk_idx"), py::arg("num_experts"), py::arg("capacity"));
+    m.def("fused_harmonic_residual_forward", &fused_harmonic_residual_forward_cuda, "Fused Harmonic Residual Forward (CUDA)",
+          py::arg("h_in"), py::arg("h_curr"), py::arg("scale"));
+    m.def("fused_harmonic_residual_backward", &fused_harmonic_residual_backward_cuda, "Fused Harmonic Residual Backward (CUDA)",
+          py::arg("grad_out"), py::arg("h_in"), py::arg("h_curr"), py::arg("scale"));
 
     m.def("fused_sr_update", &fused_sr_update_cuda, "Fused Muon Stochastic Rounding Update (CUDA)",
           py::arg("dst"), py::arg("update"), py::arg("lr_scale"), py::arg("wd_factor"), py::arg("seed"));

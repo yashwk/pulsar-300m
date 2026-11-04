@@ -361,7 +361,7 @@ def test_drop_priority_is_lowest_weight_first():
     topk_idx = torch.zeros(N, K, dtype=torch.long, device="cuda")
     w = torch.arange(N * K, device="cuda", dtype=torch.float32).reshape(N, K)
 
-    slots = compute_token_slots(topk_idx, w, E, capacity)
+    slots = compute_token_slots(topk_idx, w, E, capacity, sort_by_weight=True)
     survived = slots.reshape(-1) >= 0
     kept = w.reshape(-1)[survived]
     dropped = w.reshape(-1)[~survived]

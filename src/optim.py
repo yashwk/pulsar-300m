@@ -35,24 +35,30 @@ except ImportError:
     HAS_PULSAR_CUDA = False
 
 
-@torch.compile
 def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
+    """Batched 3D Newton-Schulz iteration using fused cuBLAS bmm and baddbmm in eager mode.
+
+    A = torch.bmm(X, X.transpose(-2, -1))
+    B = torch.baddbmm(A, A, A, beta=b, alpha=c)   # B = b*A + c*(A @ A)
+    X = torch.baddbmm(X, B, X, beta=a, alpha=1.0) # X = a*X + B @ X
+    """
     assert G.ndim in (2, 3), f"Expected 2D matrix or 3D batched matrix, got {G.shape}"
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
-    norm = X.norm(dim=(-2, -1), keepdim=True) + eps
-    X = X / norm
-    transposed = False
-    if X.size(-2) > X.size(-1):
-        X = X.transpose(-2, -1)
-        transposed = True
-    for _ in range(steps):
-        A = X @ X.transpose(-2, -1)
-        B = b * A + c * (A @ A)
-        X = a * X + B @ X
+    is_2d = (X.ndim == 2)
+    if is_2d:
+        X = X.unsqueeze(0)
+    transposed = X.size(-2) > X.size(-1)
     if transposed:
         X = X.transpose(-2, -1)
-    return X
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)
+    for _ in range(steps):
+        A = torch.bmm(X, X.transpose(-2, -1))
+        B = torch.baddbmm(A, A, A, beta=b, alpha=c)
+        X = torch.baddbmm(X, B, X, beta=a, alpha=1.0)
+    if transposed:
+        X = X.transpose(-2, -1)
+    return X.squeeze(0) if is_2d else X
 
 
 def stochastic_round_(dst: torch.Tensor, src_fp32: torch.Tensor, generator: torch.Generator | None = None) -> None:

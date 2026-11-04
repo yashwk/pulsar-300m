@@ -687,52 +687,56 @@ std::vector<torch::Tensor> swiglu_backward_cuda(torch::Tensor dout, torch::Tenso
 }
 
 // ------------------------------------------------------------------------
-// 3b. Fused SwiGLU: direct [..., 2*d_ff] -> [..., d_ff] (zero .chunk/.contiguous overhead)
+// 3b. Fused SwiGLU: direct [..., 2*d_ff] -> [..., d_ff] (128-bit vectorized)
 // ------------------------------------------------------------------------
 __global__ void fused_swiglu_forward_vec8_kernel(
     const __nv_bfloat16* __restrict__ gu,
     __nv_bfloat16* __restrict__ out,
-    int N,
-    int d_ff,
-    int vec_per_row
+    int64_t num_rows,
+    int d_ff
 ) {
-    int v_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_vec = N * vec_per_row;
-    if (v_idx < total_vec) {
-        int r = v_idx / vec_per_row;
-        int vc = v_idx % vec_per_row;
-        int row_offset = r * (2 * d_ff);
-        uint4 g_u4 = *reinterpret_cast<const uint4*>(gu + row_offset + vc * 8);
-        uint4 u_u4 = *reinterpret_cast<const uint4*>(gu + row_offset + d_ff + vc * 8);
-        const __nv_bfloat16* g_bf = reinterpret_cast<const __nv_bfloat16*>(&g_u4);
-        const __nv_bfloat16* u_bf = reinterpret_cast<const __nv_bfloat16*>(&u_u4);
+    int D_vec = d_ff >> 3; // 8 bf16 per uint4
+    for (int64_t row = blockIdx.x; row < num_rows; row += gridDim.x) {
+        const uint4* __restrict__ gate_row = reinterpret_cast<const uint4*>(gu + row * (2 * d_ff));
+        const uint4* __restrict__ up_row   = reinterpret_cast<const uint4*>(gu + row * (2 * d_ff) + d_ff);
+        uint4* __restrict__ out_row        = reinterpret_cast<uint4*>(out + row * d_ff);
 
-        __nv_bfloat16 out_bf[8];
-        #pragma unroll
-        for (int k = 0; k < 8; ++k) {
-            float g_val = __bfloat162float(g_bf[k]);
-            float u_val = __bfloat162float(u_bf[k]);
-            out_bf[k] = __float2bfloat16(silu_fast(g_val) * u_val);
+        for (int col = threadIdx.x; col < D_vec; col += blockDim.x) {
+            uint4 g_u4 = gate_row[col];
+            uint4 u_u4 = up_row[col];
+            uint4 o_u4;
+
+            const __nv_bfloat162* g_bf2 = reinterpret_cast<const __nv_bfloat162*>(&g_u4);
+            const __nv_bfloat162* u_bf2 = reinterpret_cast<const __nv_bfloat162*>(&u_u4);
+            __nv_bfloat162* o_bf2       = reinterpret_cast<__nv_bfloat162*>(&o_u4);
+
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                float2 gf = __bfloat1622float2(g_bf2[i]);
+                float2 uf = __bfloat1622float2(u_bf2[i]);
+                float2 of_val;
+                of_val.x = silu_fast(gf.x) * uf.x;
+                of_val.y = silu_fast(gf.y) * uf.y;
+                o_bf2[i] = __float22bfloat162_rn(of_val);
+            }
+            out_row[col] = o_u4;
         }
-        *reinterpret_cast<uint4*>(out + v_idx * 8) = *reinterpret_cast<uint4*>(out_bf);
     }
 }
 
 __global__ void fused_swiglu_forward_kernel(
     const __nv_bfloat16* __restrict__ gu,
     __nv_bfloat16* __restrict__ out,
-    int N,
+    int64_t num_rows,
     int d_ff
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = N * d_ff;
-    if (idx < total) {
-        int r = idx / d_ff;
-        int c = idx % d_ff;
-        int row_offset = r * (2 * d_ff);
-        float g_val = __bfloat162float(gu[row_offset + c]);
-        float u_val = __bfloat162float(gu[row_offset + d_ff + c]);
-        out[idx] = __float2bfloat16(silu_fast(g_val) * u_val);
+    for (int64_t row = blockIdx.x; row < num_rows; row += gridDim.x) {
+        int64_t row_offset = row * (2 * d_ff);
+        for (int c = threadIdx.x; c < d_ff; c += blockDim.x) {
+            float g_val = __bfloat162float(gu[row_offset + c]);
+            float u_val = __bfloat162float(gu[row_offset + d_ff + c]);
+            out[row * d_ff + c] = __float2bfloat16(silu_fast(g_val) * u_val);
+        }
     }
 }
 
@@ -740,38 +744,52 @@ __global__ void fused_swiglu_backward_vec8_kernel(
     const __nv_bfloat16* __restrict__ dout,
     const __nv_bfloat16* __restrict__ gu,
     __nv_bfloat16* __restrict__ dgu,
-    int N,
-    int d_ff,
-    int vec_per_row
+    int64_t num_rows,
+    int d_ff
 ) {
-    int v_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_vec = N * vec_per_row;
-    if (v_idx < total_vec) {
-        int r = v_idx / vec_per_row;
-        int vc = v_idx % vec_per_row;
-        int row_offset = r * (2 * d_ff);
+    int D_vec = d_ff >> 3;
+    for (int64_t row = blockIdx.x; row < num_rows; row += gridDim.x) {
+        const uint4* __restrict__ do_row = reinterpret_cast<const uint4*>(dout + row * d_ff);
+        const uint4* __restrict__ g_row  = reinterpret_cast<const uint4*>(gu + row * (2 * d_ff));
+        const uint4* __restrict__ u_row  = reinterpret_cast<const uint4*>(gu + row * (2 * d_ff) + d_ff);
+        uint4* __restrict__ dg_row       = reinterpret_cast<uint4*>(dgu + row * (2 * d_ff));
+        uint4* __restrict__ du_row       = reinterpret_cast<uint4*>(dgu + row * (2 * d_ff) + d_ff);
 
-        uint4 do_u4 = *reinterpret_cast<const uint4*>(dout + v_idx * 8);
-        uint4 g_u4 = *reinterpret_cast<const uint4*>(gu + row_offset + vc * 8);
-        uint4 u_u4 = *reinterpret_cast<const uint4*>(gu + row_offset + d_ff + vc * 8);
-        const __nv_bfloat16* do_bf = reinterpret_cast<const __nv_bfloat16*>(&do_u4);
-        const __nv_bfloat16* g_bf = reinterpret_cast<const __nv_bfloat16*>(&g_u4);
-        const __nv_bfloat16* u_bf = reinterpret_cast<const __nv_bfloat16*>(&u_u4);
+        for (int col = threadIdx.x; col < D_vec; col += blockDim.x) {
+            uint4 do_u4 = do_row[col];
+            uint4 g_u4  = g_row[col];
+            uint4 u_u4  = u_row[col];
+            uint4 dg_u4, du_u4;
 
-        __nv_bfloat16 dg_bf[8];
-        __nv_bfloat16 du_bf[8];
-        #pragma unroll
-        for (int k = 0; k < 8; ++k) {
-            float do_val = __bfloat162float(do_bf[k]);
-            float g_val = __bfloat162float(g_bf[k]);
-            float u_val = __bfloat162float(u_bf[k]);
-            float du = do_val * silu_fast(g_val);
-            float dg = do_val * u_val * dsilu_fast(g_val);
-            dg_bf[k] = __float2bfloat16(dg);
-            du_bf[k] = __float2bfloat16(du);
+            const __nv_bfloat162* do_bf2 = reinterpret_cast<const __nv_bfloat162*>(&do_u4);
+            const __nv_bfloat162* g_bf2  = reinterpret_cast<const __nv_bfloat162*>(&g_u4);
+            const __nv_bfloat162* u_bf2  = reinterpret_cast<const __nv_bfloat162*>(&u_u4);
+            __nv_bfloat162* dg_bf2       = reinterpret_cast<__nv_bfloat162*>(&dg_u4);
+            __nv_bfloat162* du_bf2       = reinterpret_cast<__nv_bfloat162*>(&du_u4);
+
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                float2 dy = __bfloat1622float2(do_bf2[i]);
+                float2 g  = __bfloat1622float2(g_bf2[i]);
+                float2 u  = __bfloat1622float2(u_bf2[i]);
+
+                float sig_x = 1.0f / (1.0f + __expf(-g.x));
+                float sig_y = 1.0f / (1.0f + __expf(-g.y));
+                float silu_x = g.x * sig_x;
+                float silu_y = g.y * sig_y;
+
+                float2 dg, du;
+                du.x = dy.x * silu_x;
+                du.y = dy.y * silu_y;
+                dg.x = dy.x * u.x * sig_x * (1.0f + g.x * (1.0f - sig_x));
+                dg.y = dy.y * u.y * sig_y * (1.0f + g.y * (1.0f - sig_y));
+
+                dg_bf2[i] = __float22bfloat162_rn(dg);
+                du_bf2[i] = __float22bfloat162_rn(du);
+            }
+            dg_row[col] = dg_u4;
+            du_row[col] = du_u4;
         }
-        *reinterpret_cast<uint4*>(dgu + row_offset + vc * 8) = *reinterpret_cast<uint4*>(dg_bf);
-        *reinterpret_cast<uint4*>(dgu + row_offset + d_ff + vc * 8) = *reinterpret_cast<uint4*>(du_bf);
     }
 }
 
@@ -779,49 +797,48 @@ __global__ void fused_swiglu_backward_kernel(
     const __nv_bfloat16* __restrict__ dout,
     const __nv_bfloat16* __restrict__ gu,
     __nv_bfloat16* __restrict__ dgu,
-    int N,
+    int64_t num_rows,
     int d_ff
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = N * d_ff;
-    if (idx < total) {
-        int r = idx / d_ff;
-        int c = idx % d_ff;
-        int row_offset = r * (2 * d_ff);
-        float do_val = __bfloat162float(dout[idx]);
-        float g_val = __bfloat162float(gu[row_offset + c]);
-        float u_val = __bfloat162float(gu[row_offset + d_ff + c]);
-        float du = do_val * silu_fast(g_val);
-        float dg = do_val * u_val * dsilu_fast(g_val);
-        dgu[row_offset + c] = __float2bfloat16(dg);
-        dgu[row_offset + d_ff + c] = __float2bfloat16(du);
+    for (int64_t row = blockIdx.x; row < num_rows; row += gridDim.x) {
+        int64_t row_offset = row * (2 * d_ff);
+        int64_t out_offset = row * d_ff;
+        for (int c = threadIdx.x; c < d_ff; c += blockDim.x) {
+            float do_val = __bfloat162float(dout[out_offset + c]);
+            float g_val = __bfloat162float(gu[row_offset + c]);
+            float u_val = __bfloat162float(gu[row_offset + d_ff + c]);
+            float du = do_val * silu_fast(g_val);
+            float dg = do_val * u_val * dsilu_fast(g_val);
+            dgu[row_offset + c] = __float2bfloat16(dg);
+            dgu[row_offset + d_ff + c] = __float2bfloat16(du);
+        }
     }
 }
 
 torch::Tensor fused_swiglu_forward_cuda(torch::Tensor gu, int64_t d_ff) {
     TORCH_CHECK(gu.is_cuda() && gu.is_contiguous(), "gu must be a contiguous CUDA tensor");
     TORCH_CHECK(gu.scalar_type() == torch::kBFloat16, "gu must be bfloat16");
-    int total_elements = gu.numel();
+    int64_t total_elements = gu.numel();
     if (total_elements == 0) {
         auto sizes = gu.sizes().vec();
         sizes.back() = d_ff;
         return torch::empty(sizes, gu.options());
     }
-    int N = total_elements / (2 * d_ff);
+    int64_t N = total_elements / (2 * d_ff);
     auto sizes = gu.sizes().vec();
     sizes.back() = d_ff;
     auto out = torch::empty(sizes, gu.options());
+    int blocks = (int)std::min<int64_t>(N, 65535);
     if (d_ff % 8 == 0) {
-        int vec_per_row = (int)d_ff / 8;
-        int total_vec = N * vec_per_row;
-        fused_swiglu_forward_vec8_kernel<<<(total_vec + 255) / 256, 256>>>(
+        int threads = (int)std::min<int64_t>(std::max<int64_t>(d_ff / 8, 32), 256);
+        fused_swiglu_forward_vec8_kernel<<<blocks, threads>>>(
             reinterpret_cast<const __nv_bfloat16*>(gu.data_ptr<c10::BFloat16>()),
             reinterpret_cast<__nv_bfloat16*>(out.data_ptr<c10::BFloat16>()),
-            N, (int)d_ff, vec_per_row
+            N, (int)d_ff
         );
     } else {
-        int total = N * d_ff;
-        fused_swiglu_forward_kernel<<<(total + 255) / 256, 256>>>(
+        int threads = (int)std::min<int64_t>(std::max<int64_t>(d_ff, 32), 256);
+        fused_swiglu_forward_kernel<<<blocks, threads>>>(
             reinterpret_cast<const __nv_bfloat16*>(gu.data_ptr<c10::BFloat16>()),
             reinterpret_cast<__nv_bfloat16*>(out.data_ptr<c10::BFloat16>()),
             N, (int)d_ff
@@ -836,23 +853,23 @@ torch::Tensor fused_swiglu_backward_cuda(torch::Tensor dout, torch::Tensor gu, i
     TORCH_CHECK(dout.is_contiguous(), "dout must be contiguous");
     TORCH_CHECK(dout.scalar_type() == torch::kBFloat16, "dout must be bfloat16");
     auto dgu = torch::empty_like(gu);
-    int total_elements = gu.numel();
+    int64_t total_elements = gu.numel();
     if (total_elements == 0) {
         return dgu;
     }
-    int N = total_elements / (2 * d_ff);
+    int64_t N = total_elements / (2 * d_ff);
+    int blocks = (int)std::min<int64_t>(N, 65535);
     if (d_ff % 8 == 0) {
-        int vec_per_row = (int)d_ff / 8;
-        int total_vec = N * vec_per_row;
-        fused_swiglu_backward_vec8_kernel<<<(total_vec + 255) / 256, 256>>>(
+        int threads = (int)std::min<int64_t>(std::max<int64_t>(d_ff / 8, 32), 256);
+        fused_swiglu_backward_vec8_kernel<<<blocks, threads>>>(
             reinterpret_cast<const __nv_bfloat16*>(dout.data_ptr<c10::BFloat16>()),
             reinterpret_cast<const __nv_bfloat16*>(gu.data_ptr<c10::BFloat16>()),
             reinterpret_cast<__nv_bfloat16*>(dgu.data_ptr<c10::BFloat16>()),
-            N, (int)d_ff, vec_per_row
+            N, (int)d_ff
         );
     } else {
-        int total = N * d_ff;
-        fused_swiglu_backward_kernel<<<(total + 255) / 256, 256>>>(
+        int threads = (int)std::min<int64_t>(std::max<int64_t>(d_ff, 32), 256);
+        fused_swiglu_backward_kernel<<<blocks, threads>>>(
             reinterpret_cast<const __nv_bfloat16*>(dout.data_ptr<c10::BFloat16>()),
             reinterpret_cast<const __nv_bfloat16*>(gu.data_ptr<c10::BFloat16>()),
             reinterpret_cast<__nv_bfloat16*>(dgu.data_ptr<c10::BFloat16>()),
@@ -3055,6 +3072,173 @@ std::vector<torch::Tensor> moe_slots_from_order_cuda(
 }
 
 // ------------------------------------------------------------------------
+// 14b. Direct MoE Slot Assignment (Deterministic 2-Pass Prefix-Sum, No Sort)
+// ------------------------------------------------------------------------
+
+template <typename T>
+__global__ void moe_count_block_hist_kernel(
+    const T* __restrict__ topk_idx,
+    int32_t* __restrict__ block_hist,
+    int M,
+    int num_experts
+) {
+    __shared__ int warp_hist[8][32];
+    int lane = threadIdx.x % 32;
+    int wid = threadIdx.x / 32;
+
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int e = (i < M) ? (int)topk_idx[i] : -1;
+
+    for (int exp = 0; exp < num_experts; ++exp) {
+        unsigned int mask = __ballot_sync(0xffffffff, e == exp);
+        if (lane == 0) {
+            warp_hist[wid][exp] = __popc(mask);
+        }
+    }
+    __syncthreads();
+
+    if (wid == 0 && lane < num_experts) {
+        int sum = 0;
+        #pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            sum += warp_hist[w][lane];
+        }
+        block_hist[blockIdx.x * num_experts + lane] = sum;
+    }
+}
+
+__global__ void moe_block_prefix_sum_kernel(
+    int32_t* __restrict__ block_hist,
+    int64_t* __restrict__ expert_counts,
+    int num_blocks,
+    int num_experts
+) {
+    int e = threadIdx.x;
+    if (e < num_experts) {
+        int64_t acc = 0;
+        for (int b = 0; b < num_blocks; ++b) {
+            int cnt = block_hist[b * num_experts + e];
+            block_hist[b * num_experts + e] = (int32_t)acc;
+            acc += cnt;
+        }
+        expert_counts[e] = acc;
+    }
+}
+
+template <typename T>
+__global__ void moe_assign_slots_direct_kernel(
+    const T* __restrict__ topk_idx,
+    const int32_t* __restrict__ block_hist,
+    int32_t* __restrict__ slots,
+    int M,
+    int num_experts,
+    int capacity
+) {
+    __shared__ int warp_prefix[8][32];
+    int lane = threadIdx.x % 32;
+    int wid = threadIdx.x / 32;
+
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int e = (i < M) ? (int)topk_idx[i] : -1;
+    int intra_warp_rank = 0;
+
+    for (int exp = 0; exp < num_experts; ++exp) {
+        unsigned int mask = __ballot_sync(0xffffffff, e == exp);
+        if (e == exp) {
+            intra_warp_rank = __popc(mask & ((1u << lane) - 1u));
+        }
+        if (lane == 0) {
+            warp_prefix[wid][exp] = __popc(mask);
+        }
+    }
+    __syncthreads();
+
+    if (wid == 0 && lane < num_experts) {
+        int acc = 0;
+        #pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            int cnt = warp_prefix[w][lane];
+            warp_prefix[w][lane] = acc;
+            acc += cnt;
+        }
+    }
+    __syncthreads();
+
+    if (i < M) {
+        if (e >= 0 && e < num_experts) {
+            int block_base = block_hist[blockIdx.x * num_experts + e];
+            int intra_block_rank = warp_prefix[wid][e] + intra_warp_rank;
+            int global_rank = block_base + intra_block_rank;
+            slots[i] = (global_rank < capacity) ? (int32_t)global_rank : -1;
+        } else {
+            slots[i] = -1;
+        }
+    }
+}
+
+std::vector<torch::Tensor> moe_assign_slots_cuda(
+    torch::Tensor topk_idx,
+    int64_t num_experts,
+    int64_t capacity
+) {
+    TORCH_CHECK(topk_idx.is_cuda() && topk_idx.is_contiguous(), "topk_idx must be contiguous CUDA");
+    int64_t M = topk_idx.numel();
+    auto slots = torch::empty(topk_idx.sizes(), torch::TensorOptions().dtype(torch::kInt32).device(topk_idx.device()));
+    auto expert_counts = torch::zeros({num_experts}, torch::TensorOptions().dtype(torch::kInt64).device(topk_idx.device()));
+    if (M == 0) {
+        return {slots, expert_counts};
+    }
+    int threads = 256;
+    int blocks = (int)((M + threads - 1) / threads);
+    auto block_hist = torch::empty({blocks, (int)num_experts}, torch::TensorOptions().dtype(torch::kInt32).device(topk_idx.device()));
+
+    if (topk_idx.scalar_type() == torch::kInt64) {
+        moe_count_block_hist_kernel<int64_t><<<blocks, threads>>>(
+            topk_idx.data_ptr<int64_t>(),
+            block_hist.data_ptr<int32_t>(),
+            (int)M,
+            (int)num_experts
+        );
+    } else {
+        moe_count_block_hist_kernel<int32_t><<<blocks, threads>>>(
+            topk_idx.data_ptr<int32_t>(),
+            block_hist.data_ptr<int32_t>(),
+            (int)M,
+            (int)num_experts
+        );
+    }
+
+    moe_block_prefix_sum_kernel<<<1, 32>>>(
+        block_hist.data_ptr<int32_t>(),
+        expert_counts.data_ptr<int64_t>(),
+        blocks,
+        (int)num_experts
+    );
+
+    if (topk_idx.scalar_type() == torch::kInt64) {
+        moe_assign_slots_direct_kernel<int64_t><<<blocks, threads>>>(
+            topk_idx.data_ptr<int64_t>(),
+            block_hist.data_ptr<int32_t>(),
+            slots.data_ptr<int32_t>(),
+            (int)M,
+            (int)num_experts,
+            (int)capacity
+        );
+    } else {
+        moe_assign_slots_direct_kernel<int32_t><<<blocks, threads>>>(
+            topk_idx.data_ptr<int32_t>(),
+            block_hist.data_ptr<int32_t>(),
+            slots.data_ptr<int32_t>(),
+            (int)M,
+            (int)num_experts,
+            (int)capacity
+        );
+    }
+
+    return {slots, expert_counts};
+}
+
+// ------------------------------------------------------------------------
 // 15. Fused Muon Weight Decay + Stochastic Rounding Update
 // ------------------------------------------------------------------------
 
@@ -3528,4 +3712,248 @@ std::vector<torch::Tensor> causal_depthwise_conv1d_k4_backward_cuda(
     );
 
     return {dx, dweight};
+}
+
+// ------------------------------------------------------------------------
+// 16. Fused Harmonic Residual Refinement: out = h_in + (h_curr - h_in) * scale
+// ------------------------------------------------------------------------
+
+__global__ void fused_harmonic_residual_fwd_vec8_kernel(
+    const __nv_bfloat16* __restrict__ h_in,
+    const __nv_bfloat16* __restrict__ h_curr,
+    const float* __restrict__ scale,
+    __nv_bfloat16* __restrict__ out,
+    int64_t num_rows,
+    int D
+) {
+    int D_vec = D >> 3; // 8 bf16 per uint4
+    for (int64_t row = blockIdx.x; row < num_rows; row += gridDim.x) {
+        const uint4* __restrict__ in_row   = reinterpret_cast<const uint4*>(h_in + row * D);
+        const uint4* __restrict__ curr_row = reinterpret_cast<const uint4*>(h_curr + row * D);
+        uint4* __restrict__ out_row        = reinterpret_cast<uint4*>(out + row * D);
+
+        for (int col = threadIdx.x; col < D_vec; col += blockDim.x) {
+            uint4 in_u4   = in_row[col];
+            uint4 curr_u4 = curr_row[col];
+            uint4 out_u4;
+
+            const __nv_bfloat162* in_bf2   = reinterpret_cast<const __nv_bfloat162*>(&in_u4);
+            const __nv_bfloat162* curr_bf2 = reinterpret_cast<const __nv_bfloat162*>(&curr_u4);
+            __nv_bfloat162* out_bf2        = reinterpret_cast<__nv_bfloat162*>(&out_u4);
+
+            int base_d = col * 8;
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                float2 in_f   = __bfloat1622float2(in_bf2[i]);
+                float2 curr_f = __bfloat1622float2(curr_bf2[i]);
+                float s0 = scale[base_d + i * 2];
+                float s1 = scale[base_d + i * 2 + 1];
+
+                float2 res;
+                res.x = in_f.x + (curr_f.x - in_f.x) * s0;
+                res.y = in_f.y + (curr_f.y - in_f.y) * s1;
+                out_bf2[i] = __float22bfloat162_rn(res);
+            }
+            out_row[col] = out_u4;
+        }
+    }
+}
+
+__global__ void fused_harmonic_residual_fwd_scalar_kernel(
+    const __nv_bfloat16* __restrict__ h_in,
+    const __nv_bfloat16* __restrict__ h_curr,
+    const float* __restrict__ scale,
+    __nv_bfloat16* __restrict__ out,
+    int64_t total_elements,
+    int D
+) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total_elements) {
+        int d = (int)(idx % D);
+        float in_f = __bfloat162float(h_in[idx]);
+        float curr_f = __bfloat162float(h_curr[idx]);
+        float s = scale[d];
+        out[idx] = __float2bfloat16(in_f + (curr_f - in_f) * s);
+    }
+}
+
+__global__ void fused_harmonic_residual_bwd_vec8_kernel(
+    const __nv_bfloat16* __restrict__ grad_out,
+    const __nv_bfloat16* __restrict__ h_in,
+    const __nv_bfloat16* __restrict__ h_curr,
+    const float* __restrict__ scale,
+    __nv_bfloat16* __restrict__ grad_h_in,
+    __nv_bfloat16* __restrict__ grad_h_curr,
+    float* __restrict__ grad_scale,
+    int64_t num_rows,
+    int D
+) {
+    int D_vec = D >> 3;
+    for (int64_t row = blockIdx.x; row < num_rows; row += gridDim.x) {
+        const uint4* __restrict__ go_row   = reinterpret_cast<const uint4*>(grad_out + row * D);
+        const uint4* __restrict__ in_row   = reinterpret_cast<const uint4*>(h_in + row * D);
+        const uint4* __restrict__ curr_row = reinterpret_cast<const uint4*>(h_curr + row * D);
+        uint4* __restrict__ gin_row        = reinterpret_cast<uint4*>(grad_h_in + row * D);
+        uint4* __restrict__ gcurr_row      = reinterpret_cast<uint4*>(grad_h_curr + row * D);
+
+        for (int col = threadIdx.x; col < D_vec; col += blockDim.x) {
+            uint4 go_u4   = go_row[col];
+            uint4 in_u4   = in_row[col];
+            uint4 curr_u4 = curr_row[col];
+            uint4 gin_u4, gcurr_u4;
+
+            const __nv_bfloat162* go_bf2   = reinterpret_cast<const __nv_bfloat162*>(&go_u4);
+            const __nv_bfloat162* in_bf2   = reinterpret_cast<const __nv_bfloat162*>(&in_u4);
+            const __nv_bfloat162* curr_bf2 = reinterpret_cast<const __nv_bfloat162*>(&curr_u4);
+            __nv_bfloat162* gin_bf2        = reinterpret_cast<__nv_bfloat162*>(&gin_u4);
+            __nv_bfloat162* gcurr_bf2      = reinterpret_cast<__nv_bfloat162*>(&gcurr_u4);
+
+            int base_d = col * 8;
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                float2 go_f   = __bfloat1622float2(go_bf2[i]);
+                float2 in_f   = __bfloat1622float2(in_bf2[i]);
+                float2 curr_f = __bfloat1622float2(curr_bf2[i]);
+                float s0 = scale[base_d + i * 2];
+                float s1 = scale[base_d + i * 2 + 1];
+
+                float2 gin_f, gcurr_f;
+                gin_f.x   = go_f.x * (1.0f - s0);
+                gin_f.y   = go_f.y * (1.0f - s1);
+                gcurr_f.x = go_f.x * s0;
+                gcurr_f.y = go_f.y * s1;
+
+                gin_bf2[i]   = __float22bfloat162_rn(gin_f);
+                gcurr_bf2[i] = __float22bfloat162_rn(gcurr_f);
+
+                if (grad_scale != nullptr) {
+                    float ds0 = go_f.x * (curr_f.x - in_f.x);
+                    float ds1 = go_f.y * (curr_f.y - in_f.y);
+                    atomicAdd(&grad_scale[base_d + i * 2], ds0);
+                    atomicAdd(&grad_scale[base_d + i * 2 + 1], ds1);
+                }
+            }
+            gin_row[col]   = gin_u4;
+            gcurr_row[col] = gcurr_u4;
+        }
+    }
+}
+
+__global__ void fused_harmonic_residual_bwd_scalar_kernel(
+    const __nv_bfloat16* __restrict__ grad_out,
+    const __nv_bfloat16* __restrict__ h_in,
+    const __nv_bfloat16* __restrict__ h_curr,
+    const float* __restrict__ scale,
+    __nv_bfloat16* __restrict__ grad_h_in,
+    __nv_bfloat16* __restrict__ grad_h_curr,
+    float* __restrict__ grad_scale,
+    int64_t total_elements,
+    int D
+) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total_elements) {
+        int d = (int)(idx % D);
+        float go_f   = __bfloat162float(grad_out[idx]);
+        float in_f   = __bfloat162float(h_in[idx]);
+        float curr_f = __bfloat162float(h_curr[idx]);
+        float s      = scale[d];
+        grad_h_in[idx]   = __float2bfloat16(go_f * (1.0f - s));
+        grad_h_curr[idx] = __float2bfloat16(go_f * s);
+        if (grad_scale != nullptr) {
+            atomicAdd(&grad_scale[d], go_f * (curr_f - in_f));
+        }
+    }
+}
+
+torch::Tensor fused_harmonic_residual_forward_cuda(
+    torch::Tensor h_in,
+    torch::Tensor h_curr,
+    torch::Tensor scale
+) {
+    TORCH_CHECK(h_in.is_cuda() && h_in.is_contiguous(), "h_in must be contiguous CUDA");
+    TORCH_CHECK(h_curr.is_cuda() && h_curr.is_contiguous(), "h_curr must be contiguous CUDA");
+    TORCH_CHECK(h_in.scalar_type() == torch::kBFloat16, "h_in must be bfloat16");
+    TORCH_CHECK(h_curr.scalar_type() == torch::kBFloat16, "h_curr must be bfloat16");
+
+    auto scale_f = scale.to(torch::kFloat32).contiguous();
+    auto out = torch::empty_like(h_in);
+    int64_t total_elements = h_in.numel();
+    if (total_elements == 0) return out;
+
+    int D = (int)scale.numel();
+    int64_t N = total_elements / D;
+    int blocks = (int)std::min<int64_t>(N, 65535);
+
+    if (D % 8 == 0) {
+        int threads = (int)std::min<int64_t>(std::max<int64_t>(D / 8, 32), 256);
+        fused_harmonic_residual_fwd_vec8_kernel<<<blocks, threads>>>(
+            reinterpret_cast<const __nv_bfloat16*>(h_in.data_ptr<c10::BFloat16>()),
+            reinterpret_cast<const __nv_bfloat16*>(h_curr.data_ptr<c10::BFloat16>()),
+            scale_f.data_ptr<float>(),
+            reinterpret_cast<__nv_bfloat16*>(out.data_ptr<c10::BFloat16>()),
+            N, D
+        );
+    } else {
+        int threads = 256;
+        int scalar_blocks = (int)((total_elements + threads - 1) / threads);
+        fused_harmonic_residual_fwd_scalar_kernel<<<scalar_blocks, threads>>>(
+            reinterpret_cast<const __nv_bfloat16*>(h_in.data_ptr<c10::BFloat16>()),
+            reinterpret_cast<const __nv_bfloat16*>(h_curr.data_ptr<c10::BFloat16>()),
+            scale_f.data_ptr<float>(),
+            reinterpret_cast<__nv_bfloat16*>(out.data_ptr<c10::BFloat16>()),
+            total_elements, D
+        );
+    }
+    return out;
+}
+
+std::vector<torch::Tensor> fused_harmonic_residual_backward_cuda(
+    torch::Tensor grad_out,
+    torch::Tensor h_in,
+    torch::Tensor h_curr,
+    torch::Tensor scale
+) {
+    TORCH_CHECK(grad_out.is_cuda() && grad_out.is_contiguous(), "grad_out must be contiguous CUDA");
+    TORCH_CHECK(h_in.is_cuda() && h_in.is_contiguous(), "h_in must be contiguous CUDA");
+    TORCH_CHECK(h_curr.is_cuda() && h_curr.is_contiguous(), "h_curr must be contiguous CUDA");
+
+    auto scale_f = scale.to(torch::kFloat32).contiguous();
+    auto grad_h_in = torch::empty_like(h_in);
+    auto grad_h_curr = torch::empty_like(h_curr);
+    auto grad_scale = torch::zeros_like(scale_f);
+
+    int64_t total_elements = h_in.numel();
+    if (total_elements == 0) return {grad_h_in, grad_h_curr, grad_scale.to(scale.dtype())};
+
+    int D = (int)scale.numel();
+    int64_t N = total_elements / D;
+    int blocks = (int)std::min<int64_t>(N, 65535);
+
+    if (D % 8 == 0) {
+        int threads = (int)std::min<int64_t>(std::max<int64_t>(D / 8, 32), 256);
+        fused_harmonic_residual_bwd_vec8_kernel<<<blocks, threads>>>(
+            reinterpret_cast<const __nv_bfloat16*>(grad_out.data_ptr<c10::BFloat16>()),
+            reinterpret_cast<const __nv_bfloat16*>(h_in.data_ptr<c10::BFloat16>()),
+            reinterpret_cast<const __nv_bfloat16*>(h_curr.data_ptr<c10::BFloat16>()),
+            scale_f.data_ptr<float>(),
+            reinterpret_cast<__nv_bfloat16*>(grad_h_in.data_ptr<c10::BFloat16>()),
+            reinterpret_cast<__nv_bfloat16*>(grad_h_curr.data_ptr<c10::BFloat16>()),
+            grad_scale.data_ptr<float>(),
+            N, D
+        );
+    } else {
+        int threads = 256;
+        int scalar_blocks = (int)((total_elements + threads - 1) / threads);
+        fused_harmonic_residual_bwd_scalar_kernel<<<scalar_blocks, threads>>>(
+            reinterpret_cast<const __nv_bfloat16*>(grad_out.data_ptr<c10::BFloat16>()),
+            reinterpret_cast<const __nv_bfloat16*>(h_in.data_ptr<c10::BFloat16>()),
+            reinterpret_cast<const __nv_bfloat16*>(h_curr.data_ptr<c10::BFloat16>()),
+            scale_f.data_ptr<float>(),
+            reinterpret_cast<__nv_bfloat16*>(grad_h_in.data_ptr<c10::BFloat16>()),
+            reinterpret_cast<__nv_bfloat16*>(grad_h_curr.data_ptr<c10::BFloat16>()),
+            grad_scale.data_ptr<float>(),
+            total_elements, D
+        );
+    }
+    return {grad_h_in, grad_h_curr, grad_scale.to(scale.dtype())};
 }

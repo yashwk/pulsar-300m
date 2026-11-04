@@ -581,6 +581,8 @@ def train():
                              "safe: capacity changes no checkpoint format.")
     parser.add_argument("--drop-warn-pct", type=float, default=2.0,
                         help="Warn when overall MoE drop rate exceeds this percentage")
+    parser.add_argument("--moe-grouped-mm", action=argparse.BooleanOptionalAction, default=False,
+                        help="Use dropless torch._grouped_mm MoE path if available")
     parser.add_argument("--no-stochastic-rounding", action="store_true",
                         help="Disable stochastic rounding for bf16 weights (default: on). "
                              "Without SR, sub-ulp updates and weight decay round away.")
@@ -621,6 +623,8 @@ def train():
         torch.set_float32_matmul_precision("high")
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+        if hasattr(torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction"):
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
         torch.backends.cudnn.benchmark = True
 
     print("=======================================================")
@@ -725,6 +729,8 @@ def train():
     )
     if args.moe_capacity_factor is not None:
         cfg.moe_capacity_factor = args.moe_capacity_factor
+    if args.moe_grouped_mm is not None:
+        cfg.moe_grouped_mm = args.moe_grouped_mm
     # None means "use the config default" (True); the flag only overrides when given.
     if args.per_pulse_bias is not None:
         cfg.per_pulse_bias = args.per_pulse_bias

@@ -34,8 +34,9 @@ else:
             _ext._get_cuda_arch_flags([base_a])
             valid_archs.append(a)
         except Exception:
-            # Fall back to 9.0+PTX so Blackwell JIT compiles from Hopper PTX
-            if "9.0+PTX" not in valid_archs:
+            if base_a in ("10.0", "100", "compute_100", "sm_100"):
+                extra_nvcc_args.extend(["-gencode=arch=compute_100,code=sm_100", "-gencode=arch=compute_100,code=compute_100"])
+            elif "9.0+PTX" not in valid_archs:
                 valid_archs.append("9.0+PTX")
     if valid_archs:
         os.environ["TORCH_CUDA_ARCH_LIST"] = ";".join(valid_archs)

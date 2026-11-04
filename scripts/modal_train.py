@@ -345,7 +345,6 @@ def main(
     no_milestones: bool = False,
     mask_prompt_loss: bool = False,
     reset_dataset: bool = False,
-    detach: bool = True,
 ):
     # Calculate invariant hardware-agnostic batch dynamics
     tokens_per_micro = mbs * seq_len

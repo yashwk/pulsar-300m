@@ -333,7 +333,9 @@ def generate_canary(
     tokenizer: AutoTokenizer,
     prompt: str,
     max_new_tokens: int = 64,
-    temperature: float = 0.7,
+    temperature: float = 0.2,
+    top_k: int = 40,
+    top_p: float = 0.9,
     device: str = "cuda",
     repetition_penalty: float = 1.15,
 ) -> str:
@@ -376,9 +378,27 @@ def generate_canary(
                         else:
                             next_token_logits[0, tok_id] = val * repetition_penalty
 
-                scaled_logits = next_token_logits / max(1e-4, temperature)
-                probs = F.softmax(scaled_logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
+                if temperature > 0:
+                    scaled_logits = next_token_logits / max(1e-4, temperature)
+
+                    if top_k > 0:
+                        v, _ = torch.topk(scaled_logits, min(top_k, scaled_logits.size(-1)))
+                        scaled_logits[scaled_logits < v[:, [-1]]] = -float("Inf")
+
+                    if top_p < 1.0:
+                        sorted_logits, sorted_indices = torch.sort(scaled_logits, descending=True)
+                        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                        sorted_indices_to_remove = cumulative_probs > top_p
+                        sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+                        sorted_indices_to_remove[:, 0] = False
+                        indices_to_remove = sorted_indices[0, sorted_indices_to_remove[0]]
+                        scaled_logits[0, indices_to_remove] = -float("Inf")
+
+                    probs = F.softmax(scaled_logits, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+                else:
+                    next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+
                 input_ids = torch.cat([input_ids, next_token], dim=1)
 
                 if next_token.item() in stop_token_ids:
@@ -573,6 +593,8 @@ def train():
     parser.add_argument("--thermal-cooldown-seconds", type=int, default=100, help="Duration of thermal cooldown pause")
     parser.add_argument("--reset-dataset", action="store_true", default=False,
                         help="Reset dataset window cursor to 0 upon resume (crucial when switching shards or transitioning curriculum stages, while preserving model weights, step count, and optimizer moments).")
+    parser.add_argument("--mask-prompt-loss", action="store_true", default=False,
+                        help="Mask prompt loss so CE loss is computed only on assistant turns in ChatML documents")
     parser.add_argument("--rollback-telemetry-to-step", type=int, default=None,
                         help="Prune telemetry files (metrics.jsonl, metrics.csv, live_status.json, train.log) "
                              "back to a specific step without running training.")
@@ -644,10 +666,11 @@ def train():
         train_loader = PackedBatchLoader(
             train_shards, train_index, train_plan,
             micro_batch_size=args.micro_batch_size, device=device,
+            mask_prompt_loss=args.mask_prompt_loss,
         )
         pad_frac = train_plan.pad_tokens / max(1, train_plan.capacity_tokens)
         print(f"[Pulsar] Sampler: bestfit | {len(train_plan):,} windows | "
-              f"padding {pad_frac*100:.3f}% | built in {time.time()-_t0:.1f}s")
+              f"padding {pad_frac*100:.3f}% | mask_prompt_loss: {args.mask_prompt_loss} | built in {time.time()-_t0:.1f}s")
         val_index = build_doc_index(val_shards)
         val_plan = plan_epoch(
             val_index.length.astype(np.int64), args.seq_len,
@@ -656,6 +679,7 @@ def train():
         val_loader = PackedBatchLoader(
             val_shards, val_index, val_plan,
             micro_batch_size=args.micro_batch_size, device=device,
+            mask_prompt_loss=args.mask_prompt_loss,
         )
         train_loader.total_tokens = int(train_index.length.sum())
         val_loader.total_tokens = int(val_index.length.sum())
@@ -825,7 +849,13 @@ def train():
             "id": 2,
             "tag": "Agentic MCP Tool Call",
             "category": "Tool Calling",
-            "prompt": "<|im_start|>user\nRename scan_01.pdf to 2026_Invoice.pdf in /home/user/docs<|im_end|>\n<|im_start|>assistant\n<|tool_call|>",
+            "prompt": (
+                "<|im_start|>system\n"
+                '{"name": "rename_file", "description": "Rename or move a file on the filesystem", "parameters": {"src": "string", "dest": "string"}}'
+                "<|im_end|>\n"
+                "<|im_start|>user\nRename scan_01.pdf to 2026_Invoice.pdf in /home/user/docs<|im_end|>\n"
+                "<|im_start|>assistant\n<|tool_call|>"
+            ),
         },
         {
             "id": 3,
@@ -1207,7 +1237,7 @@ def train():
                 category = canary_meta["category"]
                 try:
                     generation = generate_canary(
-                        model, tokenizer, prompt, max_new_tokens=args.canary_tokens, temperature=0.7, device=device
+                        model, tokenizer, prompt, max_new_tokens=args.canary_tokens, temperature=0.2, top_k=40, top_p=0.9, device=device
                     )
                     generation_clean = generation.strip()
                     print(f"  [{tag}] {generation_clean.replace(chr(10), ' ')[:140]}...")

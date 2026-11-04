@@ -437,6 +437,81 @@ def waste_fractions(plan: PackPlan) -> dict:
 # Loader
 # ---------------------------------------------------------------------------
 
+def build_chatml_labels(
+    part: np.ndarray,
+    ignore_index: int = IGNORE_INDEX,
+    im_start_id: int = 1,
+    im_end_id: int = 2,
+    assistant_id: int = 957,
+    newline_id: int = 210,
+    tool_resp_id: int = 7,
+    tool_resp_end_id: int = 8,
+) -> np.ndarray:
+    """Build target labels for a ChatML segment masking prompt loss.
+
+    Labels are active (predicting next token) ONLY for tokens inside assistant responses
+    (<|im_start|>assistant\n through and including <|im_end|>), excluding tool responses.
+    System, user, and assistant prompt headers have target y = ignore_index (-100).
+    """
+    L = len(part)
+    y_part = np.full(L, ignore_index, dtype=np.int64)
+    if L <= 1:
+        return y_part
+
+    i = 0
+    while i < L:
+        if part[i] == im_start_id:
+            is_assistant = False
+            header_end = -1
+            for k in range(i + 1, min(i + 8, L)):
+                if part[k] == assistant_id:
+                    is_assistant = True
+                if part[k] == newline_id:
+                    header_end = k
+                    break
+                if part[k] == im_end_id or part[k] == im_start_id:
+                    break
+
+            if is_assistant and header_end != -1 and header_end + 1 < L:
+                content_start = header_end + 1
+                turn_end = L - 1
+                for k in range(content_start, L):
+                    if part[k] == im_end_id:
+                        turn_end = k
+                        break
+                    elif part[k] == im_start_id:
+                        turn_end = k - 1
+                        break
+
+                for t in range(content_start, turn_end + 1):
+                    y_part[t - 1] = part[t]
+
+                # Mask tool_response segments inside the assistant turn
+                k = content_start
+                while k <= turn_end:
+                    if part[k] == tool_resp_id:
+                        resp_start = k
+                        resp_end = turn_end
+                        for m in range(resp_start, turn_end + 1):
+                            if part[m] == tool_resp_end_id:
+                                resp_end = m
+                                break
+                        for t in range(resp_start, resp_end + 1):
+                            if t - 1 >= 0:
+                                y_part[t - 1] = ignore_index
+                        k = resp_end + 1
+                    else:
+                        k += 1
+
+                i = turn_end + 1
+            else:
+                i += 1
+        else:
+            i += 1
+
+    return y_part
+
+
 class PackedBatchLoader:
     """Serve ``(x, y)`` batches from a packed plan, reading per-window from shards."""
 
@@ -450,6 +525,13 @@ class PackedBatchLoader:
         device: str = "cpu",
         eos_id: int = EOS_TOKEN_ID,
         ignore_index: int = IGNORE_INDEX,
+        mask_prompt_loss: bool = False,
+        im_start_id: int = 1,
+        im_end_id: int = 2,
+        assistant_id: int = 957,
+        newline_id: int = 210,
+        tool_response_id: int = 7,
+        tool_response_end_id: int = 8,
     ):
         self.shards = list(shards)
         self.index = index
@@ -459,6 +541,13 @@ class PackedBatchLoader:
         self.device = device
         self.eos_id = eos_id
         self.ignore_index = ignore_index
+        self.mask_prompt_loss = mask_prompt_loss
+        self.im_start_id = im_start_id
+        self.im_end_id = im_end_id
+        self.assistant_id = assistant_id
+        self.newline_id = newline_id
+        self.tool_response_id = tool_response_id
+        self.tool_response_end_id = tool_response_end_id
         self._cursor = 0
         self._last_n_real: list[int] = []
 
@@ -481,13 +570,57 @@ class PackedBatchLoader:
         s = int(self.index.start[d]) + off
         return np.asarray(self.shards[si][s:s + length], dtype=np.int64)
 
-    def _build_window(self, w: Window) -> tuple[np.ndarray, int]:
+    def _build_window(self, w: Window) -> tuple[np.ndarray, np.ndarray, int]:
         parts = [self._read(int(d), int(o), int(l)) for d, o, l in zip(w.docs, w.offs, w.lens)]
-        toks = np.concatenate(parts) if parts else np.zeros(0, dtype=np.int64)
+        if not parts:
+            toks = np.zeros(self.seq_len, dtype=np.int64)
+            y = np.full(self.seq_len, self.ignore_index, dtype=np.int64)
+            return toks, y, 0
+
+        toks = np.concatenate(parts)
         n_real = int(toks.size)
+
+        if not self.mask_prompt_loss:
+            y = np.full(max(n_real, self.seq_len), self.ignore_index, dtype=np.int64)
+            if n_real > 1:
+                y[: n_real - 1] = toks[1:n_real]
+            if n_real > 1:
+                eos_at = np.flatnonzero(toks[: n_real - 1] == self.eos_id)
+                y[eos_at] = self.ignore_index
+        else:
+            y_parts = []
+            for part in parts:
+                L = len(part)
+                if L == 0:
+                    continue
+                if self.im_start_id in part:
+                    y_p = build_chatml_labels(
+                        part,
+                        ignore_index=self.ignore_index,
+                        im_start_id=self.im_start_id,
+                        im_end_id=self.im_end_id,
+                        assistant_id=self.assistant_id,
+                        newline_id=self.newline_id,
+                        tool_resp_id=self.tool_response_id,
+                        tool_resp_end_id=self.tool_response_end_id,
+                    )
+                else:
+                    y_p = np.full(L, self.ignore_index, dtype=np.int64)
+                    if L > 1:
+                        y_p[: L - 1] = part[1:L]
+                y_parts.append(y_p)
+
+            y = np.concatenate(y_parts) if y_parts else np.zeros(0, dtype=np.int64)
+            if y.size < self.seq_len:
+                y = np.concatenate([y, np.full(self.seq_len - y.size, self.ignore_index, dtype=np.int64)])
+            if n_real > 1:
+                eos_at = np.flatnonzero(toks[: n_real - 1] == self.eos_id)
+                y[eos_at] = self.ignore_index
+
         if n_real < self.seq_len:
             toks = np.concatenate([toks, np.full(self.seq_len - n_real, self.eos_id, dtype=np.int64)])
-        return toks[: self.seq_len], n_real
+
+        return toks[: self.seq_len], y[: self.seq_len], n_real
 
     def get_batch(self, window_ids: Iterable[int] | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         """Return ``(x, y)`` with next-token targets.
@@ -525,17 +658,7 @@ class PackedBatchLoader:
             wid = wid % n_windows   # next epoch: reuse the plan cyclically
             if wid >= n_windows:
                 break
-            toks, n_real = self._build_window(self.plan.windows[wid])
-            y = np.full(self.seq_len, self.ignore_index, dtype=np.int64)
-            if n_real > 1:
-                y[: n_real - 1] = toks[1:n_real]
-            # Cross-document transitions inside a packed window: at a document's
-            # terminating EOS the next token belongs to a DIFFERENT document, so
-            # predicting it from that EOS teaches an association that does not exist.
-            # The EOS itself remains a valid target (it is predicted from real text).
-            if n_real > 1:
-                eos_at = np.flatnonzero(toks[: n_real - 1] == self.eos_id)
-                y[eos_at] = self.ignore_index
+            toks, y, n_real = self._build_window(self.plan.windows[wid])
             self.x_buf[i].copy_(torch.from_numpy(toks))
             self.y_buf[i].copy_(torch.from_numpy(y))
             self._last_n_real.append(int(n_real))

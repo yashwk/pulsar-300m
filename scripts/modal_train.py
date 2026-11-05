@@ -344,7 +344,7 @@ def main(
     eval_every: int = 500,
     eval_iters: int = 5,
     save_every: int = 1000,
-    resume: str = None,
+    resume: str = "latest",
     compile: bool = False,
     output_ckpt: str = None,
     no_milestones: bool = False,

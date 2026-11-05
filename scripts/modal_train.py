@@ -363,9 +363,7 @@ def main(
         if mask_prompt_loss is None:
             mask_prompt_loss = True
         if reset_dataset is None:
-            reset_dataset = True
-        if resume is None:
-            resume = "/checkpoints/stage1_base.pt"
+            reset_dataset = False
 
         # Stage 2 contains 1,425,432,776 training tokens across shards 8, 9, 10
         stage2_train_tokens = 1_425_432_776

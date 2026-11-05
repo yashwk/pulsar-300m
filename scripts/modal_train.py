@@ -350,6 +350,7 @@ def main(
     no_milestones: bool = False,
     mask_prompt_loss: bool = None,
     reset_dataset: bool = None,
+    spawn: bool = False,
 ):
     if stage == 2:
         if train_shards is None:
@@ -486,4 +487,21 @@ def main(
     print(f"[Modal Orchestrator] Launching training run on NVIDIA {selected_gpu}...")
     print("[Modal Orchestrator] Note: Running with 'modal run --detach' ensures the cloud container continues if local terminal disconnects.")
     print("[Modal Orchestrator] Graceful Shutdown: Run 'modal app stop pulsar-training' to gracefully finish the step, save latest.pt, and stop.")
+
+    if spawn:
+        call = remote_fn.spawn(**kwargs)
+        print(f"\n{'='*70}")
+        print(f" [Modal Orchestrator] Detached Job Spawned: {call.object_id}")
+        print(f"{'='*70}")
+        print(f"  Target GPU:         NVIDIA {selected_gpu}")
+        print(f"  Target Horizon:     Step {effective_target_step:,}")
+        print(f"  Execution Mode:     Autonomous Cloud Task (Detached)")
+        print(f"  Local Status:       Entrypoint exiting cleanly now (code 0)")
+        print(f"  Network Immunity:   Safe against local terminal exit, Wi-Fi disconnect, or sleep")
+        print(f"  Live Monitor:       https://yashwk--pulsar-monitor-serve.us-east.modal.run")
+        print(f"  CLI Log Stream:     modal app logs pulsar-training")
+        print(f"  Graceful Stop:      modal app stop pulsar-training")
+        print(f"{'='*70}\n")
+        return
+
     remote_fn.remote(**kwargs)

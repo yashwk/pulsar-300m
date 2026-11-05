@@ -1558,7 +1558,7 @@
       <!-- 1. Current Run Target -->
       <div class="progress-box">
         <div class="progress-top-row">
-          <span class="progress-title-sub">Current Run Target</span>
+          <span class="progress-title-sub" id="stepProgressTitle">Current Run Target</span>
           <span class="progress-val-badge" id="valStepPct">0.0%</span>
         </div>
         <div class="progress-track">
@@ -3316,16 +3316,20 @@
         const stageStepsTotal = stage === 2 ? 10875 : (targetSteps || maxSteps || step);
         const stageStepPct = stageStepsTotal > 0 ? Math.min(100, (stageStep / stageStepsTotal) * 100).toFixed(1) : '0.0';
 
+        const stepTitleEl = document.getElementById('stepProgressTitle');
         if (stage === 2) {
-          document.getElementById('valStepText').innerText = `Step ${step.toLocaleString()} / ${targetSteps.toLocaleString()} (Stage 2: ${stageStep.toLocaleString()} / ${stageStepsTotal.toLocaleString()} · ${stageStepPct}%)`;
-          document.getElementById('valStepPct').innerText = `${stepPct}%`;
+          if (stepTitleEl) stepTitleEl.innerText = 'Current Run Target (Stage 2)';
+          document.getElementById('valStepText').innerText = `Stage 2: Step ${stageStep.toLocaleString()} / ${stageStepsTotal.toLocaleString()} · Global: ${step.toLocaleString()} / ${targetSteps.toLocaleString()} (${stepPct}% Total)`;
+          document.getElementById('valStepPct').innerText = `${stageStepPct}%`;
+          document.getElementById('stepProgressBar').style.width = `${stageStepPct}%`;
         } else {
+          if (stepTitleEl) stepTitleEl.innerText = 'Current Run Target';
           document.getElementById('valStepText').innerText = (targetSteps && maxSteps && targetSteps < maxSteps)
               ? `Step ${step.toLocaleString()} / ${targetSteps.toLocaleString()} (Curriculum: ${maxSteps.toLocaleString()})`
               : `Step ${step.toLocaleString()} / ${(targetSteps || maxSteps || step).toLocaleString()}`;
           document.getElementById('valStepPct').innerText = `${stepPct}%`;
+          document.getElementById('stepProgressBar').style.width = `${stepPct}%`;
         }
-        document.getElementById('stepProgressBar').style.width = `${stepPct}%`;
         document.getElementById('valPhase').innerText = data.phase || (step >= targetSteps && targetSteps > 0 ? 'Target Completed' : 'Stable Phase');
         document.getElementById('valETA').innerText = data.eta_str || '--:--';
         document.getElementById('valElapsed').innerText = data.elapsed_str || '--';

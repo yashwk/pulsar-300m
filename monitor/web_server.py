@@ -557,6 +557,40 @@ def enrich_status_payload(data):
         data["num_train_shards"] = len(disk_shards) if disk_shards else 1
         data["train_dataset_tokens"] = sum(os.path.getsize(p) // 2 for p in disk_shards) if disk_shards else 0
 
+    # Multi-Stage Curriculum & Dataset Horizon Enrichment
+    shards = data.get("train_shards") or []
+    shard_nums = []
+    for s in shards:
+        m = re.search(r"shard(\d+)", s, re.IGNORECASE)
+        if m:
+            shard_nums.append(int(m.group(1)))
+
+    is_stage2 = bool(shard_nums and min(shard_nums) >= 8) or (data.get("seq_len") == 4096 and step >= 28000)
+    if is_stage2:
+        stage = 2
+        stage_name = "Stage 2 (Reasoning & Math)"
+        stage_start_step = 28991
+        stage_target_step = 39866
+        stage_dataset_tokens = data.get("train_dataset_tokens") or 1425432776
+    else:
+        stage = 1
+        stage_name = "Stage 1 (Base Pretraining)"
+        stage_start_step = 0
+        stage_target_step = 28991
+        stage_dataset_tokens = data.get("train_dataset_tokens") or 3803419808
+
+    data["stage"] = stage
+    data["stage_name"] = stage_name
+    data["stage_start_step"] = stage_start_step
+    data["stage_target_step"] = stage_target_step
+    data["stage_dataset_tokens"] = stage_dataset_tokens
+    data["total_curriculum_tokens"] = 3803419808 + 1425432776
+
+    stage_step = max(0, step - stage_start_step)
+    data["stage_step"] = stage_step
+    data["stage_steps_total"] = max(1, stage_target_step - stage_start_step)
+    data["stage_tokens_seen"] = int(stage_step * batch_tokens)
+
     # Dynamic model configuration summary (cached; never rebuilds the model per request)
     if not data.get("model_config"):
         data["model_config"] = get_model_summary_cached()

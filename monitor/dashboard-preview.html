@@ -383,9 +383,11 @@
         set('phaseText',data.phase||'Training'); set('elapsedText',`${data.elapsed_str||'—'} elapsed`);
         set('etaText',data.eta_str||'—');
 
-        const seen=number(data.tokens_seen)||0, corpus=number(data.train_dataset_tokens)||0;
-        const corpusPct=corpus?clampPct(seen/corpus*100):0;
-        set('datasetText',`${compact(seen)} / ${compact(corpus)} tokens · ${corpusPct.toFixed(1)}%`);
+        const seen=number(data.tokens_seen)||0;
+        const stageSeen=number(data.stage_tokens_seen) ?? (seen > 3799908352 ? seen - 3799908352 : seen);
+        const corpus=number(data.stage_dataset_tokens) ?? number(data.train_dataset_tokens) ?? 0;
+        const corpusPct=corpus?clampPct(stageSeen/corpus*100):0;
+        set('datasetText',`${compact(stageSeen)} / ${compact(corpus)} tokens · ${corpusPct.toFixed(1)}%`);
         $('datasetProgress').style.width=`${corpusPct}%`;
         const shards=Array.isArray(data.train_shards)?data.train_shards.length:number(data.num_train_shards);
         set('shardsText',shards===null?'—':`${int(shards)} active${shards===1?' shard':' shards'}`);

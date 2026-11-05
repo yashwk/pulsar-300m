@@ -3293,11 +3293,38 @@
         const step = data.step || 0;
         const maxSteps = data.curriculum_steps || data.max_steps || data.target_steps || 0;
         const targetSteps = data.target_steps || data.active_target || maxSteps;
+        const batchTokens = data.global_batch_tokens || 131072;
+        const trainShards = Array.isArray(data.train_shards) ? data.train_shards : [];
+        const numShards = trainShards.length > 0 ? trainShards.length : (data.num_train_shards || 1);
+
+        // Stage Resolution (Stage 1: 0..28991 | Stage 2: 28991..39866)
+        let stage = data.stage;
+        let stageStartStep = data.stage_start_step !== undefined ? data.stage_start_step : 0;
+        if (stage === undefined) {
+          const hasStage2Shards = trainShards.some(s => /shard(8|9|10)\.bin/i.test(s));
+          if (hasStage2Shards || (data.seq_len === 4096 && step >= 28000)) {
+            stage = 2;
+            stageStartStep = 28991;
+          } else {
+            stage = 1;
+            stageStartStep = 0;
+          }
+        }
+
         const stepPct = targetSteps > 0 ? Math.min(100, ((step / targetSteps) * 100)).toFixed(1) : '0.0';
-        document.getElementById('valStepText').innerText = (targetSteps && maxSteps && targetSteps < maxSteps)
-            ? `Step ${step.toLocaleString()} / ${targetSteps.toLocaleString()} (Curriculum: ${maxSteps.toLocaleString()})`
-            : `Step ${step.toLocaleString()} / ${(targetSteps || maxSteps || step).toLocaleString()}`;
-        document.getElementById('valStepPct').innerText = `${stepPct}%`;
+        const stageStep = Math.max(0, step - stageStartStep);
+        const stageStepsTotal = stage === 2 ? 10875 : (targetSteps || maxSteps || step);
+        const stageStepPct = stageStepsTotal > 0 ? Math.min(100, (stageStep / stageStepsTotal) * 100).toFixed(1) : '0.0';
+
+        if (stage === 2) {
+          document.getElementById('valStepText').innerText = `Step ${step.toLocaleString()} / ${targetSteps.toLocaleString()} (Stage 2: ${stageStep.toLocaleString()} / ${stageStepsTotal.toLocaleString()} · ${stageStepPct}%)`;
+          document.getElementById('valStepPct').innerText = `${stepPct}%`;
+        } else {
+          document.getElementById('valStepText').innerText = (targetSteps && maxSteps && targetSteps < maxSteps)
+              ? `Step ${step.toLocaleString()} / ${targetSteps.toLocaleString()} (Curriculum: ${maxSteps.toLocaleString()})`
+              : `Step ${step.toLocaleString()} / ${(targetSteps || maxSteps || step).toLocaleString()}`;
+          document.getElementById('valStepPct').innerText = `${stepPct}%`;
+        }
         document.getElementById('stepProgressBar').style.width = `${stepPct}%`;
         document.getElementById('valPhase').innerText = data.phase || (step >= targetSteps && targetSteps > 0 ? 'Target Completed' : 'Stable Phase');
         document.getElementById('valETA').innerText = data.eta_str || '--:--';
@@ -3318,24 +3345,27 @@
           }
         }
 
-        const tokensSeen = data.tokens_seen || 0;
-        const datasetTokens = data.train_dataset_tokens || 0;
-        const trainShards = Array.isArray(data.train_shards) ? data.train_shards : [];
-        const numShards = trainShards.length > 0 ? trainShards.length : (data.num_train_shards || 1);
-        const datasetPct = datasetTokens > 0 ? Math.min(100, ((tokensSeen / datasetTokens) * 100)).toFixed(2) : '0.00';
-        
-        // Dynamic Concurrent Shard Traversal & Epoch Math
-        const batchTokens = data.global_batch_tokens || 131072;
-        const totalEpochSteps = (datasetTokens > 0 && batchTokens > 0) ? Math.ceil(datasetTokens / batchTokens) : 0;
-        const epochNum = datasetTokens > 0 ? (Math.floor(tokensSeen / datasetTokens) + 1) : 1;
-        const stepsInEpoch = totalEpochSteps > 0 ? (step % totalEpochSteps) : step;
+        // Stage Dataset Horizon Traversal
+        const datasetTokens = data.stage_dataset_tokens || data.train_dataset_tokens || (stage === 2 ? 1425432776 : 3803419808);
+        const stageTokensSeen = (data.stage_tokens_seen !== undefined) ? data.stage_tokens_seen : (stageStep * batchTokens);
+        const totalTokensSeen = data.tokens_seen || (step * batchTokens);
+
+        const totalEpochSteps = (datasetTokens > 0 && batchTokens > 0) ? Math.ceil(datasetTokens / batchTokens) : (stage === 2 ? 10875 : 28991);
+        const epochNum = datasetTokens > 0 ? (Math.floor(stageTokensSeen / datasetTokens) + 1) : 1;
+        const stepsInEpoch = totalEpochSteps > 0 ? (stageStep % totalEpochSteps) : stageStep;
         const stepsRemainingInEpoch = Math.max(0, totalEpochSteps - stepsInEpoch);
+
+        const datasetPct = datasetTokens > 0 ? Math.min(100, Math.max(0, ((stageTokensSeen / datasetTokens) * 100))).toFixed(2) : '0.00';
 
         const horizonTitleEl = document.getElementById('datasetHorizonTitle');
         if (horizonTitleEl) {
-          horizonTitleEl.innerText = numShards > 1
-            ? `Dataset Horizon (${numShards} Shards Concurrent Interleaved)`
-            : `Dataset Horizon (Single Shard Streaming)`;
+          if (stage === 2) {
+            horizonTitleEl.innerText = `Stage 2 Dataset Horizon (${numShards} Shards Concurrent Interleaved)`;
+          } else {
+            horizonTitleEl.innerText = numShards > 1
+              ? `Dataset Horizon (${numShards} Shards Concurrent Interleaved)`
+              : `Dataset Horizon (Single Shard Streaming)`;
+          }
         }
         
         const shardsTextEl = document.getElementById('valShardsText');
@@ -3368,9 +3398,10 @@
           }
         }
 
+        const stagePrefix = stage === 2 ? 'Stage 2: ' : '';
         document.getElementById('valTokensText').innerText = datasetTokens > 0
-          ? `${(tokensSeen / 1e6).toFixed(2)}M / ${(datasetTokens / 1e6).toFixed(1)}M Tokens (Epoch ${epochNum} • ${totalEpochSteps.toLocaleString()} steps / epoch)`
-          : `${(tokensSeen / 1e6).toFixed(2)}M Total Tokens`;
+          ? `${stagePrefix}${(stageTokensSeen / 1e6).toFixed(1)}M / ${(datasetTokens / 1e6).toFixed(1)}M Tokens (${(totalTokensSeen / 1e9).toFixed(2)}B Total Seen · Epoch ${epochNum})`
+          : `${(totalTokensSeen / 1e6).toFixed(1)}M Total Tokens`;
         document.getElementById('valDatasetPct').innerText = `${datasetPct}% (Ep ${epochNum})`;
         document.getElementById('datasetProgressBar').style.width = `${Math.min(100, datasetPct)}%`;
 

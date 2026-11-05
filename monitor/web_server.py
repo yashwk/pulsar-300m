@@ -82,7 +82,17 @@ _history_lock = threading.Lock()
 
 
 def get_model_summary_cached():
-    """Build the model summary from checkpoints/config.json at most once per file change."""
+    """Build the model summary from live_status.json or config.json without importing PyTorch."""
+    live_status = os.path.join(CHECKPOINT_DIR, "live_status.json")
+    if os.path.exists(live_status):
+        try:
+            with open(live_status, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if data and "model_config" in data:
+                    return data["model_config"]
+        except Exception:
+            pass
+
     config_json = os.path.join(CHECKPOINT_DIR, "config.json")
     try:
         st = os.stat(config_json)
@@ -92,19 +102,35 @@ def get_model_summary_cached():
     with _summary_lock:
         if _summary_cache["key"] == key and _summary_cache["value"] is not None:
             return _summary_cache["value"]
-    summary = None
+
+    summary = dict(DEFAULT_MODEL_SUMMARY)
     try:
         with open(config_json, "r", encoding="utf-8") as f:
-            cfg_dict = json.load(f)
-        import torch
-        from src.model import PulsarConfig, PulsarForCausalLM
-        cfg = PulsarConfig.from_dict(cfg_dict)
-        with torch.device("meta"):
-            summary = PulsarForCausalLM(cfg).get_model_summary(cfg.default_pulses)
+            cfg = json.load(f)
+        d_shared = cfg.get("d_shared") or cfg.get("d_expert", 512)
+        top_k = cfg.get("top_k", 4)
+        d_expert = cfg.get("d_expert", 512)
+        pulses = cfg.get("default_pulses", 3)
+        n_core = cfg.get("n_core", 8)
+        summary.update({
+            "model_name": cfg.get("model_name", "Pulsar"),
+            "n_core": n_core,
+            "num_pulses": pulses,
+            "effective_layers": n_core * pulses,
+            "d_model": cfg.get("d_model", 1024),
+            "n_heads": cfg.get("n_heads", 16),
+            "n_kv_heads": cfg.get("n_kv_heads", 4),
+            "head_dim": cfg.get("head_dim", 64),
+            "d_expert": d_expert,
+            "d_shared": d_shared,
+            "n_routed_experts": cfg.get("n_routed_experts", 16),
+            "top_k": top_k,
+            "active_ffn_dim": d_shared + top_k * d_expert,
+            "vocab_size": cfg.get("vocab_size", 32768),
+            "max_seq_len": cfg.get("max_seq_len", 32768),
+        })
     except Exception:
-        summary = None
-    if summary is None:
-        summary = dict(DEFAULT_MODEL_SUMMARY)
+        pass
     with _summary_lock:
         _summary_cache["key"], _summary_cache["value"] = key, summary
     return summary
@@ -195,10 +221,26 @@ def detect_max_steps():
     return target_step or curriculum_steps or 100
 
 
+_csv_grads_cache = {"key": None, "data": {}}
+_csv_grads_lock = threading.Lock()
+_canaries_cache = {"key": None, "data": []}
+_canaries_lock = threading.Lock()
+
+
 def load_csv_grads():
     csv_file = os.path.join(CHECKPOINT_DIR, "metrics.csv")
-    grads = {}
-    if os.path.exists(csv_file):
+    if not os.path.exists(csv_file):
+        return {}
+    try:
+        st = os.stat(csv_file)
+        key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return {}
+    with _csv_grads_lock:
+        if _csv_grads_cache["key"] == key:
+            return _csv_grads_cache["data"]
+
+        grads = {}
         try:
             with open(csv_file, "r", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
@@ -214,7 +256,9 @@ def load_csv_grads():
                         pass
         except Exception:
             pass
-    return grads
+        _csv_grads_cache["key"] = key
+        _csv_grads_cache["data"] = grads
+        return grads
 
 
 def load_history_records():
@@ -768,19 +812,21 @@ class PulsarMonitorHandler(SimpleHTTPRequestHandler):
         fields: list[str] | None = None,
     ):
         records = _v2_incremental_reader.read_records()
-        grads = load_csv_grads()
-
-        for item in records:
-            s = item.get("step")
-            if s in grads:
-                item["grad_norm_total"] = grads[s]["grad_norm_total"]
-                item["grad_norm_muon"] = grads[s]["grad_norm_muon"]
-                item["grad_norm_adam"] = grads[s]["grad_norm_adam"]
-
         if last_n is not None and last_n > 0 and len(records) > last_n:
             records = records[-last_n:]
 
         sampled = downsample_records(records, max_points=max_points, fields=fields, since_step=since_step)
+
+        # Merge gradient norms ONLY for the downsampled slice returned to browser
+        grads = load_csv_grads()
+        if grads:
+            for item in sampled:
+                s = item.get("step")
+                if s in grads:
+                    item["grad_norm_total"] = grads[s]["grad_norm_total"]
+                    item["grad_norm_muon"] = grads[s]["grad_norm_muon"]
+                    item["grad_norm_adam"] = grads[s]["grad_norm_adam"]
+
         payload = json.dumps({"count": len(sampled), "history": sampled}).encode("utf-8")
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/json")
@@ -789,50 +835,67 @@ class PulsarMonitorHandler(SimpleHTTPRequestHandler):
         self.wfile.write(payload)
 
     def serve_canaries(self):
-        milestones = []
-        canary_hist_file = os.path.join(CHECKPOINT_DIR, "canary_history.json")
-        if os.path.exists(canary_hist_file):
-            try:
-                with open(canary_hist_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    milestones = data.get("milestones", [])
-            except Exception:
-                pass
-
-        # Also extract true evaluation milestones directly from metrics.jsonl
+        # Cached canary milestones by metrics.jsonl mtime and size
+        key = None
         if os.path.exists(METRICS_JSONL_FILE):
             try:
-                with open(METRICS_JSONL_FILE, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line:
-                            try:
-                                item = json.loads(line)
-                                if item.get("val_loss") is not None and item.get("canaries"):
-                                    s = item.get("step")
-                                    if not any(m.get("step") == s for m in milestones):
-                                        milestones.append({
-                                            "step": s,
-                                            "label": f"Step {s:,}",
-                                            "val_loss": item.get("val_loss"),
-                                            "val_ppl": item.get("val_ppl"),
-                                            "canaries": item.get("canaries", []),
-                                        })
-                            except Exception:
-                                continue
-            except Exception:
-                pass
+                st = os.stat(METRICS_JSONL_FILE)
+                key = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                key = None
 
-        milestones.sort(key=lambda m: m.get("step", 0))
+        with _canaries_lock:
+            if key is not None and _canaries_cache["key"] == key and _canaries_cache["data"]:
+                milestones = _canaries_cache["data"]
+            else:
+                milestones = []
+                canary_hist_file = os.path.join(CHECKPOINT_DIR, "canary_history.json")
+                if os.path.exists(canary_hist_file):
+                    try:
+                        with open(canary_hist_file, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                            milestones = data.get("milestones", [])
+                    except Exception:
+                        pass
 
-        # Enrich all canaries with category and tag metadata
-        for m in milestones:
-            canaries_list = m.get("canaries", [])
-            if isinstance(canaries_list, list):
-                for c in canaries_list:
-                    tag, cat = infer_canary_meta(c)
-                    c["tag"] = tag
-                    c["category"] = cat
+                # Also extract true evaluation milestones directly from metrics.jsonl
+                if os.path.exists(METRICS_JSONL_FILE):
+                    try:
+                        with open(METRICS_JSONL_FILE, "r", encoding="utf-8") as f:
+                            for line in f:
+                                line = line.strip()
+                                if line:
+                                    try:
+                                        item = json.loads(line)
+                                        if item.get("val_loss") is not None and item.get("canaries"):
+                                            s = item.get("step")
+                                            if not any(m.get("step") == s for m in milestones):
+                                                milestones.append({
+                                                    "step": s,
+                                                    "label": f"Step {s:,}",
+                                                    "val_loss": item.get("val_loss"),
+                                                    "val_ppl": item.get("val_ppl"),
+                                                    "canaries": item.get("canaries", []),
+                                                })
+                                    except Exception:
+                                        continue
+                    except Exception:
+                        pass
+
+                milestones.sort(key=lambda m: m.get("step", 0))
+
+                # Enrich all canaries with category and tag metadata
+                for m in milestones:
+                    canaries_list = m.get("canaries", [])
+                    if isinstance(canaries_list, list):
+                        for c in canaries_list:
+                            tag, cat = infer_canary_meta(c)
+                            c["tag"] = tag
+                            c["category"] = cat
+
+                if key is not None:
+                    _canaries_cache["key"] = key
+                    _canaries_cache["data"] = milestones
 
         payload = json.dumps({"count": len(milestones), "milestones": milestones}).encode("utf-8")
         self.send_response(HTTPStatus.OK)

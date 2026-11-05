@@ -127,6 +127,8 @@ class IncrementalMetricsReader:
                         continue
                     try:
                         rec = json.loads(line)
+                        # Strip heavy canary text blobs from in-memory history cache to save memory
+                        rec.pop("canaries", None)
                         self._enrich_record(rec)
                         new_records.append(rec)
                     except Exception:

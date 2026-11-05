@@ -23,10 +23,7 @@ ckpt_vol = modal.Volume.from_name("pulsar-checkpoints", create_if_missing=True)
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install("git")
-    .pip_install("torch>=2.4.0", "numpy")
     .add_local_dir("monitor", remote_path="/root/monitor")
-    .add_local_dir("src", remote_path="/root/src")
 )
 
 app = modal.App("pulsar-monitor")
@@ -36,7 +33,7 @@ app = modal.App("pulsar-monitor")
     image=image,
     volumes={"/checkpoints": ckpt_vol},
     cpu=0.25,
-    memory=512,
+    memory=256,
     max_containers=1,
     timeout=60 * 60 * 4,
     scaledown_window=60,
@@ -48,7 +45,7 @@ def serve():
 
     def volume_reloader():
         while True:
-            time.sleep(2.0)
+            time.sleep(5.0)
             try:
                 ckpt_vol.reload()
             except Exception:
